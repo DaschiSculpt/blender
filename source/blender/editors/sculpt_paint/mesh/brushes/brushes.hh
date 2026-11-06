@@ -156,6 +156,14 @@ void do_layer_brush(const Depsgraph &depsgraph,
                     const Sculpt &sd,
                     Object &object,
                     const IndexMask &node_mask);
+void do_morph_brush(const Depsgraph &depsgraph,
+                    const Sculpt &sd,
+                    Object &object,
+                    const IndexMask &node_mask);
+void do_erase_layer_brush(const Depsgraph &depsgraph,
+                          const Sculpt &sd,
+                          Object &object,
+                          const IndexMask &node_mask);
 /** A brush that modifies mask values instead of position. */
 void do_mask_brush(const Depsgraph &depsgraph,
                    const Sculpt &sd,

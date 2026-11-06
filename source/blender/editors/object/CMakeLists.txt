@@ -21,6 +21,7 @@ set(INC_SYS
 set(SRC
   add_modifier_assets.cc
   interface_template_shape_key_tree.cc
+  interface_template_sculpt_layer_tree.cc
   object_add.cc
   object_bake.cc
   object_bake_api.cc

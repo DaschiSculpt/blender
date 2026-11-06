@@ -56,6 +56,9 @@ static bool geometry_extract_poll(bContext *C)
       CTX_wm_operator_poll_msg_set(C, "The geometry cannot be extracted with dyntopo activated");
       return false;
     }
+    if (bke::object::pbvh_get(*ob)->type() == bke::pbvh::Type::Multires) {
+      return false;
+    }
     return ED_operator_object_active_editable_mesh(C);
   }
   return false;

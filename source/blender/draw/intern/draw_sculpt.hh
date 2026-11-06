@@ -34,7 +34,8 @@ enum SculptBatchFeature {
   SCULPT_BATCH_MASK = 1 << 1,
   SCULPT_BATCH_FACE_SET = 1 << 2,
   SCULPT_BATCH_VERTEX_COLOR = 1 << 3,
-  SCULPT_BATCH_UV = 1 << 4
+  SCULPT_BATCH_UV = 1 << 4,
+  SCULPT_BATCH_WIREFRAME_INTERNAL = 1 << 5,
 };
 ENUM_OPERATORS(SculptBatchFeature);
 

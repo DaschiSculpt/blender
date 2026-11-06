@@ -88,6 +88,16 @@ static const EnumPropertyItem rna_enum_canvas_source_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
+const EnumPropertyItem rna_enum_morph_store_mode_items[] = {
+    {0, "CURRENT_POSITIONS", 0, "Current Positions", "Store the current positions"},
+    {1,
+     "SUBDIVIDED_BASE",
+     0,
+     "Subdivided Base",
+     "Store the base mesh subdivided to the current level"},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 const EnumPropertyItem rna_enum_symmetrize_direction_items[] = {
     {BMO_SYMMETRIZE_NEGATIVE_X, "NEGATIVE_X", 0, "-X to +X", ""},
     {BMO_SYMMETRIZE_POSITIVE_X, "POSITIVE_X", 0, "+X to -X", ""},
@@ -322,6 +332,11 @@ static void rna_Paint_update(bContext *C, PointerRNA * /*ptr*/)
 static std::optional<std::string> rna_Sculpt_path(const PointerRNA * /*ptr*/)
 {
   return "tool_settings.sculpt";
+}
+
+static std::optional<std::string> rna_MultiresBakeSettings_path(const PointerRNA * /*ptr*/)
+{
+  return "tool_settings.sculpt.multires_bake";
 }
 
 static std::optional<std::string> rna_VertexPaint_path(const PointerRNA *ptr)
@@ -1153,6 +1168,73 @@ static void rna_def_mesh_automasking_settings(BlenderRNA *brna)
   RNA_def_property_update(prop, 0, "rna_MeshAutomaskingSettings_update");
 }
 
+static void rna_def_multires_bake_settings(BlenderRNA *brna)
+{
+  StructRNA *srna;
+  PropertyRNA *prop;
+
+  static const EnumPropertyItem multires_bake_type_items[] = {
+      {MULTIRES_BAKE_NORMALS, "NORMALS", 0, "Normals", "Bake tangent-space normals"},
+      {MULTIRES_BAKE_DISPLACEMENT, "DISPLACEMENT", 0, "Displacement", "Bake height displacement"},
+      {MULTIRES_BAKE_VECTOR_DISPLACEMENT,
+       "VECTOR_DISPLACEMENT",
+       0,
+       "Vector Displacement",
+       "Bake vector displacement"},
+      {0, nullptr, 0, nullptr, nullptr},
+  };
+
+  static const EnumPropertyItem multires_bake_space_items[] = {
+      {MULTIRES_BAKE_SPACE_TANGENT, "TANGENT", 0, "Tangent", "Tangent space"},
+      {MULTIRES_BAKE_SPACE_OBJECT, "OBJECT", 0, "Object", "Object space"},
+      {0, nullptr, 0, nullptr, nullptr},
+  };
+
+  srna = RNA_def_struct(brna, "MultiresBakeSettings", nullptr);
+  RNA_def_struct_sdna(srna, "MultiresBakeSettings");
+  RNA_def_struct_path_func(srna, "rna_MultiresBakeSettings_path");
+  RNA_def_struct_ui_text(
+      srna, "Multires Bake Settings", "Settings for baking multiresolution mesh data");
+  RNA_def_struct_clear_flag(srna, STRUCT_UNDO);
+
+  prop = RNA_def_property(srna, "image", PROP_POINTER, PROP_NONE);
+  RNA_def_property_pointer_sdna(prop, nullptr, "image");
+  RNA_def_property_struct_type(prop, "Image");
+  RNA_def_property_flag(prop, PROP_EDITABLE);
+  RNA_def_property_pointer_funcs(
+      prop, nullptr, nullptr, nullptr, "rna_Image_no_renderresult_or_viewer_poll");
+  RNA_def_property_ui_text(prop, "Image", "Image datablock to bake into");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "type", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_sdna(prop, nullptr, "type");
+  RNA_def_property_enum_items(prop, multires_bake_type_items);
+  RNA_def_property_ui_text(
+      prop, "Bake Type", "Type of data to bake from the multiresolution mesh");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "space", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_sdna(prop, nullptr, "space");
+  RNA_def_property_enum_items(prop, multires_bake_space_items);
+  RNA_def_property_ui_text(prop, "Space", "Orientation space for vector displacement");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "margin", PROP_INT, PROP_PIXEL);
+  RNA_def_property_int_sdna(prop, nullptr, "margin");
+  RNA_def_property_range(prop, 0, 64);
+  RNA_def_property_ui_range(prop, 0, 64, 1, 1);
+  RNA_def_property_ui_text(prop, "Margin", "Extends the baked result as a post process filter");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "use_normalize", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "use_normalize", 1);
+  RNA_def_property_ui_text(
+      prop,
+      "Normalize",
+      "Normalize height values into [0, 1] range (recommended for 8-bit images)");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+}
+
 static void rna_def_sculpt(BlenderRNA *brna)
 {
   static const EnumPropertyItem detail_refine_items[] = {
@@ -1306,7 +1388,41 @@ static void rna_def_sculpt(BlenderRNA *brna)
   RNA_def_property_flag(prop, PROP_EDITABLE);
   RNA_def_property_ui_text(
       prop, "Orientation", "Object whose Z axis defines orientation of gravity");
+  /* `rna_Sculpt_update` takes a `bContext`, so the context-update cast is required. */
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Sculpt_update");
+
+  prop = RNA_def_property(srna, "morph_store_mode", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_sdna(prop, nullptr, "morph_store_mode");
+  RNA_def_property_enum_items(prop, rna_enum_morph_store_mode_items);
+  RNA_def_property_ui_text(prop, "Morph Store Mode", "Which positions the Store operator stores");
   RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "morph_skip_undo", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "morph_skip_undo", 1);
+  RNA_def_property_ui_text(prop,
+                           "Skip Undo Step",
+                           "Store the sculpt morph without pushing an undo step, "
+                           "keeping the redo stack (e.g. to store a morph from the past)");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "morph_use_mask", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "morph_use_mask", 1);
+  RNA_def_property_ui_text(
+      prop, "Morph Respect Mask", "Swap the sculpt morph only where vertices are not masked");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "morph_use_hide", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "morph_use_hide", 1);
+  RNA_def_property_ui_text(
+      prop, "Morph Respect Visibility", "Swap the sculpt morph only where vertices are visible");
+  RNA_def_property_update(prop, NC_SCENE | ND_TOOLSETTINGS, nullptr);
+
+  prop = RNA_def_property(srna, "multires_bake", PROP_POINTER, PROP_NONE);
+  RNA_def_property_flag(prop, PROP_NEVER_NULL);
+  RNA_def_property_pointer_sdna(prop, nullptr, "multires_bake");
+  RNA_def_property_struct_type(prop, "MultiresBakeSettings");
+  RNA_def_property_ui_text(prop, "Multires Bake Settings", "Multiresolution baking settings");
 }
 
 static void rna_def_uv_sculpt(BlenderRNA *brna)
@@ -2039,6 +2155,7 @@ void RNA_def_sculpt_paint(BlenderRNA *brna)
   rna_def_paint(brna);
   rna_def_unified_paint_settings(brna);
   rna_def_mesh_automasking_settings(brna);
+  rna_def_multires_bake_settings(brna);
   rna_def_sculpt(brna);
   rna_def_uv_sculpt(brna);
   rna_def_gp_paint(brna);

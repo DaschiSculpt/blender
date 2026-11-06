@@ -9,9 +9,12 @@
  * Embeds GPU meshes inside of bke::pbvh::Tree nodes, used by mesh sculpt mode.
  */
 
+#include <cmath>
+
 #include "BLI_enumerable_thread_specific.hh"
 #include "BLI_function_ref.hh"
 #include "BLI_map.hh"
+#include "BLI_math_bits.hh"
 #include "BLI_math_geom_c.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_utildefines.hh"
@@ -24,6 +27,7 @@
 #include "BKE_attribute_math.hh"
 #include "BKE_customdata.hh"
 #include "BKE_mesh.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_bvh.hh"
 #include "BKE_subdiv_ccg.hh"
@@ -247,11 +251,71 @@ struct OrigMeshData {
   }
 };
 
+struct MultiresDrawView {
+  bke::multiresolution::BaseTopology base_topo;
+  Span<float3> positions;
+  Span<int> corner_verts;
+  Span<bool> hidden_faces;
+  Span<float> masks;
+  Span<int> face_sets;
+  Span<float4> colors;
+  int faces_per_corner = 1;
+  int level = 0;
+  bool is_coarse = false;
+
+  static MultiresDrawView get(const Object &object, const bke::pbvh::Tree &pbvh)
+  {
+    const Object &object_orig = *DEG_get_original(&object);
+    const Mesh &mesh = *id_cast<const Mesh *>(object_orig.data);
+    const Multiresolution &multires = *mesh.multires;
+    const bke::multiresolution::MultiresCoarseView *coarse =
+        multires.runtime ? multires.runtime->coarse_view.get() : nullptr;
+    if (coarse && coarse->tree.get() == &pbvh) {
+      return MultiresDrawView{
+          multires.get_base_topology(mesh, coarse->coarse_level),
+          coarse->positions,
+          coarse->corner_verts,
+          coarse->hidden_faces,
+          coarse->masks,
+          coarse->face_sets,
+          coarse->colors,
+          coarse->faces_per_corner,
+          coarse->coarse_level,
+          true,
+      };
+    }
+    return MultiresDrawView{
+        multires.get_base_topology(mesh),
+        multires.positions(),
+        multires.corner_verts(),
+        multires.hidden_faces(),
+        multires.masks(),
+        multires.face_sets(),
+        multires.colors(),
+        multires.faces_per_corner(),
+        multires.curr_level,
+        false,
+    };
+  }
+};
+
 /**
  * Stores the data necessary to draw the PBVH geometry. A separate `*Impl` class is used to hide
  * implementation details from the public header.
  */
 class DrawCacheImpl : public DrawCache {
+  /**
+   * The tree being drawn. It is not necessarily the object's tree (see #MultiresCoarseView), so
+   * it is provided by the public entry points, which set it before doing any work.
+   */
+  const bke::pbvh::Tree *pbvh_ = nullptr;
+
+  const bke::pbvh::Tree &tree() const
+  {
+    BLI_assert(pbvh_ != nullptr);
+    return *pbvh_;
+  }
+
  public:
   struct AttributeData {
     /**
@@ -329,6 +393,7 @@ class DrawCacheImpl : public DrawCache {
   };
   IBOFamily ibo_lines_;
   IBOFamily ibo_lines_coarse_;
+  IBOFamily ibo_lines_internal_;
   IBOFamily ibo_tris_;
   IBOFamily ibo_tris_coarse_;
 
@@ -362,6 +427,8 @@ class DrawCacheImpl : public DrawCache {
   BatchCache lines_batches_;
   /** Batches for drawing coarse "fast navigate" wireframe geometry. */
   BatchCache lines_batches_coarse_;
+  /** Batches for drawing internal multires wireframe geometry with reduced opacity. */
+  BatchCache lines_batches_internal_;
   /**
    * Batches for drawing triangles, stored separately for each combination of attributes and
    * coarse-ness. Different viewports might request different sets of attributes, and we don't want
@@ -391,14 +458,21 @@ class DrawCacheImpl : public DrawCache {
   void tag_attribute_changed(const IndexMask &node_mask, StringRef attribute_name) override;
 
   Span<Batch *> ensure_tris_batches(const Object &object,
+                                    const bke::pbvh::Tree &pbvh,
                                     const ViewportRequest &request,
                                     const IndexMask &nodes_to_update) override;
 
   Span<Batch *> ensure_lines_batches(const Object &object,
+                                     const bke::pbvh::Tree &pbvh,
                                      const ViewportRequest &request,
                                      const IndexMask &nodes_to_update) override;
 
-  Span<int> ensure_material_indices(const Object &object) override;
+  Span<Batch *> ensure_lines_internal_batches(const Object &object,
+                                              const bke::pbvh::Tree &pbvh,
+                                              const ViewportRequest &request,
+                                              const IndexMask &nodes_to_update) override;
+
+  Span<int> ensure_material_indices(const Object &object, const bke::pbvh::Tree &pbvh) override;
 
  private:
   /**
@@ -432,10 +506,17 @@ class DrawCacheImpl : public DrawCache {
                                             const IndexMask &node_mask,
                                             bool coarse);
 
+  Span<Batch *> ensure_lines_batches_common(const Object &object,
+                                            const bke::pbvh::Tree &pbvh_to_draw,
+                                            const ViewportRequest &request,
+                                            const IndexMask &nodes_to_update,
+                                            bool internal_edges);
+
   Span<gpu::IndexBufPtr> ensure_lines_indices(const Object &object,
                                               const OrigMeshData &orig_mesh_data,
                                               const IndexMask &node_mask,
-                                              bool coarse);
+                                              bool coarse,
+                                              bool internal_edges);
 };
 
 void DrawCacheImpl::AttributeData::tag_dirty(const IndexMask &node_mask)
@@ -465,6 +546,7 @@ void DrawCacheImpl::tag_visibility_changed(const IndexMask &node_mask)
   vbo_.tag_dirty(node_mask);
   ibo_lines_.buffer.tag_dirty(node_mask);
   ibo_lines_coarse_.buffer.tag_dirty(node_mask);
+  ibo_lines_internal_.buffer.tag_dirty(node_mask);
   ibo_tris_.buffer.tag_dirty(node_mask);
   ibo_tris_coarse_.buffer.tag_dirty(node_mask);
 }
@@ -716,6 +798,41 @@ void extract_data_vert_mesh(const OffsetIndices<int> faces,
 }
 
 template<typename T>
+void extract_data_vert_multires(const int faces_per_corner,
+                                const Span<int> corner_verts,
+                                const bke::multiresolution::BaseTopology &base_topo,
+                                const Span<T> attribute,
+                                const bke::pbvh::MultiresNode &node,
+                                gpu::VertBuf &vbo,
+                                const IndexRange scratch_range)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const Span<int> node_faces = node.faces();
+  const OffsetIndices<int> base_faces = base_topo.faces;
+
+  using Converter = AttributeConverter<T>;
+  using VBOType = typename Converter::VBOType;
+  VBOType *data = vbo.data<VBOType>().data() + scratch_range.start();
+  VBOType *data_start = data;
+
+  for (const int j : node_faces.index_range()) {
+    const int face_idx = node_faces[j];
+    const IndexRange face_range = base_faces[face_idx];
+    const int first_subface_idx = face_range.start() * faces_per_corner;
+    const int subfaces_num = face_range.size() * faces_per_corner;
+    const Span<int> subfaces = corner_verts.slice(first_subface_idx * 4, subfaces_num * 4);
+
+    for (const int vert : subfaces) {
+      *data = Converter::convert(attribute[vert]);
+      data++;
+    }
+  }
+
+  UNUSED_VARS_NDEBUG(data_start);
+  BLI_assert(data == data_start + scratch_range.size());
+}
+
+template<typename T>
 void extract_data_face_mesh(const OffsetIndices<int> faces,
                             const Span<T> attribute,
                             const Span<int> face_indices,
@@ -865,6 +982,7 @@ DrawCacheImpl::~DrawCacheImpl()
 {
   free_batches(lines_batches_.batches);
   free_batches(lines_batches_coarse_.batches);
+  free_batches(lines_batches_internal_.batches);
   for (BatchCache &batch_cache : tris_batches_.values()) {
     free_batches(batch_cache.batches);
   }
@@ -886,6 +1004,7 @@ void DrawCacheImpl::free_nodes_with_changed_topology(const bke::pbvh::Tree &pbvh
 
   free_ibos(ibo_lines_.ibos, nodes_to_free);
   free_ibos(ibo_lines_coarse_.ibos, nodes_to_free);
+  free_ibos(ibo_lines_internal_.ibos, nodes_to_free);
   free_ibos(ibo_tris_.ibos, nodes_to_free);
   free_ibos(ibo_tris_coarse_.ibos, nodes_to_free);
 
@@ -949,17 +1068,26 @@ static int grid_quads_per_axis(const CCGKey &key, const bool coarse)
  * \brief Calculate the number of vertices each node stores in the shared vertex buffer.
  */
 static void calc_vert_counts(const Object &object,
+                             const bke::pbvh::Tree &pbvh,
                              const BitSpan use_flat_layout,
                              const IndexMask &node_mask,
                              MutableSpan<int> counts)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
       node_mask.foreach_index(
           [&](const int i, const int pos) { counts[pos] = nodes[i].corners_num(); });
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      const int faces_per_corner = view.faces_per_corner;
+      node_mask.foreach_index([&](const int i, const int pos) {
+        counts[pos] = nodes[i].corners_num * faces_per_corner * 4;
+      });
       break;
     }
     case bke::pbvh::Type::Grids: {
@@ -987,19 +1115,93 @@ static void calc_vert_counts(const Object &object,
   }
 }
 
+static int count_visible_subfaces_multires(const OffsetIndices<int> base_faces,
+                                           const Span<bool> hidden_faces,
+                                           const int faces_per_corner,
+                                           const Span<int> node_faces)
+{
+  if (hidden_faces.is_empty()) {
+    int total_subfaces = 0;
+    for (const int face_idx : node_faces) {
+      total_subfaces += base_faces[face_idx].size() * faces_per_corner;
+    }
+    return total_subfaces;
+  }
+  int visible_subfaces = 0;
+  for (const int face_idx : node_faces) {
+    const IndexRange face_range = base_faces[face_idx];
+    const int first_subface_idx = face_range.start() * faces_per_corner;
+    const int subfaces_num = face_range.size() * faces_per_corner;
+    for (const int i : IndexRange(subfaces_num)) {
+      if (!hidden_faces[first_subface_idx + i]) {
+        visible_subfaces++;
+      }
+    }
+  }
+  return visible_subfaces;
+}
+
+static uint8_t multires_subface_lines_mask(const int corners_num,
+                                           const int subfaces_num,
+                                           const int subface_i,
+                                           const bool coarse,
+                                           const bool internal_edges)
+{
+  if (coarse) {
+    return 0b1111;
+  }
+  if (corners_num == 4) {
+    const int N = int(std::round(std::sqrt(float(subfaces_num))));
+    const int r = subface_i / N;
+    const int c = subface_i % N;
+    if (internal_edges) {
+      return uint8_t((r > 0) | ((c > 0) << 3));
+    }
+    return uint8_t((r == 0) | ((c == N - 1) << 1) | ((r == N - 1) << 2) | ((c == 0) << 3));
+  }
+  return internal_edges ? 0b0010 : 0b1001;
+}
+
+static int count_visible_lines_multires(const OffsetIndices<int> base_faces,
+                                        const Span<bool> hidden_faces,
+                                        const int faces_per_corner,
+                                        const Span<int> node_faces,
+                                        const bool coarse,
+                                        const bool internal_edges)
+{
+  int total_lines = 0;
+  for (const int face_idx : node_faces) {
+    const IndexRange face_range = base_faces[face_idx];
+    const int corners_num = face_range.size();
+    const int first_subface_idx = face_range.start() * faces_per_corner;
+    const int subfaces_num = corners_num * faces_per_corner;
+    for (const int i : IndexRange(subfaces_num)) {
+      if (!hidden_faces.is_empty() && hidden_faces[first_subface_idx + i]) {
+        continue;
+      }
+      total_lines += count_bits_i(
+          multires_subface_lines_mask(corners_num, subfaces_num, i, coarse, internal_edges));
+    }
+  }
+  return total_lines * 2;
+}
+
 /**
  * \brief Calculate the number of indices each node needs in the shared wireframe index buffer.
  *
  * Hidden faces aren't indexed, so the counts change whenever visibility does.
  */
 static void calc_lines_index_counts(const Object &object,
+                                    const bke::pbvh::Tree &pbvh,
                                     const OrigMeshData &orig_mesh_data,
                                     const bool coarse,
+                                    const bool internal_edges,
                                     const IndexMask &node_mask,
                                     MutableSpan<int> counts)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  /* Internal lines only exist for non-coarse multires, see #ensure_lines_batches_common. */
+  BLI_assert(!internal_edges || (!coarse && pbvh.type() == bke::pbvh::Type::Multires));
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
@@ -1011,6 +1213,25 @@ static void calc_lines_index_counts(const Object &object,
           [&](const int i, const int pos) {
             /* One line per face corner, two indices per line. */
             counts[pos] = count_visible_corners_mesh(faces, hide_poly, nodes[i]) * 2;
+          },
+          exec_mode::grain_size(8));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      const OffsetIndices<int> base_faces = view.base_topo.faces;
+      const Span<bool> hidden_faces = view.hidden_faces;
+      const int faces_per_corner = view.faces_per_corner;
+
+      node_mask.foreach_index(
+          [&](const int i, const int pos) {
+            counts[pos] = count_visible_lines_multires(base_faces,
+                                                       hidden_faces,
+                                                       faces_per_corner,
+                                                       nodes[i].faces(),
+                                                       coarse,
+                                                       internal_edges);
           },
           exec_mode::grain_size(8));
       break;
@@ -1046,13 +1267,13 @@ static void calc_lines_index_counts(const Object &object,
  * Hidden faces aren't indexed, so the counts change whenever visibility does.
  */
 static void calc_tris_index_counts(const Object &object,
+                                   const bke::pbvh::Tree &pbvh,
                                    const OrigMeshData &orig_mesh_data,
                                    const bool coarse,
                                    const IndexMask &node_mask,
                                    MutableSpan<int> counts)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
@@ -1063,6 +1284,22 @@ static void calc_tris_index_counts(const Object &object,
       node_mask.foreach_index(
           [&](const int i, const int pos) {
             counts[pos] = count_visible_tris_mesh(faces, hide_poly, nodes[i]) * 3;
+          },
+          exec_mode::grain_size(8));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      const OffsetIndices<int> base_faces = view.base_topo.faces;
+      const Span<bool> hidden_faces = view.hidden_faces;
+      const int faces_per_corner = view.faces_per_corner;
+
+      node_mask.foreach_index(
+          [&](const int i, const int pos) {
+            counts[pos] = count_visible_subfaces_multires(
+                              base_faces, hidden_faces, faces_per_corner, nodes[i].faces()) *
+                          6;
           },
           exec_mode::grain_size(8));
       break;
@@ -1367,6 +1604,387 @@ BLI_NOINLINE static void update_generic_attribute_mesh(const Object &object,
       },
       exec_mode::grain_size(1));
   finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+static void update_positions_multires(const Object &object,
+                                      const bke::pbvh::Tree &pbvh,
+                                      const Buffer &vbo,
+                                      const int vert_len,
+                                      const IndexMask &node_mask,
+                                      const ScratchOffsets &scratch_offsets,
+                                      DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(position_format(),
+                                                          scratch_offsets.total);
+  node_mask.foreach_index(
+      [&](const int node_index, const int scratch_index) {
+        const IndexRange scratch_range = vbo.scratch_range(node_index,
+                                                           scratch_offsets.offsets[scratch_index]);
+        extract_data_vert_multires<float3>(view.faces_per_corner,
+                                           view.corner_verts,
+                                           view.base_topo,
+                                           view.positions,
+                                           nodes[node_index],
+                                           *scratch_vbo,
+                                           scratch_range);
+      },
+      exec_mode::grain_size(1));
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+static void update_normals_multires(const Object &object,
+                                    const bke::pbvh::Tree &pbvh,
+                                    const Buffer &vbo,
+                                    const int vert_len,
+                                    const IndexMask &node_mask,
+                                    const ScratchOffsets &scratch_offsets,
+                                    DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+  const Span<float3> positions = view.positions;
+  const Span<int> corner_verts = view.corner_verts;
+  const OffsetIndices<int> base_faces = view.base_topo.faces;
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(normal_format(), scratch_offsets.total);
+
+  const int faces_per_corner = view.faces_per_corner;
+
+  node_mask.foreach_index(
+      [&](const int node_index, const int scratch_index) {
+        short4 *data = scratch_vbo->data<short4>().data() + scratch_offsets.offsets[scratch_index];
+        short4 *data_start = data;
+        const bke::pbvh::MultiresNode &node = nodes[node_index];
+        const Span<int> node_faces = node.faces();
+
+        for (const int face_idx : node_faces) {
+          const IndexRange face_range = base_faces[face_idx];
+          const int first_subface_idx = face_range.start() * faces_per_corner;
+          const int subfaces_num = face_range.size() * faces_per_corner;
+          const Span<int> sub_faces = corner_verts.slice(first_subface_idx * 4, subfaces_num * 4);
+
+          for (const int i : IndexRange(subfaces_num)) {
+            const int v0 = sub_faces[i * 4 + 0];
+            const int v1 = sub_faces[i * 4 + 1];
+            const int v2 = sub_faces[i * 4 + 2];
+            const int v3 = sub_faces[i * 4 + 3];
+
+            const float3 &p0 = positions[v0];
+            const float3 &p1 = positions[v1];
+            const float3 &p2 = positions[v2];
+            const float3 &p3 = positions[v3];
+
+            const float3 normal = math::normalize(math::cross(p2 - p0, p3 - p1));
+            const short4 packed_normal = normal_float_to_short(normal);
+
+            data[0] = packed_normal;
+            data[1] = packed_normal;
+            data[2] = packed_normal;
+            data[3] = packed_normal;
+            data += 4;
+          }
+        }
+
+        UNUSED_VARS_NDEBUG(data_start);
+        BLI_assert(data == data_start + vbo.sizes[node_index]);
+      },
+      exec_mode::grain_size(1));
+
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+BLI_NOINLINE static void update_masks_multires(const Object &object,
+                                               const bke::pbvh::Tree &pbvh,
+                                               const Buffer &vbo,
+                                               const int vert_len,
+                                               const IndexMask &node_mask,
+                                               const ScratchOffsets &scratch_offsets,
+                                               DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+  const OffsetIndices<int> base_faces = view.base_topo.faces;
+  const int faces_per_corner = view.faces_per_corner;
+  const Span<int> corner_verts = view.corner_verts;
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(mask_format(), scratch_offsets.total);
+
+  if (!view.masks.is_empty()) {
+    const Span<float> masks = view.masks;
+
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const bke::pbvh::MultiresNode &node = nodes[node_index];
+          float *data = scratch_vbo->data<float>().data() + scratch_offsets.offsets[scratch_index];
+          float *data_start = data;
+
+          for (const int face_idx : node.faces()) {
+            const IndexRange face_range = base_faces[face_idx];
+            const int first_subface_idx = face_range.start() * faces_per_corner;
+            const int subfaces_num = face_range.size() * faces_per_corner;
+            const Span<int> subfaces = corner_verts.slice(first_subface_idx * 4, subfaces_num * 4);
+
+            for (const int vert : subfaces) {
+              *data++ = masks[vert];
+            }
+          }
+
+          UNUSED_VARS_NDEBUG(data_start);
+          BLI_assert(data == data_start + vbo.sizes[node_index]);
+        },
+        exec_mode::grain_size(1));
+  }
+  else {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          scratch_vbo->data<float>().slice(scratch_range).fill(0.0f);
+        },
+        exec_mode::grain_size(64));
+  }
+
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+BLI_NOINLINE static void update_face_sets_multires(const Object &object,
+                                                   const bke::pbvh::Tree &pbvh,
+                                                   const OrigMeshData &orig_mesh_data,
+                                                   const Buffer &vbo,
+                                                   const int vert_len,
+                                                   const IndexMask &node_mask,
+                                                   const ScratchOffsets &scratch_offsets,
+                                                   DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  const OffsetIndices<int> base_faces = view.base_topo.faces;
+  const int faces_per_corner = view.faces_per_corner;
+  const int color_default = orig_mesh_data.face_set_default;
+  const int color_seed = orig_mesh_data.face_set_seed;
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(face_set_format(),
+                                                          scratch_offsets.total);
+  const Span<int> face_sets = view.face_sets;
+
+  if (!face_sets.is_empty()) {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const Span<int> node_faces = nodes[node_index].faces();
+          uchar4 *data = scratch_vbo->data<uchar4>().data() +
+                         scratch_offsets.offsets[scratch_index];
+          uchar4 *data_start = data;
+          for (const int face_idx : node_faces) {
+            const IndexRange face_range = base_faces[face_idx];
+            const int first_subface_idx = face_range.first() * faces_per_corner;
+            const int subfaces_num = face_range.size() * faces_per_corner;
+
+            for (const int subface_idx : IndexRange(first_subface_idx, subfaces_num)) {
+              uchar4 fset_color(UCHAR_MAX);
+              const int id = face_sets[subface_idx];
+              if (id != color_default) {
+                BKE_paint_face_set_overlay_color_get(id, color_seed, fset_color);
+              }
+              else {
+                fset_color[0] = fset_color[1] = fset_color[2] = UCHAR_MAX;
+              }
+
+              std::fill_n(data, 4, fset_color);
+              data += 4;
+            }
+          }
+
+          UNUSED_VARS_NDEBUG(data_start);
+          BLI_assert(data == data_start + vbo.sizes[node_index]);
+        },
+        exec_mode::grain_size(1));
+  }
+  else {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          scratch_vbo->data<uchar4>().slice(scratch_range).fill(uchar4{UCHAR_MAX});
+        },
+        exec_mode::grain_size(1));
+  }
+
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+static void update_colors_multires(const Object &object,
+                                   const bke::pbvh::Tree &pbvh,
+                                   const OrigMeshData &orig_mesh_data,
+                                   const Buffer &vbo,
+                                   const int vert_len,
+                                   const IndexMask &node_mask,
+                                   const ScratchOffsets &scratch_offsets,
+                                   DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(
+      attribute_format(
+          orig_mesh_data, base_mesh.active_color_attribute, bke::AttrType::ColorFloat),
+      scratch_offsets.total);
+
+  if (view.colors.is_empty()) {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          scratch_vbo->data<float4>().slice(scratch_range).fill(float4(1.0f));
+        },
+        exec_mode::grain_size(1));
+  }
+  else {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          extract_data_vert_multires<float4>(view.faces_per_corner,
+                                             view.corner_verts,
+                                             view.base_topo,
+                                             view.colors,
+                                             nodes[node_index],
+                                             *scratch_vbo,
+                                             scratch_range);
+        },
+        exec_mode::grain_size(1));
+  }
+
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+static void update_uvs_multires(const Object &object,
+                                const bke::pbvh::Tree &pbvh,
+                                const OrigMeshData &orig_mesh_data,
+                                const Buffer &vbo,
+                                const int vert_len,
+                                const IndexMask &node_mask,
+                                const ScratchOffsets &scratch_offsets,
+                                const StringRef name,
+                                DrawCacheImpl::AttributeData &attr_vbo)
+{
+  PRF_scope(ProfileCategory::Draw);
+  const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+  const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+  const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  if (node_mask.is_empty()) {
+    return;
+  }
+
+  gpu::VertBufPtr scratch_vbo = create_vbo_scratch_buffer(
+      attribute_format(orig_mesh_data, name, bke::AttrType::Float2), scratch_offsets.total);
+
+  const VArraySpan<float2> base_uvs = *orig_mesh_data.attributes.lookup<float2>(
+      name, bke::AttrDomain::Corner);
+
+  if (base_uvs.is_empty()) {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          scratch_vbo->data<float2>().slice(scratch_range).fill(float2(0.0f));
+        },
+        exec_mode::grain_size(1));
+    finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+    return;
+  }
+
+  const int lvl = view.level;
+  Array<float2> uv_storage;
+  const Span<float2> uvs = bke::multiresolution::uv::calc_smooth_uvs(
+      base_mesh, base_uvs, lvl, uv_storage);
+
+  if (uvs.is_empty()) {
+    node_mask.foreach_index(
+        [&](const int node_index, const int scratch_index) {
+          const IndexRange scratch_range = vbo.scratch_range(
+              node_index, scratch_offsets.offsets[scratch_index]);
+          scratch_vbo->data<float2>().slice(scratch_range).fill(float2(0.0f));
+        },
+        exec_mode::grain_size(1));
+    finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+    return;
+  }
+
+  const OffsetIndices<int> base_faces = view.base_topo.faces;
+  const int faces_per_corner = view.faces_per_corner;
+  node_mask.foreach_index(
+      [&](const int node_index, const int scratch_index) {
+        float2 *data = scratch_vbo->data<float2>().data() + scratch_offsets.offsets[scratch_index];
+        float2 *data_start = data;
+        for (const int face_idx : nodes[node_index].faces()) {
+          const IndexRange face_range = base_faces[face_idx];
+          const int first_subface_idx = face_range.start() * faces_per_corner;
+          const int subfaces_num = face_range.size() * faces_per_corner;
+          const Span<float2> src = uvs.slice(first_subface_idx * 4, subfaces_num * 4);
+          std::copy_n(src.data(), src.size(), data);
+          data += src.size();
+        }
+
+        UNUSED_VARS_NDEBUG(data_start);
+        BLI_assert(data == data_start + vbo.sizes[node_index]);
+      },
+      exec_mode::grain_size(1));
+
+  finalize_vbo_update(attr_vbo, vbo, vert_len, node_mask, scratch_offsets, scratch_vbo);
+}
+
+static void update_generic_attribute_multires(const Object &object,
+                                              const bke::pbvh::Tree &pbvh,
+                                              const OrigMeshData &orig_mesh_data,
+                                              const Buffer &vbo,
+                                              const int vert_len,
+                                              const StringRef name,
+                                              const IndexMask &node_mask,
+                                              const ScratchOffsets &scratch_offsets,
+                                              DrawCacheImpl::AttributeData &attr_vbo)
+{
+  const bke::GAttributeReader attr = orig_mesh_data.attributes.lookup(name);
+  if (!attr || attr.domain == bke::AttrDomain::Edge) {
+    return;
+  }
+  const bke::AttrType data_type = bke::cpp_type_to_attribute_type(attr.varray.type());
+  if (attr.domain == bke::AttrDomain::Corner && data_type == bke::AttrType::Float2) {
+    update_uvs_multires(
+        object, pbvh, orig_mesh_data, vbo, vert_len, node_mask, scratch_offsets, name, attr_vbo);
+    return;
+  }
+  update_colors_multires(
+      object, pbvh, orig_mesh_data, vbo, vert_len, node_mask, scratch_offsets, attr_vbo);
 }
 
 BLI_NOINLINE static void update_positions_grids(const Object &object,
@@ -2709,6 +3327,52 @@ static void create_lines_index_faces(const OffsetIndices<int> faces,
   }
 }
 
+/* NOTE: Temporary solution, see the note on #create_tri_index_bmesh. */
+static void create_lines_index_multires(const int faces_per_corner,
+                                        const Span<bool> hidden_faces,
+                                        const bke::multiresolution::BaseTopology &base_topo,
+                                        const Span<int> node_faces,
+                                        const int64_t vbo_offset,
+                                        const int64_t ibo_len,
+                                        const bool coarse,
+                                        const bool internal_edges,
+                                        uint32_t *host_data)
+{
+  const OffsetIndices<int> base_faces = base_topo.faces;
+
+  MutableSpan<uint2> data = MutableSpan<uint32_t>(host_data, ibo_len).cast<uint2>();
+
+  int line_index = 0;
+  int node_corner_offset = 0;
+
+  for (const int face_idx : node_faces) {
+    const IndexRange face_range = base_faces[face_idx];
+    const int corners_num = face_range.size();
+    const int first_subface_idx = face_range.start() * faces_per_corner;
+    const int subfaces_num = corners_num * faces_per_corner;
+
+    for (const int i : IndexRange(subfaces_num)) {
+      const int subface_idx = first_subface_idx + i;
+      if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+        node_corner_offset += 4;
+        continue;
+      }
+
+      const uint offset = uint(node_corner_offset + int(vbo_offset));
+      const uint8_t mask = multires_subface_lines_mask(
+          corners_num, subfaces_num, i, coarse, internal_edges);
+      for (const int side : IndexRange(4)) {
+        if (mask & (1 << side)) {
+          data[line_index++] = uint2(uint(side), uint((side + 1) % 4)) + offset;
+        }
+      }
+
+      node_corner_offset += 4;
+    }
+  }
+  BLI_assert(line_index * 2 == ibo_len);
+}
+
 /* NOTE: This is a temporary solution. The index buffers are only needed to offset the vertices
  * into the shared (per-object) vertex buffers. Once multi draw indirect is used (each draw can
  * specify its own base vertex) these index buffers can be removed. */
@@ -2970,10 +3634,11 @@ static void create_lines_index_grids_flat_layout(const Span<int> grid_indices,
   }
 }
 
-static Array<int> calc_material_indices(const Object &object, const OrigMeshData &orig_mesh_data)
+static Array<int> calc_material_indices(const Object &object,
+                                        const bke::pbvh::Tree &pbvh,
+                                        const OrigMeshData &orig_mesh_data)
 {
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Span<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
@@ -2992,6 +3657,49 @@ static Array<int> calc_material_indices(const Object &object, const OrigMeshData
             continue;
           }
           node_materials[i] = material_indices[face_indices.first()];
+        }
+      });
+      return node_materials;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const bke::AttributeAccessor attributes = orig_mesh_data.attributes;
+      const VArray material_indices = *attributes.lookup<int>("material_index",
+                                                              bke::AttrDomain::Face);
+      if (!material_indices) {
+        return {};
+      }
+      if (const std::optional<int> single = material_indices.get_if_single()) {
+        return Array<int>(nodes.size(), *single);
+      }
+
+      const Object &object_orig = *DEG_get_original(&object);
+      const Mesh &mesh = *id_cast<const Mesh *>(object_orig.data);
+      if (mesh.multires == nullptr) {
+        return {};
+      }
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      const Multiresolution &multires = *mesh.multires;
+      const int base_lvl = multires.base_level(view.level);
+
+      const bool all_quads = multires.base_all_quads;
+      const Span<int> corner_to_face = (all_quads || base_lvl == 0) ? Span<int>() :
+                                                                      mesh.corner_to_face_map();
+      const int base_shift = all_quads ? (2 * base_lvl) : (2 * std::max(0, base_lvl - 1));
+
+      Array<int> node_materials(nodes.size(), 0);
+      threading::parallel_for(nodes.index_range(), 64, [&](const IndexRange range) {
+        for (const int i : range) {
+          const Span<int> faces = nodes[i].faces();
+          if (faces.is_empty()) {
+            continue;
+          }
+          const int f = faces.first();
+          const int base_face = (base_lvl == 0) ? f :
+                                                  (all_quads ? (f >> base_shift) :
+                                                               corner_to_face[f >> base_shift]);
+          BLI_assert(base_face < material_indices.size());
+          node_materials[i] = material_indices[base_face];
         }
       });
       return node_materials;
@@ -3026,14 +3734,17 @@ static Array<int> calc_material_indices(const Object &object, const OrigMeshData
   return {};
 }
 
-static BitVector<> calc_use_flat_layout(const Object &object, const OrigMeshData &orig_mesh_data)
+static BitVector<> calc_use_flat_layout(const Object &object,
+                                        const bke::pbvh::Tree &pbvh,
+                                        const OrigMeshData &orig_mesh_data)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       /* NOTE: Theoretically it would be possible to used vertex indexed buffers if there are no
        * face corner attributes, sharp faces, or face sets. */
+      return {};
+    case bke::pbvh::Type::Multires:
       return {};
     case bke::pbvh::Type::Grids: {
       const Span<bke::pbvh::GridsNode> nodes = pbvh.nodes<bke::pbvh::GridsNode>();
@@ -3098,6 +3809,44 @@ static void create_tri_index_mesh(const OffsetIndices<int> faces,
     }
     node_corner_offset += face.size();
   }
+}
+
+static void create_tri_index_multires(const int faces_per_corner,
+                                      const Span<bool> hidden_faces,
+                                      const bke::multiresolution::BaseTopology &base_topo,
+                                      const Span<int> node_faces,
+                                      const int64_t vbo_offset,
+                                      const int64_t ibo_len,
+                                      uint32_t *host_data)
+{
+  const OffsetIndices<int> base_faces = base_topo.faces;
+
+  MutableSpan<uint3> data = MutableSpan<uint32_t>(host_data, ibo_len).cast<uint3>();
+
+  int tri_index = 0;
+  int node_corner_offset = 0;
+
+  for (const int face_idx : node_faces) {
+    const IndexRange face_range = base_faces[face_idx];
+    const int first_subface_idx = face_range.start() * faces_per_corner;
+    const int subfaces_num = face_range.size() * faces_per_corner;
+
+    for (const int i : IndexRange(subfaces_num)) {
+      const int subface_idx = first_subface_idx + i;
+      if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+        node_corner_offset += 4;
+        continue;
+      }
+
+      const uint offset = uint(node_corner_offset + int(vbo_offset));
+      data[tri_index++] = uint3(0, 1, 2) + offset;
+      data[tri_index++] = uint3(0, 2, 3) + offset;
+
+      node_corner_offset += 4;
+    }
+  }
+
+  BLI_assert(tri_index * 3 == ibo_len);
 }
 
 static void create_tri_index_grids(const CCGKey &key,
@@ -3185,11 +3934,13 @@ static void create_lines_index_grids(const CCGKey &key,
 Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_lines_indices(const Object &object,
                                                            const OrigMeshData &orig_mesh_data,
                                                            const IndexMask &node_mask,
-                                                           const bool coarse)
+                                                           const bool coarse,
+                                                           const bool internal_edges)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
-  IBOFamily &ibo_family = coarse ? ibo_lines_coarse_ : ibo_lines_;
+  const bke::pbvh::Tree &pbvh = this->tree();
+  IBOFamily &ibo_family = internal_edges ? ibo_lines_internal_ :
+                                           (coarse ? ibo_lines_coarse_ : ibo_lines_);
   ibo_family.ensure_capacity();
   const Buffer &ibo_buffer = ibo_family.buffer;
   Vector<gpu::IndexBufPtr> &ibos = ibo_family.ibos;
@@ -3224,6 +3975,25 @@ Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_lines_indices(const Object &object,
                                      ibo_buffer.sizes[node_index],
                                      scratch_buffer.data() +
                                          scratch_offsets.offsets[scratch_index]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      nodes_to_calculate.foreach_index(
+          [&](const int node_index, const int scratch_index) {
+            create_lines_index_multires(view.faces_per_corner,
+                                        view.hidden_faces,
+                                        view.base_topo,
+                                        nodes[node_index].faces(),
+                                        vbo_.offsets[node_index],
+                                        ibo_buffer.sizes[node_index],
+                                        coarse,
+                                        internal_edges,
+                                        scratch_buffer.data() +
+                                            scratch_offsets.offsets[scratch_index]);
           },
           exec_mode::grain_size(1));
       break;
@@ -3272,9 +4042,9 @@ BitSpan DrawCacheImpl::ensure_use_flat_layout(const Object &object,
                                               const OrigMeshData &orig_mesh_data)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   if (use_flat_layout_.size() != pbvh.nodes_num()) {
-    use_flat_layout_ = calc_use_flat_layout(object, orig_mesh_data);
+    use_flat_layout_ = calc_use_flat_layout(object, pbvh, orig_mesh_data);
   }
   return use_flat_layout_;
 }
@@ -3286,7 +4056,8 @@ DrawCacheImpl::AttributeData &DrawCacheImpl::ensure_attribute_data(
     const IndexMask &node_mask)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const Object &object_orig = *DEG_get_original(&object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   AttributeData &attr_vbo = attribute_vbos_.lookup_or_add_default(attr);
   attr_vbo.ensure_nodes_capacity(node_mask.min_array_size());
 
@@ -3340,6 +4111,46 @@ DrawCacheImpl::AttributeData &DrawCacheImpl::ensure_attribute_data(
                                       dirty_mask,
                                       scratch_offsets,
                                       attr_vbo);
+      }
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      if (const CustomRequest *request_type = std::get_if<CustomRequest>(&attr)) {
+        switch (*request_type) {
+          case CustomRequest::Position:
+            update_positions_multires(
+                object_orig, pbvh, vbo_, vbo_.space.size(), dirty_mask, scratch_offsets, attr_vbo);
+            break;
+          case CustomRequest::Normal:
+            update_normals_multires(
+                object_orig, pbvh, vbo_, vbo_.space.size(), dirty_mask, scratch_offsets, attr_vbo);
+            break;
+          case CustomRequest::Mask:
+            update_masks_multires(
+                object_orig, pbvh, vbo_, vbo_.space.size(), dirty_mask, scratch_offsets, attr_vbo);
+            break;
+          case CustomRequest::FaceSet:
+            update_face_sets_multires(object_orig,
+                                      pbvh,
+                                      orig_mesh_data,
+                                      vbo_,
+                                      vbo_.space.size(),
+                                      dirty_mask,
+                                      scratch_offsets,
+                                      attr_vbo);
+            break;
+        }
+      }
+      else {
+        update_generic_attribute_multires(object_orig,
+                                          pbvh,
+                                          orig_mesh_data,
+                                          vbo_,
+                                          vbo_.space.size(),
+                                          std::get<GenericRequest>(attr),
+                                          dirty_mask,
+                                          scratch_offsets,
+                                          attr_vbo);
       }
       break;
     }
@@ -3453,7 +4264,7 @@ Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_tri_indices(const Object &object,
                                                          const bool coarse)
 {
   PRF_scope(ProfileCategory::Draw);
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   IBOFamily &ibo_family = coarse ? ibo_tris_coarse_ : ibo_tris_;
   ibo_family.ensure_capacity();
   const Buffer &ibo_buffer = ibo_family.buffer;
@@ -3490,6 +4301,23 @@ Span<gpu::IndexBufPtr> DrawCacheImpl::ensure_tri_indices(const Object &object,
                                   vbo_.offsets[node_index],
                                   ibo_buffer.sizes[node_index],
                                   scratch_buffer.data() + scratch_offsets.offsets[scratch_index]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDrawView view = MultiresDrawView::get(object, pbvh);
+      nodes_to_calculate.foreach_index(
+          [&](const int node_index, const int scratch_index) {
+            create_tri_index_multires(view.faces_per_corner,
+                                      view.hidden_faces,
+                                      view.base_topo,
+                                      nodes[node_index].faces(),
+                                      vbo_.offsets[node_index],
+                                      ibo_buffer.sizes[node_index],
+                                      scratch_buffer.data() +
+                                          scratch_offsets.offsets[scratch_index]);
           },
           exec_mode::grain_size(1));
       break;
@@ -3595,13 +4423,15 @@ static IndexMask add_split_bmesh_nodes(const bke::pbvh::Tree &pbvh,
 }
 
 Span<Batch *> DrawCacheImpl::ensure_tris_batches(const Object &object,
+                                                 const bke::pbvh::Tree &pbvh_to_draw,
                                                  const ViewportRequest &request,
                                                  const IndexMask &nodes_to_update)
 {
   PRF_scope(ProfileCategory::Draw);
+  this->pbvh_ = &pbvh_to_draw;
   const Object &object_orig = *DEG_get_original(&object);
   const OrigMeshData orig_mesh_data{*id_cast<const Mesh *>(object_orig.data)};
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   const bool coarse = use_coarse_buffers(pbvh, request);
 
   IndexMaskMemory memory;
@@ -3610,7 +4440,7 @@ Span<Batch *> DrawCacheImpl::ensure_tris_batches(const Object &object,
   bool grown = this->ensure_vert_ranges(object, orig_mesh_data, range_mask);
   grown |= ibo_family.ensure_ranges(
       pbvh.nodes_num(), range_mask, [&](const IndexMask &mask, MutableSpan<int> sizes) {
-        calc_tris_index_counts(object, orig_mesh_data, coarse, mask, sizes);
+        calc_tris_index_counts(object, pbvh, orig_mesh_data, coarse, mask, sizes);
       });
   if (grown) {
     this->tag_batches_dirty();
@@ -3678,22 +4508,46 @@ Span<Batch *> DrawCacheImpl::ensure_tris_batches(const Object &object,
 }
 
 Span<Batch *> DrawCacheImpl::ensure_lines_batches(const Object &object,
+                                                  const bke::pbvh::Tree &pbvh_to_draw,
                                                   const ViewportRequest &request,
                                                   const IndexMask &nodes_to_update)
 {
+  return this->ensure_lines_batches_common(object, pbvh_to_draw, request, nodes_to_update, false);
+}
+
+Span<Batch *> DrawCacheImpl::ensure_lines_internal_batches(const Object &object,
+                                                           const bke::pbvh::Tree &pbvh_to_draw,
+                                                           const ViewportRequest &request,
+                                                           const IndexMask &nodes_to_update)
+{
+  return this->ensure_lines_batches_common(object, pbvh_to_draw, request, nodes_to_update, true);
+}
+
+Span<Batch *> DrawCacheImpl::ensure_lines_batches_common(const Object &object,
+                                                         const bke::pbvh::Tree &pbvh_to_draw,
+                                                         const ViewportRequest &request,
+                                                         const IndexMask &nodes_to_update,
+                                                         const bool internal_edges)
+{
   PRF_scope(ProfileCategory::Draw);
+  this->pbvh_ = &pbvh_to_draw;
   const Object &object_orig = *DEG_get_original(&object);
   const OrigMeshData orig_mesh_data(*id_cast<const Mesh *>(object_orig.data));
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   const bool coarse = use_coarse_buffers(pbvh, request);
+
+  if (internal_edges && (coarse || pbvh.type() != bke::pbvh::Type::Multires)) {
+    return {};
+  }
 
   IndexMaskMemory memory;
   const IndexMask range_mask = add_split_bmesh_nodes(pbvh, nodes_to_update, memory);
-  IBOFamily &ibo_family = coarse ? ibo_lines_coarse_ : ibo_lines_;
+  IBOFamily &ibo_family = internal_edges ? ibo_lines_internal_ :
+                                           (coarse ? ibo_lines_coarse_ : ibo_lines_);
   bool grown = this->ensure_vert_ranges(object, orig_mesh_data, range_mask);
   grown |= ibo_family.ensure_ranges(
       pbvh.nodes_num(), range_mask, [&](const IndexMask &mask, MutableSpan<int> sizes) {
-        calc_lines_index_counts(object, orig_mesh_data, coarse, mask, sizes);
+        calc_lines_index_counts(object, pbvh, orig_mesh_data, coarse, internal_edges, mask, sizes);
       });
   if (grown) {
     this->tag_batches_dirty();
@@ -3704,16 +4558,17 @@ Span<Batch *> DrawCacheImpl::ensure_lines_batches(const Object &object,
   const AttributeData &position = this->ensure_attribute_data(
       object, orig_mesh_data, CustomRequest::Position, nodes_to_update);
   const Span<gpu::IndexBufPtr> lines = this->ensure_lines_indices(
-      object, orig_mesh_data, nodes_to_update, coarse);
+      object, orig_mesh_data, nodes_to_update, coarse, internal_edges);
 
   /* See the note on #ensure_tris_batches for why the batches are reconfigured in place. */
-  BatchCache &batch_cache = coarse ? lines_batches_coarse_ : lines_batches_;
+  BatchCache &batch_cache = internal_edges ? lines_batches_internal_ :
+                                             (coarse ? lines_batches_coarse_ : lines_batches_);
   Vector<Batch *> &batches = batch_cache.batches;
   batches.resize(pbvh.nodes_num(), nullptr);
   batch_cache.dirty.resize(pbvh.nodes_num(), true);
   nodes_to_update.foreach_index(
       [&](const int node_index) {
-        if (lines[node_index] == nullptr) {
+        if (lines[node_index] == nullptr || lines[node_index]->index_len_get() == 0) {
           /* See the same case in #ensure_tris_batches. */
           Batch::clear(batches[node_index]);
           return;
@@ -3741,15 +4596,17 @@ Span<Batch *> DrawCacheImpl::ensure_lines_batches(const Object &object,
   return batches;
 }
 
-Span<int> DrawCacheImpl::ensure_material_indices(const Object &object)
+Span<int> DrawCacheImpl::ensure_material_indices(const Object &object,
+                                                 const bke::pbvh::Tree &pbvh_to_draw)
 {
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  this->pbvh_ = &pbvh_to_draw;
+  const bke::pbvh::Tree &pbvh = this->tree();
   const Object &object_orig = *DEG_get_original(&object);
   const OrigMeshData orig_mesh_data(*id_cast<const Mesh *>(object_orig.data));
   if (orig_mesh_data.attributes.contains("material_index") &&
       material_indices_.size() != pbvh.nodes_num())
   {
-    material_indices_ = calc_material_indices(object, orig_mesh_data);
+    material_indices_ = calc_material_indices(object, pbvh, orig_mesh_data);
   }
   return material_indices_;
 }
@@ -3775,7 +4632,7 @@ bool DrawCacheImpl::ensure_vert_ranges(const Object &object,
                                        const OrigMeshData &orig_mesh_data,
                                        const IndexMask &node_mask)
 {
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bke::pbvh::Tree &pbvh = this->tree();
   const BitSpan use_flat_layout = this->ensure_use_flat_layout(object, orig_mesh_data);
   /* Every index buffer stores offsets into the shared vertex buffer, and for BMesh the attribute
    * values are stored per visible triangle, so a moved vertex range invalidates all of them. That
@@ -3786,7 +4643,7 @@ bool DrawCacheImpl::ensure_vert_ranges(const Object &object,
       pbvh.nodes_num(),
       node_mask,
       [&](const IndexMask &mask, MutableSpan<int> sizes) {
-        calc_vert_counts(object, use_flat_layout, mask, sizes);
+        calc_vert_counts(object, pbvh, use_flat_layout, mask, sizes);
       },
       dirty_topology_);
 }
@@ -3800,6 +4657,7 @@ void DrawCacheImpl::tag_batches_dirty()
   }
   lines_batches_.dirty.fill(true);
   lines_batches_coarse_.dirty.fill(true);
+  lines_batches_internal_.dirty.fill(true);
 }
 
 }  // namespace draw::pbvh

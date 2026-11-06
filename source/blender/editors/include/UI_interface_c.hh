@@ -2958,6 +2958,10 @@ namespace ed::object::shapekey {
 void template_tree(ui::Layout *layout, bContext *C);
 }
 
+namespace ed::sculpt {
+void template_sculpt_layer_tree(ui::Layout *layout, bContext *C);
+}
+
 namespace ui {
 /**
  * \return: True if the list item with unfiltered, unordered index \a item_idx is visible given the

@@ -593,6 +593,11 @@ static void screen_space_overlays_draw(const PaintCursorContext &pcontext)
         position = positions[vert];
         break;
       }
+      case bke::pbvh::Type::Multires: {
+        const Mesh &mesh = *id_cast<const Mesh *>(active_object.data);
+        position = mesh.multires->positions()[vert];
+        break;
+      }
       case bke::pbvh::Type::Grids: {
         const SubdivCCG &subdiv_ccg = *pcontext.ss->subdiv_ccg;
         position = subdiv_ccg.positions[vert];

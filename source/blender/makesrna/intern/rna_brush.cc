@@ -171,6 +171,8 @@ const EnumPropertyItem rna_enum_brush_sculpt_brush_type_items[] = {
     {SCULPT_BRUSH_TYPE_SLIDE_RELAX, "TOPOLOGY", 0, "Slide Relax", ""},
     {SCULPT_BRUSH_TYPE_BOUNDARY, "BOUNDARY", 0, "Boundary", ""},
     {SCULPT_BRUSH_TYPE_SCENE_PROJECT, "SCENE_PROJECT", 0, "Scene Project", ""},
+    {SCULPT_BRUSH_TYPE_MORPH, "MORPH", 0, "Morph", ""},
+    {SCULPT_BRUSH_TYPE_ERASE_LAYER, "ERASE_LAYER", 0, "Erase Layer", ""},
     RNA_ENUM_ITEM_SEPR,
     {SCULPT_BRUSH_TYPE_CLOTH, "CLOTH", 0, "Cloth", ""},
     {SCULPT_BRUSH_TYPE_SIMPLIFY, "SIMPLIFY", 0, "Simplify", ""},
@@ -520,12 +522,6 @@ static bool rna_BrushCapabilitiesSculpt_has_rake_factor_get(PointerRNA *ptr)
 {
   const Brush *br = static_cast<const Brush *>(ptr->data);
   return bke::brush::supports_rake_factor(*br);
-}
-
-static bool rna_BrushCapabilitiesSculpt_has_persistence_get(PointerRNA *ptr)
-{
-  const Brush *br = static_cast<const Brush *>(ptr->data);
-  return bke::brush::supports_persistence(*br);
 }
 
 static bool rna_BrushCapabilitiesSculpt_has_pinch_factor_get(PointerRNA *ptr)
@@ -919,6 +915,8 @@ static const EnumPropertyItem *rna_Brush_direction_itemf(bContext *C,
         case SCULPT_BRUSH_TYPE_CLAY_STRIPS:
         case SCULPT_BRUSH_TYPE_PLANE:
         case SCULPT_BRUSH_TYPE_SCENE_PROJECT:
+        case SCULPT_BRUSH_TYPE_MORPH:
+        case SCULPT_BRUSH_TYPE_ERASE_LAYER:
           return prop_direction_items;
         case SCULPT_BRUSH_TYPE_SMOOTH:
           return prop_smooth_direction_items;
@@ -1262,7 +1260,6 @@ static void rna_def_sculpt_capabilities(BlenderRNA *brna)
   SCULPT_BRUSH_CAPABILITY(has_jitter, "Has Jitter");
   SCULPT_BRUSH_CAPABILITY(has_normal_weight, "Has Crease/Pinch Factor");
   SCULPT_BRUSH_CAPABILITY(has_rake_factor, "Has Rake Factor");
-  SCULPT_BRUSH_CAPABILITY(has_persistence, "Has Persistence");
   SCULPT_BRUSH_CAPABILITY(has_pinch_factor, "Has Pinch Factor");
   SCULPT_BRUSH_CAPABILITY(has_plane_offset, "Has Plane Offset");
   SCULPT_BRUSH_CAPABILITY(has_random_texture_angle, "Has Random Texture Angle");
@@ -3807,9 +3804,10 @@ static void rna_def_brush(BlenderRNA *brna)
       prop, "Smooth Stroke", "Brush lags behind mouse and follows a smoother path");
   RNA_def_property_update(prop, 0, "rna_Brush_update");
 
-  prop = RNA_def_property(srna, "use_persistent", PROP_BOOLEAN, PROP_NONE);
-  RNA_def_property_boolean_sdna(prop, nullptr, "flag", BRUSH_PERSISTENT);
-  RNA_def_property_ui_text(prop, "Persistent", "Sculpt on a persistent layer of the mesh");
+  prop = RNA_def_property(srna, "use_morph_as_base", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "flag", BRUSH_USE_MORPH_AS_BASE);
+  RNA_def_property_ui_text(
+      prop, "Use Morph As Base", "Use the stored morph positions as a base for the brush");
   RNA_def_property_update(prop, 0, "rna_Brush_update");
 
   prop = RNA_def_property(srna, "use_bidirectional", PROP_BOOLEAN, PROP_NONE);

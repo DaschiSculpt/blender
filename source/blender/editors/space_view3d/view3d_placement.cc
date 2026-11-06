@@ -1317,8 +1317,10 @@ static bool view3d_interactive_add_poll(bContext *C)
 
   if (mode == CTX_MODE_SCULPT) {
     Object *ob = CTX_data_active_object(C);
+    const Mesh &mesh = *id_cast<const Mesh *>(ob->data);
     return !BKE_sculpt_multires_active(CTX_data_scene(C), ob) &&
-           !BKE_object_sculpt_use_dyntopo(ob);
+           !BKE_object_sculpt_use_dyntopo(ob) &&
+           (mesh.multires == nullptr || mesh.multires->curr_level == 0);
   }
 
   return ELEM(mode, CTX_MODE_OBJECT, CTX_MODE_EDIT_MESH);

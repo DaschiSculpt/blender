@@ -17,6 +17,7 @@
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_meshdata_types.h"
+#include "DNA_multires_types.h"
 #include "DNA_object_types.h"
 
 #include "BLI_array_utils.hh"
@@ -65,8 +66,10 @@
 #include "BKE_mesh_wrapper.hh"
 #include "BKE_modifier.hh"
 #include "BKE_multires.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object.hh"
 #include "BKE_paint_bvh.hh"
+#include "BKE_sculpt_layer.hh"
 
 #include "DEG_depsgraph.hh"
 #include "DEG_depsgraph_query.hh"
@@ -99,8 +102,8 @@ static void mesh_init_data(ID *id)
 
   new (&mesh->attribute_storage.wrap()) bke::AttributeStorage();
   mesh->runtime = new bke::MeshRuntime();
-
   mesh->face_sets_color_seed = BLI_hash_int(BLI_time_now_seconds_i() & UINT_MAX);
+  mesh->multires = nullptr;
 }
 
 static void mesh_copy_data(Main *bmain,
@@ -161,6 +164,15 @@ static void mesh_copy_data(Main *bmain,
   mesh_dst->runtime->corner_to_face_map_cache = mesh_src->runtime->corner_to_face_map_cache;
   mesh_dst->runtime->edge_to_corner_offset_cache = mesh_src->runtime->edge_to_corner_offset_cache;
   mesh_dst->runtime->edge_to_corner_map_cache = mesh_src->runtime->edge_to_corner_map_cache;
+
+  mesh_dst->runtime->edge_to_face_offset_cache = mesh_src->runtime->edge_to_face_offset_cache;
+  mesh_dst->runtime->edge_to_face_map_cache = mesh_src->runtime->edge_to_face_map_cache;
+  mesh_dst->runtime->vert_to_edge_offset_cache = mesh_src->runtime->vert_to_edge_offset_cache;
+  mesh_dst->runtime->vert_to_edge_map_cache = mesh_src->runtime->vert_to_edge_map_cache;
+  mesh_dst->runtime->face_edge_reversed_cache = mesh_src->runtime->face_edge_reversed_cache;
+  mesh_dst->runtime->boundary_edge_cache = mesh_src->runtime->boundary_edge_cache;
+  mesh_dst->runtime->boundary_vert_cache = mesh_src->runtime->boundary_vert_cache;
+
   mesh_dst->runtime->bvh_cache_edges = mesh_src->runtime->bvh_cache_edges;
   mesh_dst->runtime->bvh_cache_faces = mesh_src->runtime->bvh_cache_faces;
   mesh_dst->runtime->bvh_cache_corner_tris = mesh_src->runtime->bvh_cache_corner_tris;
@@ -181,6 +193,64 @@ static void mesh_copy_data(Main *bmain,
         *mesh_src->runtime->bake_materials);
   }
 
+  if (mesh_src->multires) {
+    if (flag & LIB_ID_CREATE_NO_MAIN) {
+      mesh_dst->multires = nullptr;
+    }
+    else {
+      mesh_dst->multires = BKE_multiresolution_create(*mesh_dst);
+
+      mesh_dst->multires->top_level = mesh_src->multires->top_level;
+      mesh_dst->multires->curr_level = mesh_src->multires->curr_level;
+      mesh_dst->multires->sculpt_level = mesh_src->multires->sculpt_level;
+      mesh_dst->multires->view_level = mesh_src->multires->view_level;
+      mesh_dst->multires->render_level = mesh_src->multires->render_level;
+      mesh_dst->multires->base_verts_num = mesh_src->multires->base_verts_num;
+      mesh_dst->multires->base_edges_num = mesh_src->multires->base_edges_num;
+      mesh_dst->multires->base_faces_num = mesh_src->multires->base_faces_num;
+      mesh_dst->multires->base_corners_num = mesh_src->multires->base_corners_num;
+      mesh_dst->multires->base_all_quads = mesh_src->multires->base_all_quads;
+      mesh_dst->multires->base_topology_hash = mesh_src->multires->base_topology_hash;
+
+      mesh_dst->multires->bvh_partitions = static_cast<BVHPartition *>(
+          MEM_new_array<BVHPartition>(mesh_src->multires->bvh_partitions_len, "bvh_partitions"));
+      mesh_dst->multires->bvh_partitions_len = mesh_src->multires->bvh_partitions_len;
+      mesh_dst->multires->runtime->bvh_partition_sharing.resize(
+          mesh_src->multires->bvh_partitions_len);
+
+      for (int i = 0; i < mesh_src->multires->bvh_partitions_len; i++) {
+        const bke::multiresolution::BVHPartitionSharingInfo &src_info =
+            mesh_src->multires->runtime->bvh_partition_sharing[i];
+        bke::multiresolution::BVHPartitionSharingInfo &dst_info =
+            mesh_dst->multires->runtime->bvh_partition_sharing[i];
+
+        implicit_sharing::copy_shared_pointer<int>(
+            mesh_src->multires->bvh_partitions[i].face_indices,
+            src_info.face_indices,
+            &mesh_dst->multires->bvh_partitions[i].face_indices,
+            &dst_info.face_indices);
+        mesh_dst->multires->bvh_partitions[i].face_indices_len =
+            mesh_src->multires->bvh_partitions[i].face_indices_len;
+
+        implicit_sharing::copy_shared_pointer<int>(
+            mesh_src->multires->bvh_partitions[i].face_counts,
+            src_info.face_counts,
+            &mesh_dst->multires->bvh_partitions[i].face_counts,
+            &dst_info.face_counts);
+        mesh_dst->multires->bvh_partitions[i].face_counts_len =
+            mesh_src->multires->bvh_partitions[i].face_counts_len;
+      }
+
+      mesh_dst->multires->top_attribute_storage.wrap() =
+          mesh_src->multires->top_attribute_storage.wrap();
+      mesh_dst->multires->curr_attribute_storage.wrap() =
+          mesh_src->multires->curr_attribute_storage.wrap();
+    }
+  }
+  else {
+    mesh_dst->multires = nullptr;
+  }
+
   /* Only do tessface if we have no faces. */
   const bool do_tessface = ((mesh_src->totface_legacy != 0) && (mesh_src->faces_num == 0));
 
@@ -199,6 +269,8 @@ static void mesh_copy_data(Main *bmain,
   }
 
   mesh_dst->mat = MEM_dupalloc(mesh_src->mat);
+
+  mesh_dst->sculpt_layers = static_cast<SculptLayer *>(MEM_dupalloc(mesh_src->sculpt_layers));
 
   BKE_defgroup_copy_list(&mesh_dst->vertex_group_names, &mesh_src->vertex_group_names);
   mesh_dst->active_color_attribute = static_cast<char *>(
@@ -276,6 +348,18 @@ static void mesh_free_data(ID *id)
   }
   MEM_SAFE_DELETE(mesh->mselect);
   MEM_SAFE_DELETE(mesh->mat);
+  MEM_SAFE_DELETE(mesh->sculpt_layers);
+
+  if (mesh->multires) {
+    if ((mesh->id.tag & ID_TAG_NO_MAIN) == 0) {
+      mesh->multires->free();
+      MEM_SAFE_DELETE(mesh->multires);
+    }
+    else {
+      mesh->multires = nullptr;
+    }
+  }
+
   delete mesh->runtime;
 }
 
@@ -366,6 +450,8 @@ static void mesh_blend_write(BlendWriter *writer, ID *id, const void *id_address
     mesh->faces_num = 0;
     mesh->face_data = CustomData{};
     mesh->face_offset_indices = nullptr;
+
+    mesh->multires = nullptr;
   }
   else {
     /* No need to store data in 5.0 data format, because it uses #CustomData at runtime anyway. */
@@ -401,6 +487,109 @@ static void mesh_blend_write(BlendWriter *writer, ID *id, const void *id_address
   });
   BKE_id_blend_write(writer, &mesh->id);
 
+  if (mesh->multires) {
+    bke::multiresolution::MultiresolutionRuntime *old_runtime = mesh->multires->runtime;
+    bke::AttributeStorageRuntime *old_top_attr_runtime =
+        mesh->multires->top_attribute_storage.runtime;
+    bke::AttributeStorageRuntime *old_curr_attr_runtime =
+        mesh->multires->curr_attribute_storage.runtime;
+
+    blender::Attribute *old_top_attrs = mesh->multires->top_attribute_storage.dna_attributes;
+    int old_top_attrs_num = mesh->multires->top_attribute_storage.dna_attributes_num;
+    blender::Attribute *old_curr_attrs = mesh->multires->curr_attribute_storage.dna_attributes;
+    int old_curr_attrs_num = mesh->multires->curr_attribute_storage.dna_attributes_num;
+
+    bke::AttributeStorage::BlendWriteData top_attribute_data{writer, scope};
+    bke::AttributeStorage::BlendWriteData curr_attribute_data{writer, scope};
+
+    attribute_storage_blend_write_prepare(
+        mesh->multires->top_attribute_storage.wrap(),
+        false,
+        [&](const AttrDomain domain) {
+          switch (domain) {
+            case AttrDomain::Point:
+              return mesh->multires->top_verts_num();
+            case AttrDomain::Face:
+              return mesh->multires->top_faces_num();
+            default: {
+              BLI_assert_unreachable();
+              return 0;
+            }
+          }
+        },
+        top_attribute_data);
+
+    attribute_storage_blend_write_prepare(
+        mesh->multires->curr_attribute_storage.wrap(),
+        false,
+        [&](const AttrDomain domain) {
+          switch (domain) {
+            case AttrDomain::Point:
+              return mesh->multires->verts_num();
+            case AttrDomain::Face:
+              return mesh->multires->faces_num();
+            default: {
+              BLI_assert_unreachable();
+              return 0;
+            }
+          }
+        },
+        curr_attribute_data);
+
+    if (top_attribute_data.attributes.is_empty()) {
+      mesh->multires->top_attribute_storage.dna_attributes = nullptr;
+      mesh->multires->top_attribute_storage.dna_attributes_num = 0;
+    }
+    else {
+      mesh->multires->top_attribute_storage.dna_attributes = top_attribute_data.attributes.data();
+      mesh->multires->top_attribute_storage.dna_attributes_num =
+          top_attribute_data.attributes.size();
+    }
+
+    if (curr_attribute_data.attributes.is_empty()) {
+      mesh->multires->curr_attribute_storage.dna_attributes = nullptr;
+      mesh->multires->curr_attribute_storage.dna_attributes_num = 0;
+    }
+    else {
+      mesh->multires->curr_attribute_storage.dna_attributes =
+          curr_attribute_data.attributes.data();
+      mesh->multires->curr_attribute_storage.dna_attributes_num =
+          curr_attribute_data.attributes.size();
+    }
+
+    mesh->multires->runtime = nullptr;
+    writer->write_struct(mesh->multires);
+    writer->write_struct_array<BVHPartition>(mesh->multires->bvh_partitions_len,
+                                             mesh->multires->bvh_partitions);
+
+    for (int i = 0; i < mesh->multires->bvh_partitions_len; i++) {
+      const BVHPartition &p = mesh->multires->bvh_partitions[i];
+      const bke::multiresolution::BVHPartitionSharingInfo &info =
+          old_runtime->bvh_partition_sharing[i];
+
+      writer->write_shared(
+          p.face_indices, sizeof(int) * p.face_indices_len, info.face_indices, [&]() {
+            writer->write_int32_array(p.face_indices_len, p.face_indices);
+          });
+
+      writer->write_shared(p.face_counts,
+                           sizeof(int) * p.face_counts_len,
+                           info.face_counts,
+                           [&]() { writer->write_int32_array(p.face_counts_len, p.face_counts); });
+    }
+
+    mesh->multires->top_attribute_storage.wrap().blend_write(*writer, top_attribute_data);
+    mesh->multires->curr_attribute_storage.wrap().blend_write(*writer, curr_attribute_data);
+
+    mesh->multires->runtime = old_runtime;
+    mesh->multires->top_attribute_storage.runtime = old_top_attr_runtime;
+    mesh->multires->top_attribute_storage.dna_attributes = old_top_attrs;
+    mesh->multires->top_attribute_storage.dna_attributes_num = old_top_attrs_num;
+    mesh->multires->curr_attribute_storage.runtime = old_curr_attr_runtime;
+    mesh->multires->curr_attribute_storage.dna_attributes = old_curr_attrs;
+    mesh->multires->curr_attribute_storage.dna_attributes_num = old_curr_attrs_num;
+  }
+
   BKE_defbase_blend_write(writer, &mesh->vertex_group_names);
   writer->write_string(mesh->active_color_attribute);
   writer->write_string(mesh->default_color_attribute);
@@ -411,6 +600,7 @@ static void mesh_blend_write(BlendWriter *writer, ID *id, const void *id_address
 
   writer->write_pointer_array(mesh->totcol, mesh->mat);
   writer->write_struct_array(mesh->totselect, mesh->mselect);
+  writer->write_struct_array(mesh->sculpt_layers_len, mesh->sculpt_layers);
 
   CustomData_blend_write(
       writer, &mesh->vert_data, vert_layers, mesh->verts_num, CD_MASK_MESH.vmask, &mesh->id);
@@ -444,6 +634,12 @@ static void mesh_blend_read_data(BlendDataReader *reader, ID *id)
     mesh->totcol = 0;
   }
 
+  BLO_read_array_and_validate_size(reader, &mesh->sculpt_layers, &mesh->sculpt_layers_len);
+  if (!mesh->sculpt_layers) {
+    mesh->sculpt_layers_len = 0;
+    mesh->active_layer_index = -1;
+  }
+
   /* Deprecated pointers to custom data layers are read here for backward compatibility
    * with files where these were owning pointers rather than a view into custom data.
    *
@@ -466,6 +662,42 @@ static void mesh_blend_read_data(BlendDataReader *reader, ID *id)
   CustomData_blend_read(reader, &mesh->fdata_legacy, mesh->totface_legacy);
   CustomData_blend_read(reader, &mesh->corner_data, mesh->corners_num);
   CustomData_blend_read(reader, &mesh->face_data, mesh->faces_num);
+  BLO_read_struct(reader, Multiresolution, &mesh->multires);
+  if (mesh->multires) {
+    Multiresolution *multires = mesh->multires;
+    multires->runtime = MEM_new<bke::multiresolution::MultiresolutionRuntime>(__func__, *mesh);
+
+    BLO_read_array_and_validate_size(
+        reader, &multires->bvh_partitions, &multires->bvh_partitions_len);
+    multires->runtime->bvh_partition_sharing.resize(multires->bvh_partitions_len);
+
+    for (int i = 0; i < multires->bvh_partitions_len; i++) {
+      BVHPartition &p = multires->bvh_partitions[i];
+      bke::multiresolution::BVHPartitionSharingInfo &info =
+          multires->runtime->bvh_partition_sharing[i];
+
+      info.face_indices = BLO_read_shared(reader, &p.face_indices, [&]() {
+        if (!BLO_read_array(reader, &p.face_indices, int64_t(p.face_indices_len))) {
+          p.face_indices_len = 0;
+        }
+        return p.face_indices ? implicit_sharing::info_for_mem_free(p.face_indices) : nullptr;
+      });
+
+      info.face_counts = BLO_read_shared(reader, &p.face_counts, [&]() {
+        if (!BLO_read_array(reader, &p.face_counts, int64_t(p.face_counts_len))) {
+          p.face_counts_len = 0;
+        }
+        return p.face_counts ? implicit_sharing::info_for_mem_free(p.face_counts) : nullptr;
+      });
+    }
+
+    multires->top_attribute_storage.wrap().blend_read(*reader, [&](const bke::AttrDomain domain) {
+      return multires->top_attributes().domain_size(domain);
+    });
+    multires->curr_attribute_storage.wrap().blend_read(*reader, [&](const bke::AttrDomain domain) {
+      return multires->curr_attributes().domain_size(domain);
+    });
+  }
   if (mesh->deform_verts().is_empty()) {
     /* Vertex group data was also an owning pointer in old Blender versions.
      * Don't read them again if they were read as part of #CustomData. */
@@ -1295,6 +1527,19 @@ void Mesh::count_memory(MemoryCounter &memory) const
   CustomData_count_memory(this->edge_data, this->edges_num, memory);
   CustomData_count_memory(this->face_data, this->faces_num, memory);
   CustomData_count_memory(this->corner_data, this->corners_num, memory);
+
+  if (this->multires) {
+    this->multires->top_attribute_storage.wrap().count_memory(memory);
+    this->multires->curr_attribute_storage.wrap().count_memory(memory);
+
+    for (int i = 0; i < this->multires->bvh_partitions_len; i++) {
+      const int level = i + 1;
+      memory.add_shared(this->multires->runtime->bvh_partition_sharing[i].face_indices,
+                        this->multires->bvh_face_indices(level).size_in_bytes());
+      memory.add_shared(this->multires->runtime->bvh_partition_sharing[i].face_counts,
+                        this->multires->bvh_face_counts(level).size_in_bytes());
+    }
+  }
 }
 
 bke::AttributeAccessor Mesh::attributes() const
@@ -1373,6 +1618,11 @@ void Mesh::uv_maps_default_set(const StringRef name)
     }
     CustomData_set_layer_render_index(&bm->ldata, CD_PROP_FLOAT2, index);
   }
+}
+
+Span<SculptLayer> Mesh::sculpt_layers_as_span() const
+{
+  return {this->sculpt_layers, this->sculpt_layers_len};
 }
 
 Mesh *BKE_mesh_new_nomain(const int verts_num,
@@ -1473,6 +1723,7 @@ void BKE_mesh_copy_parameters(Mesh *me_dst, const Mesh *me_src)
 
   me_dst->face_sets_color_seed = me_src->face_sets_color_seed;
   me_dst->face_sets_color_default = me_src->face_sets_color_default;
+  me_dst->multires_use_linear = me_src->multires_use_linear;
 
   /* Copy texture space. */
   me_dst->texspace_flag = me_src->texspace_flag;
@@ -2072,6 +2323,10 @@ void mesh_translate(Mesh &mesh, const float3 &translation, const bool do_shape_k
     }
   }
 
+  if (mesh.multires) {
+    math::translate_points(mesh.multires->top_base_positions_for_write(), translation);
+  }
+
   mesh.tag_positions_changed_uniformly();
 
   if (bounds) {
@@ -2092,6 +2347,28 @@ void mesh_transform(Mesh &mesh, const float4x4 &transform, bool do_shape_keys)
   }
   MutableAttributeAccessor attributes = mesh.attributes_for_write();
   transform_custom_normal_attribute(transform, attributes);
+
+  const float3x3 linear_transform = float3x3(transform);
+  auto transform_directions = [&](const MutableSpan<float3> directions) {
+    threading::parallel_for(directions.index_range(), 2048, [&](const IndexRange range) {
+      for (float3 &direction : directions.slice(range)) {
+        direction = math::transform_direction(linear_transform, direction);
+      }
+    });
+  };
+
+  if (mesh.multires) {
+    math::transform_points(transform, mesh.multires->top_base_positions_for_write());
+  }
+  for (const SculptLayer &layer : mesh.sculpt_layers_as_span()) {
+    if (!bke::sculpt_layer::layer_displacements(mesh, layer.name).is_empty()) {
+      transform_directions(bke::sculpt_layer::layer_displacements_for_write(mesh, layer.name));
+    }
+    if (mesh.multires && !bke::sculpt_layer::layer_top_displacements(mesh, layer.name).is_empty())
+    {
+      transform_directions(bke::sculpt_layer::layer_top_displacements_for_write(mesh, layer.name));
+    }
+  }
 
   mesh.tag_positions_changed();
 }

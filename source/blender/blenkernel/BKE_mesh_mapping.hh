@@ -302,6 +302,10 @@ GroupedSpan<int> build_vert_to_face_map(OffsetIndices<int> faces,
                                         Array<int> &r_indices);
 
 Array<int> build_vert_to_corner_indices(Span<int> corner_verts, OffsetIndices<int> offsets);
+Array<int> build_edge_to_face_indices(OffsetIndices<int> faces,
+                                      Span<int> corner_edges,
+                                      OffsetIndices<int> offsets);
+Array<int> build_vert_to_edge_indices(Span<int2> edges, OffsetIndices<int> offsets);
 GroupedSpan<int> build_vert_to_corner_map(Span<int> corner_verts,
                                           int verts_num,
                                           Array<int> &r_offsets,

@@ -205,6 +205,28 @@ void calc_factors_common_mesh_indexed(const Depsgraph &depsgraph,
                                       const bke::pbvh::MeshNode &node,
                                       MutableSpan<float> factors,
                                       MutableSpan<float> distances);
+void calc_factors_common_multires(const Depsgraph &depsgraph,
+                                  const Brush &brush,
+                                  const Object &object,
+                                  const Multiresolution &multires,
+                                  const bke::multiresolution::BaseTopology &base_topo,
+                                  const Span<float3> positions,
+                                  const Span<float3> normals,
+                                  const bke::pbvh::MultiresNode &node,
+                                  MutableSpan<float> factors,
+                                  MutableSpan<float> distances);
+void calc_cube_tip_factors_common_multires(const Depsgraph &depsgraph,
+                                           const Brush &brush,
+                                           const Object &object,
+                                           const float4x4 &mat,
+                                           const Multiresolution &multires,
+                                           const bke::multiresolution::BaseTopology &base_topo,
+                                           const Span<float3> positions,
+                                           const Span<float3> normals,
+                                           const MutableSpan<float3> local_positions,
+                                           const bke::pbvh::MultiresNode &node,
+                                           MutableSpan<float> factors,
+                                           MutableSpan<float> distances);
 void calc_cube_tip_factors_common_mesh_indexed(const Depsgraph &depsgraph,
                                                const Brush &brush,
                                                const Object &object,
@@ -309,6 +331,9 @@ void calc_cube_tip_factors_common_from_orig_data_bmesh(const Depsgraph &depsgrap
  * Calculate initial influence factors based on vertex visibility.
  */
 void fill_factor_from_hide(Span<bool> hide_vert, Span<int> verts, MutableSpan<float> r_factors);
+void fill_factor_from_hide(const Span<bool> hidden,
+                           const IndexRange range,
+                           const MutableSpan<float> r_factors);
 void fill_factor_from_hide(const SubdivCCG &subdiv_ccg,
                            Span<int> grids,
                            MutableSpan<float> r_factors);
@@ -321,6 +346,10 @@ void fill_factor_from_hide_and_mask(Span<bool> hide_vert,
                                     Span<float> mask,
                                     Span<int> verts,
                                     MutableSpan<float> r_factors);
+void fill_factor_from_hide_and_mask(const Span<bool> hidden,
+                                    const Span<float> mask,
+                                    const IndexRange range,
+                                    const MutableSpan<float> r_factors);
 void fill_factor_from_hide_and_mask(const SubdivCCG &subdiv_ccg,
                                     Span<int> grids,
                                     MutableSpan<float> r_factors);
@@ -436,6 +465,7 @@ void calc_brush_texture_factors(PaintMode paint_mode,
  * simply add them to the final vertex positions.
  */
 void apply_translations(Span<float3> translations, Span<int> verts, MutableSpan<float3> positions);
+void apply_translations(const Span<float3> translations, const MutableSpan<float3> positions);
 void apply_translations(Span<float3> translations, Span<int> grids, SubdivCCG &subdiv_ccg);
 void apply_translations(Span<float3> translations, const Set<BMVert *, 0> &verts);
 
@@ -484,6 +514,10 @@ void clip_and_lock_translations(const Sculpt &sd,
 OffsetIndices<int> create_node_vert_offsets(Span<bke::pbvh::MeshNode> nodes,
                                             const IndexMask &node_mask,
                                             Array<int> &node_data);
+OffsetIndices<int> create_node_vert_offsets(const int grid_size,
+                                            const Span<bke::pbvh::MultiresNode> nodes,
+                                            const IndexMask &node_mask,
+                                            Array<int> &node_data);
 OffsetIndices<int> create_node_vert_offsets(const CCGKey &key,
                                             Span<bke::pbvh::GridsNode> nodes,
                                             const IndexMask &node_mask,
@@ -503,6 +537,13 @@ GroupedSpan<int> calc_vert_neighbors(OffsetIndices<int> faces,
                                      GroupedSpan<int> vert_to_face,
                                      Span<bool> hide_poly,
                                      Span<int> verts,
+                                     Vector<int> &r_offset_data,
+                                     Vector<int> &r_data);
+GroupedSpan<int> calc_vert_neighbors(const bke::multiresolution::OffsetsSpan &offsets,
+                                     const Multiresolution &multires,
+                                     const bke::multiresolution::BaseTopology &base_topo,
+                                     const Span<bool> hidden,
+                                     const bke::pbvh::MultiresNode &node,
                                      Vector<int> &r_offset_data,
                                      Vector<int> &r_data);
 GroupedSpan<int> calc_vert_neighbors(const SubdivCCG &subdiv_ccg,

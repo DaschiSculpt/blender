@@ -19,12 +19,14 @@ struct BMesh;
 struct BMVert;
 struct CCGKey;
 struct Depsgraph;
+struct Multiresolution;
 struct Object;
 struct SubdivCCG;
 struct wmOperatorType;
 namespace bke::pbvh {
 class Node;
-}
+struct MultiresNode;
+}  // namespace bke::pbvh
 
 namespace ed::sculpt_paint::mask {
 
@@ -50,6 +52,12 @@ void write_mask_mesh(const Depsgraph &depsgraph,
                      const IndexMask &node_mask,
                      FunctionRef<void(MutableSpan<float>, Span<int>)> write_fn);
 
+void write_mask_multires(const Depsgraph &depsgraph,
+                         Object &object,
+                         Multiresolution &multires,
+                         const IndexMask &node_mask,
+                         FunctionRef<void(bke::pbvh::MultiresNode &node)> write_fn);
+
 /**
  * Write to each node's mask data for visible vertices. Store undo data and mark for redraw only
  * if the data is actually changed.
@@ -58,6 +66,12 @@ void update_mask_mesh(const Depsgraph &depsgraph,
                       Object &object,
                       const IndexMask &node_mask,
                       FunctionRef<void(MutableSpan<float>, Span<int>)> update_fn);
+void update_mask_multires(
+    const Depsgraph &depsgraph,
+    Object &object,
+    Multiresolution &multires,
+    const IndexMask &index_mask,
+    FunctionRef<void(MutableSpan<float>, bke::pbvh::MultiresNode &node)> update_fn);
 
 /** Check whether array data is the same as the stored mask for the referenced geometry. */
 bool mask_equals_array_grids(Span<float> masks,

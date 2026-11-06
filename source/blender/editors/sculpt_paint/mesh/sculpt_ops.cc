@@ -12,11 +12,13 @@
 #include "BLI_enumerable_thread_specific.hh"
 #include "BLI_math_matrix.hh"
 #include "BLI_math_vector.hh"
+#include "BLI_string_utils.hh"
 
 #include "BLT_translation.hh"
 
 #include "DNA_brush_types.h"
 #include "DNA_listBase.h"
+#include "DNA_multires_types.h"
 #include "DNA_node_types.h"
 #include "DNA_object_types.h"
 #include "DNA_scene_types.h"
@@ -31,6 +33,7 @@
 #include "BKE_mesh.hh"
 #include "BKE_mesh_mirror.hh"
 #include "BKE_multires.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object.hh"
 #include "BKE_object_types.hh"
 #include "BKE_paint.hh"
@@ -38,6 +41,7 @@
 #include "BKE_paint_types.hh"
 #include "BKE_report.hh"
 #include "BKE_scene.hh"
+#include "BKE_sculpt_layer.hh"
 #include "BKE_subdiv_ccg.hh"
 
 #include "DEG_depsgraph.hh"
@@ -54,6 +58,7 @@
 #include "ED_paint.hh"
 #include "ED_screen.hh"
 #include "ED_sculpt.hh"
+#include "ED_undo.hh"
 
 #include "../paint_intern.hh"
 #include "mesh_brush_common.hh"
@@ -64,6 +69,9 @@
 #include "sculpt_dyntopo.hh"
 #include "sculpt_flood_fill.hh"
 #include "sculpt_intern.hh"
+#include "sculpt_morph.hh"
+#include "sculpt_multires.hh"
+#include "sculpt_storage_undo.hh"
 #include "sculpt_undo.hh"
 
 #include "RNA_access.hh"
@@ -79,87 +87,6 @@
 #include <cstring>
 
 namespace blender::ed::sculpt_paint {
-
-/* -------------------------------------------------------------------- */
-/** \name Set Persistent Base Operator
- * \{ */
-
-static wmOperatorStatus set_persistent_base_exec(bContext *C, wmOperator * /*op*/)
-{
-  Depsgraph *depsgraph = CTX_data_depsgraph_pointer(C);
-  Object &ob = *CTX_data_active_object(C);
-  SculptSession *ss = ob.runtime->sculpt_session;
-
-  const View3D *v3d = CTX_wm_view3d(C);
-  const Base *base = CTX_data_active_base(C);
-  if (!BKE_base_is_visible(v3d, base)) {
-    return OPERATOR_CANCELLED;
-  }
-
-  if (!ss) {
-    return OPERATOR_CANCELLED;
-  }
-
-  BKE_sculptsession_update_for_edit(depsgraph, &ob, false);
-
-  switch (bke::object::pbvh_get(ob)->type()) {
-    case bke::pbvh::Type::Mesh: {
-      Mesh &mesh = *id_cast<Mesh *>(ob.data);
-      bke::MutableAttributeAccessor attributes = mesh.attributes_for_write();
-      attributes.remove(".sculpt_persistent_co");
-      attributes.remove(".sculpt_persistent_no");
-      attributes.remove(".sculpt_persistent_disp");
-
-      const bke::AttributeReader positions = attributes.lookup<float3>("position");
-      if (positions.sharing_info && positions.varray.is_span()) {
-        attributes.add<float3>(
-            ".sculpt_persistent_co",
-            bke::AttrDomain::Point,
-            bke::AttributeInitShared(positions.varray.get_internal_span().data(),
-                                     *positions.sharing_info));
-      }
-      else {
-        attributes.add<float3>(".sculpt_persistent_co",
-                               bke::AttrDomain::Point,
-                               bke::AttributeInitVArray(positions.varray));
-      }
-
-      const Span<float3> vert_normals = bke::pbvh::vert_normals_eval(*depsgraph, ob);
-      attributes.add<float3>(".sculpt_persistent_no",
-                             bke::AttrDomain::Point,
-                             bke::AttributeInitVArray(VArray<float3>::from_span(vert_normals)));
-      break;
-    }
-    case bke::pbvh::Type::Grids: {
-      const SubdivCCG &subdiv_ccg = *ss->subdiv_ccg;
-      ss->persistent.sculpt_persistent_co = subdiv_ccg.positions;
-      ss->persistent.sculpt_persistent_no = subdiv_ccg.normals;
-      ss->persistent.sculpt_persistent_disp = Array<float>(subdiv_ccg.positions.size(), 0.0f);
-      ss->persistent.grid_size = subdiv_ccg.grid_size;
-      ss->persistent.grids_num = subdiv_ccg.grids_num;
-      break;
-    }
-    case bke::pbvh::Type::BMesh: {
-      return OPERATOR_CANCELLED;
-    }
-  }
-
-  return OPERATOR_FINISHED;
-}
-
-static void SCULPT_OT_set_persistent_base(wmOperatorType *ot)
-{
-  ot->name = "Set Persistent Base";
-  ot->idname = "SCULPT_OT_set_persistent_base";
-  ot->description = "Reset the copy of the mesh that is being sculpted on";
-
-  ot->exec = set_persistent_base_exec;
-  ot->poll = sculpt_mode_poll;
-
-  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
-}
-
-/** \} */
 
 /* -------------------------------------------------------------------- */
 /** \name Optimize Operator
@@ -210,7 +137,7 @@ static bool no_multires_poll(bContext *C)
   }
   const bke::pbvh::Tree *pbvh = bke::object::pbvh_get(*ob);
   if (sculpt_mode_poll(C) && ob->runtime->sculpt_session && pbvh) {
-    return pbvh->type() != bke::pbvh::Type::Grids;
+    return pbvh->type() != bke::pbvh::Type::Grids && pbvh->type() != bke::pbvh::Type::Multires;
   }
   return false;
 }
@@ -282,6 +209,7 @@ static wmOperatorStatus symmetrize_exec(bContext *C, wmOperator *op)
 
       break;
     }
+    case bke::pbvh::Type::Multires:
     case bke::pbvh::Type::Grids:
       return OPERATOR_CANCELLED;
   }
@@ -342,6 +270,11 @@ void object_sculpt_mode_enter(Main &bmain,
     BKE_report(reports, RPT_WARNING, "Object has negative scale, sculpting may be unpredictable");
   }
 
+  if (mesh->multires) {
+    mesh->multires->curr_level = math::clamp(
+        mesh->multires->sculpt_level, 0, mesh->multires->top_level);
+  }
+  multires::ensure_curr_storage(ob);
   ed::sculpt_paint::mode_enter_generic(bmain, depsgraph, scene, ob, OB_MODE_SCULPT);
 
   if (mesh->attributes().contains(".sculpt_face_set")) {
@@ -373,19 +306,19 @@ void object_sculpt_mode_enter(Main &bmain,
     }
     else {
       const dyntopo::WarnFlag flag = dyntopo::check_attribute_warning(scene, ob);
-      if (flag == 0) {
-        /* pass */
-      }
-      else if (flag & dyntopo::ATTRIBUTES) {
+      if (flag & dyntopo::ATTRIBUTES) {
         BKE_report(reports,
                    RPT_WARNING,
                    "Dyntopo will not preserve face sets, colors, UVs, or other attributes");
       }
-      else if (flag & dyntopo::MODIFIER) {
-        message_unsupported = RPT_("constructive modifier");
+      if (flag & dyntopo::MULTIRES) {
+        BKE_report(
+            reports,
+            RPT_WARNING,
+            "Dynamic topology will alter base mesh topology and make multiresolution data stale");
       }
-      else {
-        BLI_assert_unreachable();
+      if (flag & dyntopo::MODIFIER) {
+        message_unsupported = RPT_("constructive modifier");
       }
     }
 
@@ -431,6 +364,13 @@ void object_sculpt_mode_exit(Main &bmain, Depsgraph &depsgraph, Scene &scene, Ob
   mesh->runtime->corner_tris_cache.unfreeze();
 
   multires_flush_sculpt_updates(&ob);
+
+  if (mesh->multires) {
+    mesh->multires->sculpt_level = mesh->multires->curr_level;
+    multires::flush(ob);
+    mesh->multires->curr_level = 0;
+    mesh->multires->clear_sculpt_data();
+  }
 
   if (mesh->flag & ME_SCULPT_DYNAMIC_TOPOLOGY) {
     /* Dynamic topology must be disabled before exiting sculpt
@@ -649,6 +589,91 @@ static void mask_by_color_full_mesh(const Depsgraph &depsgraph,
       });
 }
 
+static void mask_by_color_contiguous_multires(const Depsgraph &depsgraph,
+                                              Object &object,
+                                              Multiresolution &multires,
+                                              const bke::multiresolution::BaseTopology &base_topo,
+                                              const int vert,
+                                              const float threshold,
+                                              const bool invert,
+                                              const bool preserve_mask)
+{
+  using MultiresCoord = bke::multiresolution::MultiresCoord;
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const int verts_num = multires.verts_num();
+  const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+  const Span<float4> colors = multires.colors();
+  const float4 active_color = float4(colors[vert]);
+
+  Array<float> new_mask(verts_num, invert ? 1.0f : 0.0f);
+
+  multires.coord_from_index_map_ensure(base_topo, offsets);
+  flood_fill::FillDataMultires flood(verts_num);
+  flood.add_initial(multires.coord_from_index(vert));
+
+  flood.execute(object, multires, base_topo, [&](MultiresCoord /*from*/, MultiresCoord to) {
+    const int to_idx = to.to_index(offsets);
+    const float4 current_color = float4(colors[to_idx]);
+
+    float new_vertex_mask = color_delta_get(
+        current_color.xyz(), active_color.xyz(), threshold, invert);
+    new_mask[to_idx] = new_vertex_mask;
+
+    float len = math::distance(current_color.xyz(), active_color.xyz());
+    len = len / std::numbers::sqrt3_v<float>;
+    return len <= threshold;
+  });
+
+  IndexMaskMemory memory;
+  const IndexMask node_mask = bke::pbvh::all_leaf_nodes(pbvh, memory);
+
+  update_mask_multires(depsgraph,
+                       object,
+                       multires,
+                       node_mask,
+                       [&](MutableSpan<float> node_masks, bke::pbvh::MultiresNode &node) {
+                         for (const int vert : node.range(grid_size)) {
+                           const int node_vert = vert - node.offset();
+                           node_masks[node_vert] = final_mask_get(
+                               node_masks[node_vert], new_mask[vert], invert, preserve_mask);
+                         }
+                       });
+}
+
+static void mask_by_color_full_multires(const Depsgraph &depsgraph,
+                                        Object &object,
+                                        Multiresolution &multires,
+                                        const int vert,
+                                        const float threshold,
+                                        const bool invert,
+                                        const bool preserve_mask)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const Span<float4> colors = multires.colors();
+  const float4 active_color = float4(colors[vert]);
+
+  IndexMaskMemory memory;
+  const IndexMask node_mask = bke::pbvh::all_leaf_nodes(pbvh, memory);
+
+  mask::update_mask_multires(depsgraph,
+                             object,
+                             multires,
+                             node_mask,
+                             [&](MutableSpan<float> node_masks, bke::pbvh::MultiresNode &node) {
+                               for (const int vert : node.range(grid_size)) {
+                                 const int node_vert = vert - node.offset();
+                                 const float4 current_color = float4(colors[vert]);
+                                 const float current_mask = node_masks[node_vert];
+                                 const float new_mask = color_delta_get(
+                                     active_color.xyz(), current_color.xyz(), threshold, invert);
+                                 node_masks[node_vert] = final_mask_get(
+                                     current_mask, new_mask, invert, preserve_mask);
+                               }
+                             });
+}
+
 static wmOperatorStatus mask_by_color(bContext *C, wmOperator *op, const float2 region_location)
 {
   const Scene &scene = *CTX_data_scene(C);
@@ -693,17 +718,46 @@ static wmOperatorStatus mask_by_color(bContext *C, wmOperator *op, const float2 
   const bool preserve_mask = RNA_boolean_get(op->ptr, "preserve_previous_mask");
 
   const int active_vert = std::get<int>(ss.active_vert());
-  if (RNA_boolean_get(op->ptr, "contiguous")) {
-    mask_by_color_contiguous_mesh(*depsgraph, ob, active_vert, threshold, invert, preserve_mask);
-  }
-  else {
-    mask_by_color_full_mesh(*depsgraph, ob, active_vert, threshold, invert, preserve_mask);
+
+  switch (bke::object::pbvh_get(ob)->type()) {
+    case bke::pbvh::Type::Mesh: {
+      if (RNA_boolean_get(op->ptr, "contiguous")) {
+        mask_by_color_contiguous_mesh(
+            *depsgraph, ob, active_vert, threshold, invert, preserve_mask);
+      }
+      else {
+        mask_by_color_full_mesh(*depsgraph, ob, active_vert, threshold, invert, preserve_mask);
+      }
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      Multiresolution &multires = *base_mesh.multires;
+
+      if (multires.colors().is_empty()) {
+        return OPERATOR_CANCELLED;
+      }
+
+      const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+      if (RNA_boolean_get(op->ptr, "contiguous")) {
+        mask_by_color_contiguous_multires(
+            *depsgraph, ob, multires, base_topo, active_vert, threshold, invert, preserve_mask);
+      }
+      else {
+        mask_by_color_full_multires(
+            *depsgraph, ob, multires, active_vert, threshold, invert, preserve_mask);
+      }
+      break;
+    }
+    case bke::pbvh::Type::Grids:
+    case bke::pbvh::Type::BMesh:
+      BLI_assert_unreachable();
+      break;
   }
 
   undo::push_end(ob);
 
   flush_update_done(C, ob, UpdateType::Mask);
-  DEG_id_tag_update(&ob.id, ID_RECALC_GEOMETRY);
 
   return OPERATOR_FINISHED;
 }
@@ -873,6 +927,38 @@ static void apply_mask_mesh(const Depsgraph &depsgraph,
   scatter_data_mesh(node_mask.as_span(), verts, mask);
 }
 
+static void apply_mask_multires(const Depsgraph &depsgraph,
+                                const Object &object,
+                                Multiresolution &multires,
+                                const bke::multiresolution::BaseTopology &base_topo,
+                                const auto_mask::Cache &automasking,
+                                const ApplyMaskMode mode,
+                                const MutableSpan<float> masks,
+                                const float factor,
+                                const bke::pbvh::MultiresNode &node,
+                                LocalData &tls)
+{
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  tls.factors.resize(node_range.size());
+  const MutableSpan<float> factors = tls.factors;
+  fill_factor_from_hide(multires.hidden_verts(), node_range, factors);
+  scale_factors(factors, factor);
+
+  tls.new_mask.resize(node_range.size());
+  const MutableSpan<float> new_mask = tls.new_mask;
+  new_mask.fill(1.0f);
+  auto_mask::calc_multires_factors(
+      depsgraph, object, multires, base_topo, automasking, node, new_mask);
+
+  mask::invert_mask(new_mask);
+
+  const MutableSpan<float> node_mask = masks.slice(node_range);
+
+  calc_new_masks(mode, node_mask, new_mask);
+  mix_new_masks(new_mask, factors, node_mask);
+}
+
 static void apply_mask_grids(const Depsgraph &depsgraph,
                              Object &object,
                              const auto_mask::Cache &automasking,
@@ -969,6 +1055,30 @@ static void apply_mask_from_settings(const Depsgraph &depsgraph,
           },
           exec_mode::grain_size(1));
       mask.finish();
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+      Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+      const MutableSpan<float> masks = multires.ensure_masks();
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      node_mask.foreach_index(
+          [&](const int i) {
+            LocalData &tls = all_tls.local();
+            apply_mask_multires(depsgraph,
+                                object,
+                                multires,
+                                base_topo,
+                                automasking,
+                                mode,
+                                masks,
+                                factor,
+                                nodes[i],
+                                tls);
+            bke::pbvh::node_update_mask_multires(masks, multires.grid_size(), nodes[i]);
+          },
+          exec_mode::grain_size(1));
       break;
     }
     case bke::pbvh::Type::Grids: {
@@ -1418,9 +1528,17 @@ void operatortypes_sculpt()
 {
   WM_operatortype_append(SCULPT_OT_brush_stroke);
   WM_operatortype_append(SCULPT_OT_sculptmode_toggle);
-  WM_operatortype_append(SCULPT_OT_set_persistent_base);
   WM_operatortype_append(dyntopo::SCULPT_OT_dynamic_topology_toggle);
   WM_operatortype_append(SCULPT_OT_optimize);
+  WM_operatortype_append(multires::SCULPT_OT_multires_set_sculpt_level);
+  WM_operatortype_append(multires::SCULPT_OT_multires_set_view_level);
+  WM_operatortype_append(multires::SCULPT_OT_multires_set_render_level);
+  WM_operatortype_append(multires::SCULPT_OT_multires_switch_down);
+  WM_operatortype_append(multires::SCULPT_OT_multires_switch_up);
+  WM_operatortype_append(multires::SCULPT_OT_multires_subdiv);
+  WM_operatortype_append(multires::SCULPT_OT_multires_delete_lower);
+  WM_operatortype_append(multires::SCULPT_OT_multires_delete_higher);
+  WM_operatortype_append(multires::SCULPT_OT_multires_bake);
   WM_operatortype_append(SCULPT_OT_symmetrize);
   WM_operatortype_append(dyntopo::SCULPT_OT_detail_flood_fill);
   WM_operatortype_append(dyntopo::SCULPT_OT_sample_detail_size);
@@ -1454,6 +1572,17 @@ void operatortypes_sculpt()
   WM_operatortype_append(SCULPT_OT_paint_mask_extract);
   WM_operatortype_append(SCULPT_OT_face_set_extract);
   WM_operatortype_append(SCULPT_OT_paint_mask_slice);
+
+  WM_operatortype_append(layer::SCULPT_OT_layer_add);
+  WM_operatortype_append(layer::SCULPT_OT_layer_remove);
+  WM_operatortype_append(layer::SCULPT_OT_layer_move);
+  WM_operatortype_append(layer::SCULPT_OT_layer_duplicate);
+  WM_operatortype_append(layer::SCULPT_OT_layer_merge_to_base);
+  WM_operatortype_append(layer::SCULPT_OT_layer_merge_down);
+
+  WM_operatortype_append(morph::SCULPT_OT_morph_store);
+  WM_operatortype_append(morph::SCULPT_OT_morph_swap);
+  WM_operatortype_append(morph::SCULPT_OT_morph_delete);
 }
 
 void keymap_sculpt(wmKeyConfig *keyconf)

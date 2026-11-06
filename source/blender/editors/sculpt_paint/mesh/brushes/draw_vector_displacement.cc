@@ -154,6 +154,49 @@ static void calc_faces(const Depsgraph &depsgraph,
   position_data.deform(translations, verts);
 }
 
+static void calc_multires(const Depsgraph &depsgraph,
+                          const Sculpt &sd,
+                          Multiresolution &multires,
+                          const bke::multiresolution::BaseTopology &base_topo,
+                          Object &object,
+                          const Brush &brush,
+                          const float3x3 &mat,
+                          bke::pbvh::MultiresNode &node,
+                          const MultiresDeformData &deform_data)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = deform_data.positions.slice(node_range);
+  const Span<float3> normals = multires.normals().slice(node_range);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(positions.size());
+
+  fill_factor_from_hide_and_mask(multires.hidden_verts(), multires.masks(), node_range, factors);
+  filter_region_clip_factors(ss, positions, factors);
+  if (brush.flag & BRUSH_FRONTFACE) {
+    calc_front_face(cache.view_normal_symm, normals, factors);
+  }
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> distances(positions.size());
+  calc_brush_distances(ss, positions, eBrushFalloffShape(brush.falloff_shape), distances);
+  filter_distances_with_radius(cache.radius, distances, factors);
+  apply_hardness_to_distances(cache, distances);
+  calc_brush_strength_factors(cache, brush, distances, factors);
+
+  auto_mask::calc_multires_factors(
+      depsgraph, object, multires, base_topo, cache.automasking.get(), node, factors);
+
+  Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> translations(positions.size());
+  calc_brush_texture_colors(PaintMode::Sculpt, ss, brush, positions, translations);
+  scale_translations(translations, factors);
+  transform_directions(mat, translations);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  deform_data.deform(node_range, translations);
+}
+
 static void calc_grids(const Depsgraph &depsgraph,
                        const Sculpt &sd,
                        Object &object,
@@ -247,6 +290,7 @@ void do_draw_vector_displacement_brush(const Depsgraph &depsgraph,
   PRF_scope(ProfileCategory::Editor);
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const Brush &brush = *BKE_paint_brush_for_read(&sd.paint);
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
 
   const SculptSession &ss = *object.runtime->sculpt_session;
   const float3x3 mat = calc_vertex_displacement_matrix(*ss.cache, brush);
@@ -254,7 +298,6 @@ void do_draw_vector_displacement_brush(const Depsgraph &depsgraph,
   threading::EnumerableThreadSpecific<LocalData> all_tls;
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
-      Mesh &mesh = *id_cast<Mesh *>(object.data);
       const PositionDeformData position_data(depsgraph, object);
       const Span<float3> vert_normals = bke::pbvh::vert_normals_eval(depsgraph, object);
       MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
@@ -271,6 +314,21 @@ void do_draw_vector_displacement_brush(const Depsgraph &depsgraph,
                        object,
                        position_data);
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(mesh);
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDeformData deform_data(mesh);
+      node_mask.foreach_index(
+          [&](const int i) {
+            calc_multires(
+                depsgraph, sd, multires, base_topo, object, brush, mat, nodes[i], deform_data);
+            bke::pbvh::update_node_bounds_multires(
+                multires.grid_size(), multires.positions(), pbvh.offsets, nodes[i]);
           },
           exec_mode::grain_size(1));
       break;

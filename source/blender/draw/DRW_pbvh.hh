@@ -62,6 +62,7 @@ class DrawCache : public bke::pbvh::DrawCache {
    * \note Calls within the drawing of a single viewport must use the same nodes_to_update mask.
    */
   virtual Span<Batch *> ensure_tris_batches(const Object &object,
+                                            const bke::pbvh::Tree &pbvh,
                                             const ViewportRequest &request,
                                             const IndexMask &nodes_to_update) = 0;
   /**
@@ -70,14 +71,20 @@ class DrawCache : public bke::pbvh::DrawCache {
    * \note Calls within the drawing of a single viewport must use the same nodes_to_update mask.
    */
   virtual Span<Batch *> ensure_lines_batches(const Object &object,
+                                             const bke::pbvh::Tree &pbvh,
                                              const ViewportRequest &request,
                                              const IndexMask &nodes_to_update) = 0;
+
+  virtual Span<Batch *> ensure_lines_internal_batches(const Object &object,
+                                                      const bke::pbvh::Tree &pbvh,
+                                                      const ViewportRequest &request,
+                                                      const IndexMask &nodes_to_update) = 0;
 
   /**
    * Return the material index for each node (all faces in a node should have the same material
    * index, as ensured by the BVH building process).
    */
-  virtual Span<int> ensure_material_indices(const Object &object) = 0;
+  virtual Span<int> ensure_material_indices(const Object &object, const bke::pbvh::Tree &pbvh) = 0;
 };
 
 DrawCache &ensure_draw_data(std::unique_ptr<bke::pbvh::DrawCache> &ptr);

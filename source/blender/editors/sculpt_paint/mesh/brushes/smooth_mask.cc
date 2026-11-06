@@ -180,6 +180,112 @@ static void do_smooth_brush_mesh(const Depsgraph &depsgraph,
   mask.finish();
 }
 
+static void apply_masks_multires(const Depsgraph &depsgraph,
+                                 Multiresolution &multires,
+                                 const bke::multiresolution::BaseTopology &base_topo,
+                                 const Brush &brush,
+                                 const bke::pbvh::MultiresNode &node,
+                                 const float strength,
+                                 Object &object,
+                                 LocalData &tls,
+                                 const Span<float> mask_averages,
+                                 const MutableSpan<float> mask)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = multires.positions().slice(node_range);
+  const Span<float3> normals = multires.normals().slice(node_range);
+
+  tls.factors.resize(positions.size());
+  const MutableSpan<float> factors = tls.factors;
+  fill_factor_from_hide(multires.hidden_verts(), node_range, factors);
+  filter_region_clip_factors(ss, positions, factors);
+  if (brush.flag & BRUSH_FRONTFACE) {
+    calc_front_face(cache.view_normal_symm, normals, factors);
+  }
+
+  tls.distances.resize(positions.size());
+  const MutableSpan<float> distances = tls.distances;
+  calc_brush_distances(ss, positions, eBrushFalloffShape(brush.falloff_shape), distances);
+  filter_distances_with_radius(cache.radius, distances, factors);
+  apply_hardness_to_distances(cache, distances);
+  calc_brush_strength_factors(cache, brush, distances, factors);
+
+  auto_mask::calc_multires_factors(
+      depsgraph, object, multires, base_topo, cache.automasking.get(), node, factors);
+
+  scale_factors(factors, strength);
+
+  calc_brush_texture_factors(PaintMode::Sculpt, ss, brush, positions, factors);
+
+  tls.new_masks.resize(positions.size());
+  const MutableSpan<float> new_masks = tls.new_masks;
+  new_masks.copy_from(mask);
+
+  mask::mix_new_masks(mask_averages, factors, new_masks);
+  mask::clamp_mask(new_masks);
+  mask.copy_from(new_masks);
+}
+
+static void do_smooth_brush_multires(const Depsgraph &depsgraph,
+                                     const Brush &brush,
+                                     Object &object,
+                                     const IndexMask &node_mask,
+                                     const float brush_strength)
+{
+  const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+  const Span<bool> hidden_verts = multires.hidden_verts();
+  const int grid_size = multires.grid_size();
+  const MutableSpan<float> masks = multires.ensure_masks();
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  Array<int> node_offset_data;
+  const OffsetIndices<int> node_vert_offsets = create_node_vert_offsets(
+      multires.grid_size(), nodes, node_mask, node_offset_data);
+  Array<float> new_masks(node_vert_offsets.total_size());
+
+  threading::EnumerableThreadSpecific<LocalData> all_tls;
+
+  for (const float strength : iteration_strengths(brush_strength)) {
+    node_mask.foreach_index(
+        [&](const int i, const int pos) {
+          smooth::neighbor_data_average_node_multires<float>(
+              multires,
+              base_topo,
+              nodes[i],
+              pbvh.offsets,
+              masks,
+              new_masks.as_mutable_span().slice(node_vert_offsets[pos]),
+              hidden_verts);
+        },
+        exec_mode::grain_size(1));
+
+    node_mask.foreach_index(
+        [&](const int i, const int pos) {
+          LocalData &tls = all_tls.local();
+          apply_masks_multires(depsgraph,
+                               multires,
+                               base_topo,
+                               brush,
+                               nodes[i],
+                               strength,
+                               object,
+                               tls,
+                               new_masks.as_span().slice(node_vert_offsets[pos]),
+                               masks.slice(nodes[i].range(grid_size)));
+        },
+        exec_mode::grain_size(1));
+  }
+
+  bke::pbvh::update_mask_multires(multires, node_mask, pbvh);
+  pbvh.tag_masks_changed(node_mask);
+}
+
 static void calc_grids(const Depsgraph &depsgraph,
                        Object &object,
                        const Brush &brush,
@@ -300,6 +406,10 @@ void do_smooth_mask_brush(const Depsgraph &depsgraph,
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       do_smooth_brush_mesh(depsgraph, brush, object, node_mask, brush_strength);
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      do_smooth_brush_multires(depsgraph, brush, object, node_mask, brush_strength);
       break;
     }
     case bke::pbvh::Type::Grids: {

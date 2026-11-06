@@ -116,6 +116,9 @@ bool vert_is_boundary(GroupedSpan<int> vert_to_face_map,
                       Span<bool> hide_poly,
                       BitSpan boundary_verts,
                       int vert);
+bool vert_is_boundary(const bke::multiresolution::MultiresCoord coord,
+                      const BitSpan boundary_verts,
+                      const BitSpan boundary_edges);
 bool vert_is_boundary(OffsetIndices<int> faces,
                       Span<int> corner_verts,
                       BitSpan boundary_verts,
@@ -138,6 +141,11 @@ std::unique_ptr<SculptBoundary> data_init_mesh(const Depsgraph &depsgraph,
                                                const Brush *brush,
                                                int initial_vert,
                                                float radius);
+std::unique_ptr<SculptBoundary> data_init_multires(
+    Object &object,
+    const Brush *brush,
+    const bke::multiresolution::MultiresCoord initial_vert,
+    const float radius);
 std::unique_ptr<SculptBoundary> data_init_grids(Object &object,
                                                 const Brush *brush,
                                                 SubdivCCGCoord initial_vert,

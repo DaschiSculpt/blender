@@ -37,6 +37,7 @@ class Wireframe : Overlay {
     PassMain::Sub *mesh_ps_ = nullptr;
     /* Variant for meshes that force drawing all edges. */
     PassMain::Sub *mesh_all_edges_ps_ = nullptr;
+    PassMain::Sub *mesh_internal_edges_ps_ = nullptr;
     PassMain::Sub *points_ps_ = nullptr;
     PassMain::Sub *pointcloud_ps_ = nullptr;
     PassMain::Sub *gsplat_ps_ = nullptr;
@@ -82,28 +83,33 @@ class Wireframe : Overlay {
                      state.clipping_plane_count);
       res.select_bind(pass);
 
-      auto shader_pass =
-          [&](gpu::Shader *shader, const char *name, bool use_coloring, float wire_threshold) {
-            auto &sub = pass.sub(name);
-            if (res.shaders->wireframe_mesh.get() == shader) {
-              sub.specialize_constant(shader, "use_custom_depth_bias", do_smooth_lines);
-            }
-            sub.shader_set(shader);
-            sub.bind_texture("depth_tx", depth_tex);
-            sub.push_constant("wire_opacity", state.overlay.wireframe_opacity);
-            sub.push_constant("is_transform", is_transform);
-            sub.push_constant("color_type", state.v3d->shading.wire_color_type);
-            sub.push_constant("use_coloring", use_coloring);
-            sub.push_constant("wire_step_param", wire_threshold);
-            sub.push_constant("ndc_offset_factor", &state.ndc_offset_factor);
-            sub.push_constant("is_hair", false);
-            return &sub;
-          };
+      auto shader_pass = [&](gpu::Shader *shader,
+                             const char *name,
+                             bool use_coloring,
+                             float wire_threshold,
+                             float opacity_factor = 1.0f) {
+        auto &sub = pass.sub(name);
+        if (res.shaders->wireframe_mesh.get() == shader) {
+          sub.specialize_constant(shader, "use_custom_depth_bias", do_smooth_lines);
+        }
+        sub.shader_set(shader);
+        sub.bind_texture("depth_tx", depth_tex);
+        sub.push_constant("wire_opacity", state.overlay.wireframe_opacity * opacity_factor);
+        sub.push_constant("is_transform", is_transform);
+        sub.push_constant("color_type", state.v3d->shading.wire_color_type);
+        sub.push_constant("use_coloring", use_coloring);
+        sub.push_constant("wire_step_param", wire_threshold);
+        sub.push_constant("ndc_offset_factor", &state.ndc_offset_factor);
+        sub.push_constant("is_hair", false);
+        return &sub;
+      };
 
       auto coloring_pass = [&](ColoringPass &ps, bool use_color) {
         overlay::ShaderModule &sh = *res.shaders;
         ps.mesh_ps_ = shader_pass(sh.wireframe_mesh.get(), "Mesh", use_color, wire_threshold);
         ps.mesh_all_edges_ps_ = shader_pass(sh.wireframe_mesh.get(), "Wire", use_color, 1.0f);
+        ps.mesh_internal_edges_ps_ = shader_pass(
+            sh.wireframe_mesh.get(), "WireInternal", use_color, 1.0f, 0.5f);
         ps.points_ps_ = shader_pass(sh.wireframe_points.get(), "Points", use_color, 1.0f);
         ps.pointcloud_ps_ = shader_pass(
             sh.wireframe_points_with_radius.get(), "PtCloud", use_color, 1.0f);
@@ -185,6 +191,11 @@ class Wireframe : Overlay {
 
             for (SculptBatch &batch : sculpt_batches_get(ob_ref.object, SCULPT_BATCH_WIREFRAME)) {
               coloring.mesh_all_edges_ps_->draw(batch.batch, handle);
+            }
+            for (SculptBatch &batch :
+                 sculpt_batches_get(ob_ref.object, SCULPT_BATCH_WIREFRAME_INTERNAL))
+            {
+              coloring.mesh_internal_edges_ps_->draw(batch.batch, handle);
             }
           }
           else if (!in_edit_mode || bypass_mode_check) {

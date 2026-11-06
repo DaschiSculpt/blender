@@ -54,6 +54,7 @@ enum class Type : int8_t;
 }  // namespace ed::sculpt_paint
 struct bContext;
 struct BMLog;
+struct Depsgraph;
 struct Dial;
 struct DistRayAABB_Precalc;
 struct Image;
@@ -69,6 +70,18 @@ struct wmOperatorType;
 namespace bke::bvh {
 class Tree;
 }
+
+namespace ed::sculpt_paint {
+namespace layer {
+/* Refresh sculpt display positions after sculpt-layer data changed. Shared by the layer
+ * operators and storage-undo restore. Only ever updates layers-only fast-path state in place
+ * (multires eval positions and the session display buffer, i.e. evaluation A == B). Returns
+ * true when anything beyond that is needed (modifiers, shape keys: evaluation B), in which
+ * case the caller owns tagging ID_RECALC_GEOMETRY. Anything left stale by the fast path is
+ * cleaned up by sculptsession_update after the reevaluation it triggers. */
+bool sync_after_layer_change(Object &object, const Depsgraph &depsgraph, bool positions_changed);
+}  // namespace layer
+}  // namespace ed::sculpt_paint
 
 /* -------------------------------------------------------------------- */
 /** \name Sculpt Types
@@ -119,9 +132,25 @@ class PositionDeformData {
 
   std::optional<ShapeKeyData> shape_key_data_;
 
+  bool is_layer_active_;
+  float layer_inv_opacity_ = 1.0f;
+  MutableSpan<float3> layer_displacements_;
+
  public:
   PositionDeformData(const Depsgraph &depsgraph, Object &object_orig);
   void deform(MutableSpan<float3> translations, Span<int> verts) const;
+};
+
+struct MultiresDeformData {
+  MutableSpan<float3> positions;
+  MutableSpan<float3> base_positions;
+  MutableSpan<float3> displacements;
+  float inv_opacity = 1.0f;
+  bool apply_base = false;
+
+  MultiresDeformData() = default;
+  MultiresDeformData(Mesh &mesh);
+  void deform(IndexRange node_range, Span<float3> translations) const;
 };
 
 enum class UpdateType {
@@ -408,9 +437,6 @@ struct StrokeCache {
   /* Stores the displacement produced by the laplacian step of HC smooth. */
   Array<float3> surface_smooth_laplacian_disp;
 
-  /* Layer brush */
-  Array<float> layer_displacement_factor;
-
   /* Amount to rotate the vertices when using rotate brush. */
   float vertex_rotation = 0.0f;
   Dial *dial = nullptr;
@@ -673,6 +699,12 @@ std::optional<int> nearest_vert_calc_mesh(const bke::pbvh::Tree &pbvh,
                                           const float3 &location,
                                           float max_distance,
                                           bool use_original);
+std::optional<bke::multiresolution::MultiresCoord> nearest_vert_calc_multires(
+    const bke::pbvh::Tree &pbvh,
+    const Multiresolution &multires,
+    const float3 &location,
+    const float max_distance,
+    const bool use_original);
 std::optional<SubdivCCGCoord> nearest_vert_calc_grids(const bke::pbvh::Tree &pbvh,
                                                       const SubdivCCG &subdiv_ccg,
                                                       const float3 &location,
@@ -709,6 +741,9 @@ Vector<int> find_symm_verts_mesh(const Depsgraph &depsgraph,
                                  const Object &object,
                                  int original_vert,
                                  float max_distance = std::numeric_limits<float>::max());
+Vector<int> find_symm_verts_multires(const Object &object,
+                                     const int original_vert,
+                                     const float max_distance);
 Vector<int> find_symm_verts_grids(const Object &object,
                                   int original_vert,
                                   float max_distance = std::numeric_limits<float>::max());
@@ -727,6 +762,10 @@ Vector<int> find_symm_verts(const Depsgraph &depsgraph,
  */
 std::array<int, PAINT_SYMM_AREAS> find_all_symm_verts_mesh(
     const Depsgraph &depsgraph,
+    const Object &object,
+    int original_vert,
+    float max_distance = std::numeric_limits<float>::max());
+std::array<int, PAINT_SYMM_AREAS> find_all_symm_verts_multires(
     const Object &object,
     int original_vert,
     float max_distance = std::numeric_limits<float>::max());
@@ -850,6 +889,20 @@ inline OrigPositionData orig_position_data_get_mesh(const Object &object,
   return *result;
 }
 
+std::optional<OrigPositionData> orig_position_data_lookup_multires_all_verts(
+    const Object &object, const bke::pbvh::MultiresNode &node);
+
+std::optional<OrigPositionData> orig_position_data_lookup_multires(
+    const Object &object, const bke::pbvh::MultiresNode &node);
+
+inline OrigPositionData orig_position_data_get_multires(const Object &object,
+                                                        const bke::pbvh::MultiresNode &node)
+{
+  const std::optional<OrigPositionData> result = orig_position_data_lookup_multires(object, node);
+  BLI_assert(result.has_value());
+  return *result;
+}
+
 std::optional<OrigPositionData> orig_position_data_lookup_grids(const Object &object,
                                                                 const bke::pbvh::GridsNode &node);
 inline OrigPositionData orig_position_data_get_grids(const Object &object,
@@ -872,14 +925,26 @@ inline Span<float4> orig_color_data_get_mesh(const Object &object, const bke::pb
   return *orig_color_data_lookup_mesh(object, node);
 }
 
+std::optional<Span<float4>> orig_color_data_lookup_multires(const Object &object,
+                                                            const bke::pbvh::MultiresNode &node);
+inline Span<float4> orig_color_data_get_multires(const Object &object,
+                                                 const bke::pbvh::MultiresNode &node)
+{
+  return *orig_color_data_lookup_multires(object, node);
+}
+
 std::optional<Span<int>> orig_face_set_data_lookup_mesh(const Object &object,
                                                         const bke::pbvh::MeshNode &node);
+
+std::optional<Span<int>> orig_face_set_data_lookup_multires(const bke::pbvh::MultiresNode &node);
 
 std::optional<Span<int>> orig_face_set_data_lookup_grids(const Object &object,
                                                          const bke::pbvh::GridsNode &node);
 
 std::optional<Span<float>> orig_mask_data_lookup_mesh(const Object &object,
                                                       const bke::pbvh::MeshNode &node);
+
+std::optional<Span<float>> orig_mask_data_lookup_multires(const bke::pbvh::MultiresNode &node);
 
 std::optional<Span<float>> orig_mask_data_lookup_grids(const Object &object,
                                                        const bke::pbvh::GridsNode &node);
@@ -1002,6 +1067,25 @@ void SCULPT_OT_dyntopo_detail_size_edit(wmOperatorType *ot);
 void SCULPT_OT_dynamic_topology_toggle(wmOperatorType *ot);
 
 }  // namespace ed::sculpt_paint::dyntopo
+
+namespace ed::sculpt_paint::layer {
+
+void SCULPT_OT_layer_add(wmOperatorType *ot);
+void SCULPT_OT_layer_remove(wmOperatorType *ot);
+void SCULPT_OT_layer_move(wmOperatorType *ot);
+void SCULPT_OT_layer_duplicate(wmOperatorType *ot);
+void SCULPT_OT_layer_merge_to_base(wmOperatorType *ot);
+void SCULPT_OT_layer_merge_down(wmOperatorType *ot);
+
+}  // namespace ed::sculpt_paint::layer
+
+namespace ed::sculpt_paint::morph {
+
+void SCULPT_OT_morph_store(wmOperatorType *ot);
+void SCULPT_OT_morph_swap(wmOperatorType *ot);
+void SCULPT_OT_morph_delete(wmOperatorType *ot);
+
+}  // namespace ed::sculpt_paint::morph
 
 /** \} */
 

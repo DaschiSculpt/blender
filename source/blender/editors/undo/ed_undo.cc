@@ -689,7 +689,10 @@ std::optional<UndoEncodeHints> ED_undo_is_legacy_compatible_for_property(bContex
 
 UndoStack *ED_undo_stack_get()
 {
-  wmWindowManager *wm = G_MAIN->wm.first();
+  wmWindowManager *wm = (G_MAIN != nullptr) ? G_MAIN->wm.first() : nullptr;
+  if (wm == nullptr || wm->runtime == nullptr) {
+    return nullptr;
+  }
   return wm->runtime->undo_stack;
 }
 

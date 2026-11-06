@@ -57,6 +57,8 @@ ActiveElementIndices get_active_element_indices(ViewContext &vc, const float2 &m
  */
 bool shape_key_check(const Object &ob, ReportList *reports);
 
+bool sculpt_layer_check(const Object &ob, ReportList *reports);
+
 void operatortypes_sculpt();
 
 void keymap_sculpt(wmKeyConfig *keyconf);
@@ -83,16 +85,32 @@ void geometry_begin(const Scene &scene, Object &ob, const wmOperator *op);
 void geometry_begin_ex(const Scene &scene, Object &ob, const char *name);
 void geometry_end(Object &ob);
 
-/**
- * Undo for changes happening on a base mesh for multires sculpting.
- * if there is no multi-res sculpt active regular undo is used.
- */
 void push_multires_mesh_begin(bContext *C, const char *str);
 void push_multires_mesh_end(bContext *C, const char *str);
 
 size_t step_memory_size_get(UndoStep *step);
 
 }  // namespace undo
+
+namespace storage_undo {
+
+void push_set_active_layer_begin(Object &ob);
+void push_rename_layer_begin(Object &ob);
+void push_end(Object &ob);
+
+}  // namespace storage_undo
+
+namespace multires {
+
+bool set_sculpt_level(bContext *C,
+                      Object *ob,
+                      Mesh &mesh,
+                      int target_lvl,
+                      const char *undo_name = "Multires Set Sculpt Level");
+
+void view_level_changed(bContext *C, Object *ob, Mesh &mesh);
+
+}  // namespace multires
 
 namespace face_set {
 

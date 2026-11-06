@@ -28,6 +28,8 @@
 
 namespace blender::ed::sculpt_paint::flood_fill {
 
+using MultiresCoord = bke::multiresolution::MultiresCoord;
+
 void FillDataMesh::add_initial(const int vertex)
 {
   this->queue.push(vertex);
@@ -37,6 +39,18 @@ void FillDataMesh::add_initial(const Span<int> verts)
 {
   for (const int vert : verts) {
     this->add_initial(vert);
+  }
+}
+
+void FillDataMultires::add_initial(const MultiresCoord vert)
+{
+  this->queue.push(vert);
+}
+
+void FillDataMultires::add_initial(const Multiresolution &multires, const Span<int> verts)
+{
+  for (const int vert : verts) {
+    this->queue.push(multires.coord_from_index(vert));
   }
 }
 
@@ -68,6 +82,12 @@ void FillDataMesh::add_and_skip_initial(const int vertex)
 {
   this->queue.push(vertex);
   this->visited_verts[vertex].set();
+}
+
+void FillDataMultires::add_and_skip_initial(const MultiresCoord vert, const int index)
+{
+  this->queue.push(vert);
+  this->visited_verts[index].set();
 }
 
 void FillDataGrids::add_and_skip_initial(const SubdivCCGCoord vertex, const int index)
@@ -114,6 +134,47 @@ void FillDataMesh::execute(Object &object,
       }
 
       this->visited_verts[neighbor].set();
+      if (func(from_v, neighbor)) {
+        this->queue.push(neighbor);
+      }
+    }
+  }
+}
+
+void FillDataMultires::execute(const Object &object,
+                               const Multiresolution &multires,
+                               const bke::multiresolution::BaseTopology &base_topo,
+                               FunctionRef<bool(MultiresCoord from_v, MultiresCoord to_v)> func)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const Span<bool> hidden = multires.hidden_verts();
+  const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+
+  multires.coord_from_index_map_ensure(base_topo, offsets);
+
+  Vector<MultiresCoord> neighbors;
+  while (!this->queue.empty()) {
+    const MultiresCoord from_v = this->queue.front();
+    this->queue.pop();
+
+    multires.calc_neighbors(from_v, base_topo, grid_size, offsets, hidden, neighbors);
+
+    const int from_idx = from_v.to_index(offsets);
+    if (!this->fake_neighbors.is_empty() && this->fake_neighbors[from_idx] != FAKE_NEIGHBOR_NONE) {
+      neighbors.append(multires.coord_from_index(this->fake_neighbors[from_idx]));
+    }
+
+    for (const MultiresCoord &neighbor : neighbors) {
+      const int neighbor_idx = neighbor.to_index(offsets);
+      if (this->visited_verts[neighbor_idx]) {
+        continue;
+      }
+      if (!hidden.is_empty() && hidden[neighbor_idx]) {
+        continue;
+      }
+
+      this->visited_verts[neighbor_idx].set();
       if (func(from_v, neighbor)) {
         this->queue.push(neighbor);
       }

@@ -63,11 +63,13 @@
 #include "BKE_mesh_runtime.hh"
 #include "BKE_modifier.hh"
 #include "BKE_multires.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_bvh.hh"
 #include "BKE_paint_types.hh"
 #include "BKE_scene.hh"
+#include "BKE_sculpt_layer.hh"
 #include "BKE_subdiv_ccg.hh"
 #include "BKE_view3d_runtime.hh"
 
@@ -2186,6 +2188,10 @@ int SculptSession::last_active_vert_index() const
 float3 SculptSession::active_vert_position(const Depsgraph &depsgraph, const Object &object) const
 {
   if (std::holds_alternative<int>(active_vert_)) {
+    const Mesh &mesh = *id_cast<Mesh *>(object.data);
+    if (bke::multiresolution::is_active(mesh)) {
+      return mesh.multires->positions()[std::get<int>(active_vert_)];
+    }
     if (this->subdiv_ccg) {
       return this->subdiv_ccg->positions[std::get<int>(active_vert_)];
     }
@@ -2219,24 +2225,6 @@ void SculptSession::clear_active_elements(bool persist_last_active)
 void SculptSession::set_active_vert(const ActiveVert vert)
 {
   active_vert_ = vert;
-}
-
-std::optional<PersistentMultiresData> SculptSession::persistent_multires_data()
-{
-  BLI_assert(subdiv_ccg);
-  if (persistent.grids_num == -1 || persistent.grid_size == -1) {
-    return std::nullopt;
-  }
-
-  if (this->subdiv_ccg->grids_num != persistent.grids_num ||
-      this->subdiv_ccg->grid_size != persistent.grid_size)
-  {
-    return std::nullopt;
-  }
-
-  return PersistentMultiresData{persistent.sculpt_persistent_co,
-                                persistent.sculpt_persistent_no,
-                                persistent.sculpt_persistent_disp};
 }
 
 static MultiresModifierData *sculpt_multires_modifier_get(const Scene *scene,
@@ -2357,6 +2345,34 @@ static bool sculpt_modifiers_active(const Scene *scene, const Sculpt *sd, Object
   return false;
 }
 
+bool BKE_eval_layers_only(const Depsgraph &depsgraph, Object *ob_orig)
+{
+  if ((ob_orig->mode & OB_MODE_SCULPT) == 0) {
+    return false;
+  }
+  SculptSession *ss = ob_orig->runtime->sculpt_session;
+  if (ss == nullptr || ss->bm != nullptr) {
+    return false;
+  }
+  const Mesh &mesh_orig = *id_cast<const Mesh *>(ob_orig->data);
+  if (mesh_orig.sculpt_layers_len == 0) {
+    return false;
+  }
+
+  if (bke::multiresolution::is_active_fast(mesh_orig)) {
+    return false;
+  }
+
+  Scene *scene = DEG_get_input_scene(&depsgraph);
+  Sculpt *sd = scene->toolsettings ? scene->toolsettings->sculpt : nullptr;
+  MultiresModifierData *mmd = sculpt_multires_modifier_get(scene, ob_orig, true);
+  const bool has_multires = mmd != nullptr;
+  const bool deform_active = !has_multires && sculpt_modifiers_active(scene, sd, ob_orig);
+  KeyBlock *shapekey = (!has_multires && ss->bm == nullptr) ? BKE_keyblock_from_object(ob_orig) :
+                                                              nullptr;
+  return !deform_active && shapekey == nullptr;
+}
+
 static void sculptsession_update(Depsgraph *depsgraph,
                                  Object *ob,
                                  Object *ob_eval,
@@ -2373,6 +2389,8 @@ static void sculptsession_update(Depsgraph *depsgraph,
   Mesh *mesh_eval = BKE_object_get_evaluated_mesh_unchecked(ob_eval);
   MultiresModifierData *mmd = sculpt_multires_modifier_get(scene, ob, true);
 
+  const bool has_multires = mmd != nullptr || bke::multiresolution::is_active(*mesh_orig);
+
   BLI_assert(mesh_eval != nullptr);
 
   /* This is for handling a newly opened file with no object visible,
@@ -2381,16 +2399,41 @@ static void sculptsession_update(Depsgraph *depsgraph,
     return;
   }
 
-  ss.deform_modifiers_active = sculpt_modifiers_active(scene, sd, ob);
+  ss.deform_modifiers_active = !has_multires && sculpt_modifiers_active(scene, sd, ob);
 
-  ss.shapekey_active = (mmd == nullptr && ss.bm == nullptr) ? BKE_keyblock_from_object(ob) :
-                                                              nullptr;
+  ss.shapekey_active = (!has_multires && ss.bm == nullptr) ? BKE_keyblock_from_object(ob) :
+                                                             nullptr;
+
+  /* Layers live on the original mesh, which is the source of truth. The evaluated mesh may be
+   * a stale cached copy from before the layer was added (layer operators only tag shading to
+   * stay fast), so reading the active layer from it can yield a null/stale pointer. */
+  ss.sculpt_layer_active = bke::sculpt_layer::active_layer(*mesh_orig);
 
   ss.multires_modifier = mmd;
 
   ss.subdiv_ccg = mesh_eval->runtime->subdiv_ccg.get();
 
   pbvh::Tree &pbvh = object::pbvh_ensure(*depsgraph, *ob);
+
+  const bool layers_only = BKE_eval_layers_only(*depsgraph, ob);
+  if (layers_only) {
+    if (ss.layers_cos.size() != mesh_orig->verts_num) {
+      ss.layers_cos.reinitialize(mesh_orig->verts_num);
+      ss.vert_normals_deform = {};
+      ss.face_normals_deform = {};
+    }
+    bke::sculpt_layer::calc_eval_positions(*mesh_orig, ss.layers_cos.as_mutable_span());
+    ss.layers_only_eval = true;
+    BKE_pbvh_vert_coords_apply(pbvh, ss.layers_cos);
+  }
+  else if (ss.layers_only_eval) {
+    ss.layers_cos = {};
+    ss.layers_only_eval = false;
+    if (!ss.deform_modifiers_active && ss.shapekey_active == nullptr) {
+      ss.vert_normals_deform = {};
+      ss.face_normals_deform = {};
+    }
+  }
 
   if (ss.deform_modifiers_active) {
     /* Painting doesn't need crazyspace, use already evaluated mesh coordinates if possible. */
@@ -2431,8 +2474,13 @@ static void sculptsession_update(Depsgraph *depsgraph,
       }
     }
   }
-  else {
+  else if (!layers_only) {
     BKE_sculptsession_free_deformMats(&ss);
+  }
+  else {
+    /* Layers display reuses the deform normal caches: only drop positions. */
+    ss.deform_cos = {};
+    ss.deform_imats = {};
   }
 
   if (ss.shapekey_active != nullptr && ss.deform_cos.is_empty()) {
@@ -2494,7 +2542,13 @@ void BKE_sculptsession_update_before_eval(Object *ob_eval)
      * topology does not change in the meantime .. weak. */
     BKE_sculptsession_free_pbvh(*ob_orig);
 
-    BKE_sculptsession_free_deformMats(ss);
+    if (ss->layers_only_eval) {
+      ss->deform_cos = {};
+      ss->deform_imats = {};
+    }
+    else {
+      BKE_sculptsession_free_deformMats(ss);
+    }
   }
   else if (pbvh) {
     IndexMaskMemory memory;
@@ -2675,15 +2729,9 @@ static std::unique_ptr<pbvh::Tree> build_pbvh_for_dynamic_topology(Object *ob)
 static std::unique_ptr<pbvh::Tree> build_pbvh_from_regular_mesh(Object *ob,
                                                                 const Mesh *me_eval_deform)
 {
-  const Mesh &mesh = *BKE_object_get_original_mesh(ob);
-  std::unique_ptr<pbvh::Tree> pbvh = std::make_unique<pbvh::Tree>(pbvh::Tree::from_mesh(mesh));
-
-  const bool is_deformed = check_sculpt_object_deformed(ob, true);
-  if (is_deformed && me_eval_deform != nullptr) {
-    BKE_pbvh_vert_coords_apply(*pbvh, me_eval_deform->vert_positions());
-  }
-
-  return pbvh;
+  const Mesh &mesh_for_build = me_eval_deform ? *me_eval_deform :
+                                                *BKE_object_get_original_mesh(ob);
+  return std::make_unique<pbvh::Tree>(pbvh::Tree::from_mesh(mesh_for_build));
 }
 
 static std::unique_ptr<pbvh::Tree> build_pbvh_from_ccg(Object *ob, SubdivCCG &subdiv_ccg)
@@ -2703,12 +2751,26 @@ pbvh::Tree &pbvh_ensure(Depsgraph &depsgraph, Object &object)
   if (pbvh::Tree *pbvh = pbvh_get(object)) {
     return *pbvh;
   }
+
   BLI_assert(object.runtime->sculpt_session != nullptr);
+  const Mesh &mesh = *id_cast<Mesh *>(object.data);
   SculptSession &ss = *object.runtime->sculpt_session;
+
+  const bool is_vertex_or_weight_paint = (object.mode &
+                                          (OB_MODE_VERTEX_PAINT | OB_MODE_WEIGHT_PAINT)) != 0;
 
   if (ss.bm != nullptr) {
     /* Sculpting on a BMesh (dynamic-topology) gets a special pbvh::Tree. */
     ss.pbvh = build_pbvh_for_dynamic_topology(&object);
+  }
+  else if (mesh.multires && mesh.multires->curr_level > 0 && !is_vertex_or_weight_paint &&
+           bke::multiresolution::base_topology_matches(mesh))
+  {
+    const Multiresolution &multires = *mesh.multires;
+    ss.pbvh = std::make_unique<bke::pbvh::Tree>(
+        bke::pbvh::Tree::from_stored_nodes_multires(multires.curr_level, mesh));
+
+    ss.pbvh->finalize_multires(mesh);
   }
   else {
     Object *object_eval = DEG_get_evaluated(&depsgraph, &object);

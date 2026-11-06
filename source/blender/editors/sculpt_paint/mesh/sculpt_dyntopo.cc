@@ -122,7 +122,7 @@ static void disable(
   BKE_sculptsession_free_pbvh(ob);
 
   if (undo_step) {
-    undo::restore_from_bmesh_enter_geometry(*undo_step, *mesh);
+    undo::restore_from_bmesh_enter_geometry(*undo_step, ob);
   }
   else {
     BKE_sculptsession_bm_to_me(&ob);
@@ -235,6 +235,10 @@ WarnFlag check_attribute_warning(Scene &scene, Object &ob)
   BLI_assert(ss.bm == nullptr);
   UNUSED_VARS_NDEBUG(ss);
 
+  if (mesh->multires != nullptr) {
+    flag |= MULTIRES;
+  }
+
   const bke::AttributeAccessor attributes = mesh->attributes();
   attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
     if (!dyntopo_supports_layer(iter)) {
@@ -278,6 +282,35 @@ static wmOperatorStatus sculpt_dynamic_topology_toggle_invoke(bContext *C,
       BKE_report(op->reports,
                  RPT_WARNING,
                  "Dyntopo will not preserve face sets, colors, UVs, or other attributes");
+    }
+
+    if (flag & MULTIRES) {
+      BKE_report(op->reports,
+                 RPT_WARNING,
+                 "Dynamic topology will alter the base mesh topology and make multiresolution "
+                 "data stale");
+    }
+
+    if ((flag & MULTIRES) && (flag & MODIFIER)) {
+      return WM_operator_confirm_ex(C,
+                                    op,
+                                    RPT_("Generative Modifiers and Multiresolution Detected!"),
+                                    RPT_("Dyntopo will alter base mesh topology, making multires "
+                                         "data stale, and modifiers will increase polycount"),
+                                    IFACE_("Enable"),
+                                    ui::AlertIcon::Warning,
+                                    false);
+    }
+
+    if (flag & MULTIRES) {
+      return WM_operator_confirm_ex(C,
+                                    op,
+                                    RPT_("Multiresolution Detected!"),
+                                    RPT_("Dynamic topology will alter the base mesh topology and "
+                                         "make multiresolution data stale"),
+                                    IFACE_("Enable"),
+                                    ui::AlertIcon::Warning,
+                                    false);
     }
 
     if (flag & MODIFIER) {

@@ -175,6 +175,60 @@ static wmOperatorStatus sculpt_mask_init_exec(bContext *C, wmOperator *op)
       }
       break;
     }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const int grid_size = multires.grid_size();
+      const MutableSpan<float> masks = multires.masks_for_write();
+      const Span<bool> hidden = multires.hidden_verts();
+      switch (mode) {
+        case InitMode::Random:
+          write_mask_multires(
+              depsgraph, ob, multires, node_mask, [&](bke::pbvh::MultiresNode &node) {
+                for (const int vert : node.range(grid_size)) {
+                  if (!hidden.is_empty() && hidden[vert]) {
+                    continue;
+                  }
+                  masks[vert] = BLI_hash_int_01(vert + seed);
+                }
+              });
+          break;
+        case InitMode::FaceSet: {
+          const Span<int> face_sets = multires.face_sets();
+
+          write_mask_multires(
+              depsgraph, ob, multires, node_mask, [&](bke::pbvh::MultiresNode &node) {
+                node.foreach_coord(
+                    grid_size,
+                    [&](const int node_vert, bke::multiresolution::MultiresCoord coord) {
+                      const int vert = node_vert + node.offset();
+                      if (!hidden.is_empty() && hidden[vert]) {
+                        return;
+                      }
+                      const int face_set = face_set::vert_face_set_get(
+                          coord, base_topo, grid_size, face_sets);
+                      masks[vert] = BLI_hash_int_01(face_set + seed);
+                    });
+              });
+          break;
+        }
+        case InitMode::Island:
+          islands::ensure_cache(ob);
+          write_mask_multires(
+              depsgraph, ob, multires, node_mask, [&](bke::pbvh::MultiresNode &node) {
+                for (const int vert : node.range(grid_size)) {
+                  if (!hidden.is_empty() && hidden[vert]) {
+                    continue;
+                  }
+                  const int island = islands::vert_id_get(ss, vert);
+                  masks[vert] = BLI_hash_int_01(island + seed);
+                }
+              });
+          break;
+      }
+      break;
+    }
     case bke::pbvh::Type::Grids: {
       Main &bmain = *CTX_data_main(C);
       Scene &scene = *CTX_data_scene(C);

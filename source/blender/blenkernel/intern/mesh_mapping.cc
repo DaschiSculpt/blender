@@ -331,6 +331,22 @@ GroupedSpan<int> build_edge_to_face_map(const OffsetIndices<int> faces,
   return {OffsetIndices<int>(r_offsets), r_indices};
 }
 
+Array<int> build_edge_to_face_indices(const OffsetIndices<int> faces,
+                                      const Span<int> corner_edges,
+                                      const OffsetIndices<int> offsets)
+{
+  Array<int> result(offsets.total_size());
+  offset_indices::reverse_indices_in_groups(corner_edges, offsets, result, faces);
+  return result;
+}
+
+Array<int> build_vert_to_edge_indices(const Span<int2> edges, const OffsetIndices<int> offsets)
+{
+  Array<int> result(offsets.total_size());
+  offset_indices::reverse_indices_in_groups(edges.cast<int>(), offsets, result, 2);
+  return result;
+}
+
 }  // namespace bke::mesh
 
 /** \} */

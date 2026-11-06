@@ -41,6 +41,7 @@
 #include "BKE_mesh_runtime.hh"
 #include "BKE_mesh_wrapper.hh"
 #include "BKE_modifier.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object_types.hh"
 /* these 2 are only used by conversion functions */
 #include "BKE_curve.hh"
@@ -1157,6 +1158,29 @@ void BKE_mesh_nomain_to_mesh(Mesh *mesh_src, Mesh *mesh_dst, Object *ob, bool pr
   std::swap(mesh_dst->clone_uv_map_attribute, mesh_src->clone_uv_map_attribute);
   std::swap(mesh_dst->default_uv_map_attribute, mesh_src->default_uv_map_attribute);
   std::swap(mesh_dst->vertex_group_names, mesh_src->vertex_group_names);
+
+  if (mesh_src->multires) {
+    if (mesh_dst->multires) {
+      mesh_dst->multires->free();
+      MEM_SAFE_DELETE(mesh_dst->multires);
+    }
+    mesh_dst->multires = mesh_src->multires;
+    mesh_src->multires = nullptr;
+  }
+
+  if (mesh_src->sculpt_layers && mesh_src->sculpt_layers_len > 0) {
+    MEM_SAFE_DELETE(mesh_dst->sculpt_layers);
+    mesh_dst->sculpt_layers = mesh_src->sculpt_layers;
+    mesh_dst->sculpt_layers_len = mesh_src->sculpt_layers_len;
+    mesh_dst->active_layer_index = mesh_src->active_layer_index;
+    mesh_src->sculpt_layers = nullptr;
+    mesh_src->sculpt_layers_len = 0;
+    mesh_src->active_layer_index = -1;
+  }
+
+  if (mesh_dst->multires && mesh_dst->multires->runtime) {
+    mesh_dst->multires->runtime->layers_active = (mesh_dst->sculpt_layers_len > 0);
+  }
 
   BKE_mesh_copy_parameters(mesh_dst, mesh_src);
 

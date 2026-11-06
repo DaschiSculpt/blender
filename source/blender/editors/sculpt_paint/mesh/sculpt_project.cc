@@ -77,6 +77,32 @@ static void apply_projection_mesh(const Sculpt &sd,
   position_data.deform(translations, verts);
 }
 
+static void apply_projection_multires(const Sculpt &sd,
+                                      const Multiresolution &multires,
+                                      const gesture::GestureData &gesture_data,
+                                      const bke::pbvh::MultiresNode &node,
+                                      Object &object,
+                                      const MultiresDeformData &deform_data)
+{
+  const SculptSession &ss = *object.runtime->sculpt_session;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const MutableSpan<float3> positions = deform_data.positions.slice(node_range);
+  const Span<float3> normals = multires.normals();
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(positions.size());
+  fill_factor_from_hide_and_mask(multires.hidden_verts(), multires.masks(), node_range, factors);
+
+  gesture::filter_factors(gesture_data, positions, normals, factors);
+
+  Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> translations(positions.size());
+  calc_translations_to_plane(positions, gesture_data.line.plane, translations);
+  scale_translations(translations, factors);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  deform_data.deform(node_range, translations);
+}
+
 static void apply_projection_grids(const Sculpt &sd,
                                    const gesture::GestureData &gesture_data,
                                    const bke::pbvh::GridsNode &node,
@@ -144,6 +170,7 @@ static void gesture_apply_for_symmetry_pass(bContext &C, gesture::GestureData &g
   const Depsgraph &depsgraph = *CTX_data_depsgraph_pointer(&C);
   Object &object = *gesture_data.vc.obact;
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
   const Sculpt &sd = *CTX_data_tool_settings(&C)->sculpt;
   const IndexMask &node_mask = gesture_data.node_mask;
 
@@ -152,7 +179,6 @@ static void gesture_apply_for_symmetry_pass(bContext &C, gesture::GestureData &g
     case gesture::ShapeType::Line:
       switch (pbvh.type()) {
         case bke::pbvh::Type::Mesh: {
-          Mesh &mesh = *id_cast<Mesh *>(object.data);
           MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
           const PositionDeformData position_data(depsgraph, object);
           const MeshAttributeData attribute_data(mesh);
@@ -170,6 +196,21 @@ static void gesture_apply_for_symmetry_pass(bContext &C, gesture::GestureData &g
                                       tls,
                                       position_data);
                 bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+              },
+              exec_mode::grain_size(1));
+          break;
+        }
+        case bke::pbvh::Type::Multires: {
+          const Multiresolution &multires = *mesh.multires;
+          MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+          undo::push_nodes(depsgraph, object, node_mask, undo::Type::Position);
+          const MultiresDeformData deform_data(mesh);
+          node_mask.foreach_index(
+              [&](const int i) {
+                apply_projection_multires(
+                    sd, multires, gesture_data, nodes[i], object, deform_data);
+                bke::pbvh::update_node_bounds_multires(
+                    multires.grid_size(), deform_data.positions, pbvh.offsets, nodes[i]);
               },
               exec_mode::grain_size(1));
           break;

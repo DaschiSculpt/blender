@@ -120,12 +120,8 @@ static EnumPropertyItem prop_color_filter_types[] = {
 };
 
 struct LocalData {
-  Vector<float> factors;
-  Vector<float4> colors;
   Vector<int> neighbor_offsets;
   Vector<int> neighbor_data;
-  Vector<float4> average_colors;
-  Vector<float4> new_colors;
 };
 
 BLI_NOINLINE static void clamp_factors(const MutableSpan<float> factors,
@@ -137,23 +133,122 @@ BLI_NOINLINE static void clamp_factors(const MutableSpan<float> factors,
   }
 }
 
-static void color_filter_task(const Depsgraph &depsgraph,
-                              Object &ob,
-                              const OffsetIndices<int> faces,
-                              const Span<int> corner_verts,
-                              const GroupedSpan<int> vert_to_face_map,
-                              const MeshAttributeData &attribute_data,
-                              const FilterType mode,
-                              const float filter_strength,
-                              const float3 &filter_fill_color,
-                              const bke::pbvh::MeshNode &node,
-                              LocalData &tls,
-                              bke::GSpanAttributeWriter &color_attribute)
+static void fill_filter(const float3 filter_fill_color,
+                        const Span<float4> orig_colors,
+                        const MutableSpan<float> factors,
+                        const MutableSpan<float4> new_colors)
+{
+  clamp_factors(factors, 0.0f, 1.0f);
+  const float4 fill_color_rgba = float4(filter_fill_color, 1.0f);
+
+  for (const int i : new_colors.index_range()) {
+    blend_color_mix_float(new_colors[i], orig_colors[i], factors[i] * fill_color_rgba);
+  }
+}
+
+static void hue_filter(const Span<float4> orig_colors,
+                       const MutableSpan<float> factors,
+                       const MutableSpan<float4> new_colors)
+{
+  for (const int i : new_colors.index_range()) {
+    float3 hsv_color;
+    rgb_to_hsv_v(orig_colors[i], hsv_color);
+    const float hue = hsv_color[0];
+    hsv_color[0] = fmod((hsv_color[0] + fabs(factors[i])) - hue, 1);
+    hsv_to_rgb_v(hsv_color, new_colors[i]);
+  }
+}
+
+static void saturation_filter(const Span<float4> orig_colors,
+                              const MutableSpan<float> factors,
+                              const MutableSpan<float4> new_colors)
+{
+  for (const int i : new_colors.index_range()) {
+    float3 hsv_color;
+    rgb_to_hsv_v(orig_colors[i], hsv_color);
+
+    if (hsv_color[1] > 0.001f) {
+      hsv_color[1] = std::clamp(hsv_color[1] + factors[i] * hsv_color[1], 0.0f, 1.0f);
+      hsv_to_rgb_v(hsv_color, new_colors[i]);
+    }
+    else {
+      new_colors[i] = orig_colors[i];
+    }
+  }
+}
+
+static void value_filter(const Span<float4> orig_colors,
+                         const MutableSpan<float> factors,
+                         const MutableSpan<float4> new_colors)
+{
+  for (const int i : new_colors.index_range()) {
+    float3 hsv_color;
+    rgb_to_hsv_v(orig_colors[i], hsv_color);
+    hsv_color[2] = std::clamp(hsv_color[2] + factors[i], 0.0f, 1.0f);
+    hsv_to_rgb_v(hsv_color, new_colors[i]);
+  }
+}
+
+static void component_filter(const int component,
+                             const Span<float4> orig_colors,
+                             const MutableSpan<float> factors,
+                             const MutableSpan<float4> new_colors)
+{
+  for (const int i : new_colors.index_range()) {
+    new_colors[i] = orig_colors[i];
+    new_colors[i][component] = std::clamp(orig_colors[i][component] + factors[i], 0.0f, 1.0f);
+  }
+}
+
+static void brightness_filter(const Span<float4> orig_colors,
+                              const MutableSpan<float> factors,
+                              const MutableSpan<float4> new_colors)
+{
+  clamp_factors(factors, -1.0f, 1.0f);
+  for (const int i : new_colors.index_range()) {
+    for (int component = 0; component < 3; component++) {
+      new_colors[i][component] = std::clamp(orig_colors[i][component] + factors[i], 0.0f, 1.0f);
+    }
+  }
+}
+
+static void contrast_filter(const Span<float4> orig_colors,
+                            const MutableSpan<float> factors,
+                            const MutableSpan<float4> new_colors)
+{
+  clamp_factors(factors, -1.0f, 1.0f);
+  for (const int i : new_colors.index_range()) {
+    const float contrast = factors[i];
+    float delta = contrast / 2.0f;
+    float gain = 1.0f - delta * 2.0f;
+
+    if (contrast > 0) {
+      gain = 1.0f / ((gain != 0.0f) ? gain : FLT_EPSILON);
+    }
+
+    const float offset = gain * (-delta);
+
+    for (int component = 0; component < 3; component++) {
+      new_colors[i][component] = std::clamp(gain * orig_colors[i][component] + offset, 0.0f, 1.0f);
+    }
+  }
+}
+
+static void color_filter_task_mesh(const Depsgraph &depsgraph,
+                                   Object &ob,
+                                   const OffsetIndices<int> faces,
+                                   const Span<int> corner_verts,
+                                   const GroupedSpan<int> vert_to_face_map,
+                                   const MeshAttributeData &attribute_data,
+                                   const FilterType mode,
+                                   const float filter_strength,
+                                   const float3 &filter_fill_color,
+                                   const bke::pbvh::MeshNode &node,
+                                   LocalData &tls,
+                                   bke::GSpanAttributeWriter &color_attribute)
 {
   SculptSession &ss = *ob.runtime->sculpt_session;
-
   const Span<float4> orig_colors = orig_color_data_get_mesh(ob, node);
-
   const Span<int> verts = node.verts();
 
   Array<float, bke::pbvh::MESH_LEAF_LIMIT> factors(verts.size());
@@ -171,109 +266,41 @@ static void color_filter_task(const Depsgraph &depsgraph,
 
   switch (mode) {
     case FilterType::Fill: {
-      clamp_factors(factors, 0.0f, 1.0f);
-      for (const int i : verts.index_range()) {
-        float fill_color_rgba[4];
-        copy_v3_v3(fill_color_rgba, filter_fill_color);
-        fill_color_rgba[3] = 1.0f;
-        mul_v4_fl(fill_color_rgba, factors[i]);
-        blend_color_mix_float(new_colors[i], orig_colors[i], fill_color_rgba);
-      }
+      fill_filter(filter_fill_color, orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Hue: {
-      for (const int i : verts.index_range()) {
-        float3 hsv_color;
-        rgb_to_hsv_v(orig_colors[i], hsv_color);
-        const float hue = hsv_color[0];
-        hsv_color[0] = fmod((hsv_color[0] + fabs(factors[i])) - hue, 1);
-        hsv_to_rgb_v(hsv_color, new_colors[i]);
-      }
+      hue_filter(orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Saturation: {
-      for (const int i : verts.index_range()) {
-        float3 hsv_color;
-        rgb_to_hsv_v(orig_colors[i], hsv_color);
-
-        if (hsv_color[1] > 0.001f) {
-          hsv_color[1] = std::clamp(hsv_color[1] + factors[i] * hsv_color[1], 0.0f, 1.0f);
-          hsv_to_rgb_v(hsv_color, new_colors[i]);
-        }
-        else {
-          copy_v3_v3(new_colors[i], orig_colors[i]);
-        }
-      }
+      saturation_filter(orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Value: {
-      for (const int i : verts.index_range()) {
-        float3 hsv_color;
-        rgb_to_hsv_v(orig_colors[i], hsv_color);
-        hsv_color[2] = std::clamp(hsv_color[2] + factors[i], 0.0f, 1.0f);
-        hsv_to_rgb_v(hsv_color, new_colors[i]);
-      }
+      value_filter(orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Red: {
-      for (const int i : verts.index_range()) {
-        copy_v3_v3(new_colors[i], orig_colors[i]);
-        new_colors[i][0] = std::clamp(orig_colors[i][0] + factors[i], 0.0f, 1.0f);
-      }
+      component_filter(0, orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Green: {
-      for (const int i : verts.index_range()) {
-        copy_v3_v3(new_colors[i], orig_colors[i]);
-        new_colors[i][1] = std::clamp(orig_colors[i][1] + factors[i], 0.0f, 1.0f);
-      }
+      component_filter(1, orig_colors, factors, new_colors);
+
       break;
     }
     case FilterType::Blue: {
-      for (const int i : verts.index_range()) {
-        copy_v3_v3(new_colors[i], orig_colors[i]);
-        new_colors[i][2] = std::clamp(orig_colors[i][2] + factors[i], 0.0f, 1.0f);
-      }
+      component_filter(2, orig_colors, factors, new_colors);
+
       break;
     }
     case FilterType::Brightness: {
-      clamp_factors(factors, -1.0f, 1.0f);
-      for (const int i : verts.index_range()) {
-        const float brightness = factors[i];
-        const float contrast = 0;
-        float delta = contrast / 2.0f;
-        const float gain = 1.0f - delta * 2.0f;
-        delta *= -1;
-        const float offset = gain * (brightness + delta);
-        for (int component = 0; component < 3; component++) {
-          new_colors[i][component] = std::clamp(
-              gain * orig_colors[i][component] + offset, 0.0f, 1.0f);
-        }
-      }
+      brightness_filter(orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Contrast: {
-      clamp_factors(factors, -1.0f, 1.0f);
-      for (const int i : verts.index_range()) {
-        const float brightness = 0;
-        const float contrast = factors[i];
-        float delta = contrast / 2.0f;
-        float gain = 1.0f - delta * 2.0f;
-
-        float offset;
-        if (contrast > 0) {
-          gain = 1.0f / ((gain != 0.0f) ? gain : FLT_EPSILON);
-          offset = gain * (brightness - delta);
-        }
-        else {
-          delta *= -1;
-          offset = gain * (brightness + delta);
-        }
-        for (int component = 0; component < 3; component++) {
-          new_colors[i][component] = std::clamp(
-              gain * orig_colors[i][component] + offset, 0.0f, 1.0f);
-        }
-      }
+      contrast_filter(orig_colors, factors, new_colors);
       break;
     }
     case FilterType::Smooth: {
@@ -319,11 +346,8 @@ static void color_filter_task(const Depsgraph &depsgraph,
           float4 delta_color;
 
           /* Unsharp mask. */
-          copy_v4_v4(delta_color, ss.filter_cache->pre_smoothed_color[vert]);
-          delta_color -= average_colors[i];
-
-          copy_v4_v4(new_colors[i], colors[i]);
-          madd_v4_v4fl(new_colors[i], delta_color, factors[i]);
+          delta_color = ss.filter_cache->pre_smoothed_color[vert] - average_colors[i];
+          new_colors[i] += delta_color * factors[i];
         }
         else {
           blend_color_interpolate_float(new_colors[i], colors[i], average_colors[i], factors[i]);
@@ -351,7 +375,124 @@ static void color_filter_task(const Depsgraph &depsgraph,
   }
 }
 
-static void sculpt_color_presmooth_init(const Mesh &mesh, Object &object)
+static void color_filter_task_multires(const Depsgraph &depsgraph,
+                                       Object &ob,
+                                       Multiresolution &multires,
+                                       const bke::multiresolution::BaseTopology &base_topo,
+                                       const FilterType mode,
+                                       const float filter_strength,
+                                       const float3 filter_fill_color,
+                                       const bke::pbvh::MultiresNode &node)
+{
+  SculptSession &ss = *ob.runtime->sculpt_session;
+  const bke::pbvh::Tree &pbvh = *ss.pbvh;
+  const int grid_size = multires.grid_size();
+  const Span<bool> hidden_verts = multires.hidden_verts();
+  const Span<float4> global_colors = multires.colors();
+  const IndexRange node_range = node.range(grid_size);
+  const MutableSpan<float4> node_colors = multires.colors_for_write().slice(node_range);
+  const Span<float4> orig_colors = orig_color_data_get_multires(ob, node);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(node_colors.size());
+  fill_factor_from_hide_and_mask(hidden_verts, multires.masks(), node_range, factors);
+  auto_mask::calc_multires_factors(
+      depsgraph, ob, multires, base_topo, ss.filter_cache->automasking.get(), node, factors);
+  scale_factors(factors, filter_strength);
+
+  const MutableSpan<float4> new_colors = node_colors;
+
+  for (const int i : new_colors.index_range()) {
+    new_colors[i][3] = orig_colors[i][3];
+  }
+
+  switch (mode) {
+    case FilterType::Fill: {
+      fill_filter(filter_fill_color, orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Hue: {
+      hue_filter(orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Saturation: {
+      saturation_filter(orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Value: {
+      value_filter(orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Red: {
+      component_filter(0, orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Green: {
+      component_filter(1, orig_colors, factors, new_colors);
+
+      break;
+    }
+    case FilterType::Blue: {
+      component_filter(2, orig_colors, factors, new_colors);
+
+      break;
+    }
+    case FilterType::Brightness: {
+      brightness_filter(orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Contrast: {
+      contrast_filter(orig_colors, factors, new_colors);
+      break;
+    }
+    case FilterType::Smooth: {
+      const int offset = node.offset();
+      clamp_factors(factors, -1.0f, 1.0f);
+
+      Array<float4, bke::pbvh::MULTIRES_LEAF_LIMIT> average_colors(node_colors.size());
+
+      const int verts_count = node.verts().size();
+      const int edges_count = node.edges().size() * grid_size;
+      const int faces_count = node.faces().size() * grid_size * grid_size;
+      const IndexRange node_range = node.range(grid_size);
+      const IndexRange local_verts_range(0, verts_count);
+      const IndexRange local_edges_range(verts_count, edges_count);
+      const IndexRange local_faces_range(verts_count + edges_count, faces_count);
+
+      smooth::neighbor_data_average_node_multires<float4>(
+          multires, base_topo, node, pbvh.offsets, global_colors, average_colors, hidden_verts);
+
+      for (const int i : node_colors.index_range()) {
+        if (factors[i] < 0.0f) {
+          interp_v4_v4v4(average_colors[i], average_colors[i], node_colors[i], 0.5f);
+        }
+
+        bool copy_alpha = node_colors[i][3] == average_colors[i][3];
+
+        if (factors[i] < 0.0f) {
+          float4 delta_color;
+
+          /* Unsharp mask. */
+          delta_color = ss.filter_cache->pre_smoothed_color[offset + i] - average_colors[i];
+          new_colors[i] += delta_color * factors[i];
+        }
+        else {
+          blend_color_interpolate_float(
+              new_colors[i], node_colors[i], average_colors[i], factors[i]);
+        }
+
+        new_colors[i] = math::clamp(new_colors[i], 0.0f, 1.0f);
+
+        /* Prevent accumulated numeric error from corrupting alpha. */
+        if (copy_alpha) {
+          new_colors[i][3] = average_colors[i][3];
+        }
+      }
+      break;
+    }
+  }
+}
+
+static void sculpt_color_presmooth_init_mesh(const Mesh &mesh, Object &object)
 {
   SculptSession &ss = *object.runtime->sculpt_session;
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -410,13 +551,64 @@ static void sculpt_color_presmooth_init(const Mesh &mesh, Object &object)
   }
 }
 
+static void sculpt_color_presmooth_init_multires(Object &object)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  const Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const int grid_size = multires.grid_size();
+  const Span<bool> hidden_verts = multires.hidden_verts();
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  const IndexMask &node_mask = ss.filter_cache->node_mask;
+
+  if (ss.filter_cache->pre_smoothed_color.is_empty()) {
+    ss.filter_cache->pre_smoothed_color = Array<float4>(multires.verts_num());
+  }
+  const MutableSpan<float4> pre_smoothed_color = ss.filter_cache->pre_smoothed_color;
+  pre_smoothed_color.copy_from(multires.colors());
+
+  for ([[maybe_unused]] const int iteration : IndexRange(2)) {
+    node_mask.foreach_index(
+        [&](const int i) {
+          const int offset = nodes[i].offset();
+          const Span<float4> colors = multires.colors().slice(
+              nodes[i].range(multires.grid_size()));
+
+          const bke::pbvh::MultiresNode &node = nodes[i];
+          const int verts_count = node.verts().size();
+          const int edges_count = node.edges().size() * grid_size;
+          const int faces_count = node.faces().size() * grid_size * grid_size;
+          const IndexRange local_verts_range(0, verts_count);
+          const IndexRange local_edges_range(verts_count, edges_count);
+          const IndexRange local_faces_range(verts_count + edges_count, faces_count);
+
+          Array<float4, bke::pbvh::MULTIRES_LEAF_LIMIT> averaged_colors(colors.size());
+
+          smooth::neighbor_data_average_node_multires<float4>(multires,
+                                                              base_topo,
+                                                              node,
+                                                              pbvh.offsets,
+                                                              pre_smoothed_color,
+                                                              averaged_colors,
+                                                              hidden_verts);
+
+          for (const int i : colors.index_range()) {
+            pre_smoothed_color[offset + i] = math::interpolate(
+                pre_smoothed_color[offset + i], averaged_colors[i], 0.5f);
+          }
+        },
+        exec_mode::grain_size(1));
+  }
+}
+
 static void sculpt_color_filter_apply(bContext *C, wmOperator *op, Object &ob)
 {
   const Depsgraph &depsgraph = *CTX_data_depsgraph_pointer(C);
   const Sculpt &sd = *CTX_data_tool_settings(C)->sculpt;
   SculptSession &ss = *ob.runtime->sculpt_session;
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
-  MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
 
   const FilterType mode = FilterType(RNA_enum_get(op->ptr, "type"));
   float filter_strength = RNA_float_get(op->ptr, "strength");
@@ -424,9 +616,8 @@ static void sculpt_color_filter_apply(bContext *C, wmOperator *op, Object &ob)
   const float3 fill_color = fill_color_resolve(C, op, use_secondary_color);
 
   Mesh &mesh = *id_cast<Mesh *>(ob.data);
-  if (filter_strength < 0.0 && ss.filter_cache->pre_smoothed_color.is_empty()) {
-    sculpt_color_presmooth_init(mesh, ob);
-  }
+  const bool presmooth = filter_strength < 0.0 && ss.filter_cache->pre_smoothed_color.is_empty() &&
+                         mode == FilterType::Smooth;
 
   const IndexMask &node_mask = ss.filter_cache->node_mask;
   if (auto_mask::is_enabled(sd.paint, ob, nullptr) && ss.filter_cache->automasking &&
@@ -435,32 +626,61 @@ static void sculpt_color_filter_apply(bContext *C, wmOperator *op, Object &ob)
     ss.filter_cache->automasking->calc_cavity_factor(depsgraph, ob, node_mask);
   }
 
-  const OffsetIndices<int> faces = mesh.faces();
-  const Span<int> corner_verts = mesh.corner_verts();
-  const GroupedSpan<int> vert_to_face_map = mesh.vert_to_face_map();
-  bke::GSpanAttributeWriter color_attribute = active_color_attribute_for_write(mesh);
-  const MeshAttributeData attribute_data(mesh);
+  switch (pbvh.type()) {
+    case bke::pbvh::Type::Mesh: {
+      if (presmooth) {
+        sculpt_color_presmooth_init_mesh(mesh, ob);
+      }
+      const OffsetIndices<int> faces = mesh.faces();
+      const Span<int> corner_verts = mesh.corner_verts();
+      const GroupedSpan<int> vert_to_face_map = mesh.vert_to_face_map();
+      bke::GSpanAttributeWriter color_attribute = active_color_attribute_for_write(mesh);
+      const MeshAttributeData attribute_data(mesh);
+      MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
+      threading::EnumerableThreadSpecific<LocalData> all_tls;
+      node_mask.foreach_index(
+          [&](const int i) {
+            LocalData &tls = all_tls.local();
+            color_filter_task_mesh(depsgraph,
+                                   ob,
+                                   faces,
+                                   corner_verts,
+                                   vert_to_face_map,
+                                   attribute_data,
+                                   mode,
+                                   filter_strength,
+                                   fill_color,
+                                   nodes[i],
+                                   tls,
+                                   color_attribute);
+          },
+          exec_mode::grain_size(1));
+      color_attribute.finish();
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      multires.ensure_colors();
+      if (presmooth) {
+        sculpt_color_presmooth_init_multires(ob);
+      }
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      node_mask.foreach_index(
+          [&](const int i) {
+            color_filter_task_multires(
+                depsgraph, ob, multires, base_topo, mode, filter_strength, fill_color, nodes[i]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Grids:
+    case bke::pbvh::Type::BMesh:
+      BLI_assert_unreachable();
+      break;
+  }
 
-  threading::EnumerableThreadSpecific<LocalData> all_tls;
-  node_mask.foreach_index(
-      [&](const int i) {
-        LocalData &tls = all_tls.local();
-        color_filter_task(depsgraph,
-                          ob,
-                          faces,
-                          corner_verts,
-                          vert_to_face_map,
-                          attribute_data,
-                          mode,
-                          filter_strength,
-                          fill_color,
-                          nodes[i],
-                          tls,
-                          color_attribute);
-      },
-      exec_mode::grain_size(1));
   pbvh.tag_attribute_changed(node_mask, mesh.active_color_attribute);
-  color_attribute.finish();
   flush_update_step(C, UpdateType::Color);
 }
 

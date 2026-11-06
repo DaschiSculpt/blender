@@ -18,6 +18,7 @@
 #include "BKE_attribute_legacy_convert.hh"
 #include "BKE_customdata.hh"
 #include "BKE_material.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object.hh"
 #include "BKE_object_types.hh"
 #include "BKE_paint.hh"
@@ -27,6 +28,7 @@
 
 #include "bmesh_class.hh"
 
+#include "DEG_depsgraph_query.hh"
 #include "DRW_pbvh.hh"
 #include "DRW_render.hh"
 
@@ -51,6 +53,7 @@ float3 SculptBatch::debug_color()
 
 static Vector<SculptBatch> sculpt_batches_get_ex(const Object *ob,
                                                  const bool use_wire,
+                                                 const bool use_wire_internal,
                                                  const Span<pbvh::AttributeRequest> attrs)
 {
   /* pbvh::Tree should always exist for non-empty meshes, created by depsgraph eval. */
@@ -97,6 +100,18 @@ static Vector<SculptBatch> sculpt_batches_get_ex(const Object *ob,
 
   bke::pbvh::update_normals_from_eval(*const_cast<Object *>(ob), *pbvh);
 
+  if (fast_mode && pbvh->type() == bke::pbvh::Type::Multires) {
+    const Object &object_orig = *DEG_get_original(ob);
+    const Mesh &base_mesh = *id_cast<const Mesh *>(object_orig.data);
+    if (base_mesh.multires && base_mesh.multires->runtime) {
+      if (bke::multiresolution::MultiresCoarseView *coarse =
+              base_mesh.multires->runtime->ensure_coarse_view(base_mesh, *pbvh))
+      {
+        pbvh = coarse->tree.get();
+      }
+    }
+  }
+
   pbvh::DrawCache &draw_data = pbvh::ensure_draw_data(pbvh->draw_data);
 
   IndexMaskMemory memory;
@@ -114,13 +129,17 @@ static Vector<SculptBatch> sculpt_batches_get_ex(const Object *ob,
 
   Span<Batch *> batches;
   if (use_wire) {
-    batches = draw_data.ensure_lines_batches(*ob, {{}, fast_mode}, nodes_to_update);
+    batches = draw_data.ensure_lines_batches(*ob, *pbvh, {{}, fast_mode}, nodes_to_update);
+  }
+  else if (use_wire_internal) {
+    batches = draw_data.ensure_lines_internal_batches(
+        *ob, *pbvh, {{}, fast_mode}, nodes_to_update);
   }
   else {
-    batches = draw_data.ensure_tris_batches(*ob, {attrs, fast_mode}, nodes_to_update);
+    batches = draw_data.ensure_tris_batches(*ob, *pbvh, {attrs, fast_mode}, nodes_to_update);
   }
 
-  const Span<int> material_indices = draw_data.ensure_material_indices(*ob);
+  const Span<int> material_indices = draw_data.ensure_material_indices(*ob, *pbvh);
 
   const int max_material = std::max(0, BKE_object_material_count_eval(ob) - 1);
   Vector<SculptBatch> result_batches;
@@ -128,7 +147,10 @@ static Vector<SculptBatch> sculpt_batches_get_ex(const Object *ob,
   visible_nodes.foreach_index([&](const int i, const int pos) {
     /* Skip nodes without any visible geometry, for example when all faces are hidden but some
      * vertices are not. */
-    if (batches[i] == nullptr || batches[i]->gpu_batch()->elem_() == nullptr) {
+    /* Also empty when the requested wireframe variant doesn't apply (e.g. internal edges of a
+     * non-multires mesh). */
+    if (batches.is_empty() || batches[i] == nullptr || batches[i]->gpu_batch()->elem_() == nullptr)
+    {
       return;
     }
     SculptBatch batch = {};
@@ -170,7 +192,10 @@ Vector<SculptBatch> sculpt_batches_get(const Object *ob, SculptBatchFeature feat
     }
   }
 
-  return sculpt_batches_get_ex(ob, features & SCULPT_BATCH_WIREFRAME, attrs);
+  return sculpt_batches_get_ex(ob,
+                               bool(features & SCULPT_BATCH_WIREFRAME),
+                               bool(features & SCULPT_BATCH_WIREFRAME_INTERNAL),
+                               attrs);
 }
 
 Vector<SculptBatch> sculpt_batches_per_material_get(const Object *ob,
@@ -196,7 +221,7 @@ Vector<SculptBatch> sculpt_batches_per_material_get(const Object *ob,
     attrs.append(pbvh::GenericRequest(name));
   }
 
-  return sculpt_batches_get_ex(ob, false, attrs);
+  return sculpt_batches_get_ex(ob, false, false, attrs);
 }
 
 }  // namespace blender::draw

@@ -340,7 +340,18 @@ ObjectState::ObjectState(const DRWContext *draw_ctx,
       return false;
     }
     const Mesh &mesh = DRW_object_get_data_for_drawing<Mesh>(*ob);
-    return mesh_has_uv_map_attribute(mesh);
+    if (mesh_has_uv_map_attribute(mesh)) {
+      return true;
+    }
+
+    if (sculpt_pbvh) {
+      if (const Mesh *mesh_orig = BKE_object_get_original_mesh(ob)) {
+        if (mesh_orig != &mesh) {
+          return mesh_has_uv_map_attribute(*mesh_orig);
+        }
+      }
+    }
+    return false;
   };
 
   if (color_type == V3D_SHADING_TEXTURE_COLOR && (!has_uv() || ob->dt < OB_TEXTURE)) {
@@ -351,8 +362,10 @@ ObjectState::ObjectState(const DRWContext *draw_ctx,
   }
 
   if (sculpt_pbvh) {
-    if (color_type == V3D_SHADING_TEXTURE_COLOR &&
-        !ELEM(bke::object::pbvh_get(*ob)->type(), bke::pbvh::Type::Mesh, bke::pbvh::Type::Grids))
+    if (color_type == V3D_SHADING_TEXTURE_COLOR && !ELEM(bke::object::pbvh_get(*ob)->type(),
+                                                         bke::pbvh::Type::Mesh,
+                                                         bke::pbvh::Type::Grids,
+                                                         bke::pbvh::Type::Multires))
     {
       /* Force use of material color for sculpt. */
       color_type = V3D_SHADING_MATERIAL_COLOR;

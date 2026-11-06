@@ -1,0 +1,197 @@
+name: Build Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish as a GitHub Release'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Blender Windows (Official Release)
+    runs-on: windows-2022
+    timeout-minutes: 360 # 6 hours max limit
+
+    steps:
+      - name: Free Up Disk Space
+        shell: pwsh
+        run: |
+          # Free space on C:\ (where we will place C:\build_blender) by removing unused SDKs
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:ANDROID_HOME" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\Java" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\go" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\Ruby" -ErrorAction SilentlyContinue
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: false
+
+      - name: Fetch Upstream LFS Assets from Blender
+        shell: pwsh
+        run: |
+          # Custom fork assets (like essentials_brushes-mesh_sculpt.blend) are stored directly in Git
+          # via .gitattributes (!filter !diff !merge -text) and are already checked out on disk.
+          # Pull the remaining unmodified runtime assets (~23 MB) from projects.blender.org:
+          git config lfs.url "https://projects.blender.org/blender/blender.git/info/lfs"
+          git lfs pull --include="assets/**,release/**,scripts/**"
+          git config --unset lfs.url
+
+      - name: Initialize Windows Precompiled Libraries
+        shell: pwsh
+        run: |
+          # Initialize lib/windows_x64 from projects.blender.org without sequential smudge,
+          # then batch-pull LFS binaries in parallel (matching build_files/windows/check_libraries.cmd)
+          git config --local "submodule.lib/windows_x64.update" "checkout"
+          $env:GIT_LFS_SKIP_SMUDGE = "1"
+          git submodule update --init --depth 1 lib/windows_x64
+          Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
+          git -C lib/windows_x64 lfs pull
+
+          # Remove the duplicate ~7 GB LFS cache inside .git/modules to free disk space
+          Remove-Item -Recurse -Force ".git/modules/lib/windows_x64/lfs/objects" -ErrorAction SilentlyContinue
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+
+      - name: Set up OptiX 8.0 Headers & LLVM (Clang-CL) PATH
+        shell: pwsh
+        run: |
+          # Clone official NVIDIA OptiX 8.0 headers so CMake enables WITH_CYCLES_DEVICE_OPTIX in blender.exe
+          git clone --depth 1 --branch v8.0.0 https://github.com/NVIDIA/optix-dev.git C:\optix-dev
+          echo "OPTIX_ROOT_DIR=C:\optix-dev" >> $env:GITHUB_ENV
+
+          # Official Blender Buildbot uses VS2022 with clang-cl on Windows x64 (commit 1ebab9342b9b).
+          # Ninja is already preinstalled on windows-2022 runners and inside VS2022.
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          }
+
+      - name: Compile Official Release (make ninja clang release)
+        shell: cmd
+        run: |
+          :: Executes Blender's official release build command using Buildbot's toolchain (VS2022 + Clang-CL)
+          :: Places the ~15 GB build directory on C:\ where disk space was freed in Step 1
+          make.bat ninja clang release 2022 builddir C:\build_blender
+
+      - name: Inject Precompiled Cycles GPU Kernels
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          if (-not $BUILD_BIN) {
+            Write-Error "Build output directory C:\build_blender\bin not found!"
+            exit 1
+          }
+
+          $VER_DIR = Get-ChildItem -Path $BUILD_BIN.FullName -Directory | Where-Object { $_.Name -match '^\d+\.\d+$' } | Select-Object -First 1
+          $BLENDER_VER = if ($VER_DIR) { $VER_DIR.Name } else { "5.4" }
+          $ESCAPED_VER = [regex]::Escape($BLENDER_VER)
+          $PARENT_SHA = (git rev-parse --short=12 HEAD~1 2>$null)
+
+          Write-Host "Finding official Blender $BLENDER_VER daily build on builder.blender.org (parent SHA: $PARENT_SHA)..."
+          $page = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/" -UseBasicParsing
+          $match = $null
+          if ($PARENT_SHA) {
+            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
+          }
+          if (-not $match -or -not $match.Success) {
+            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
+          }
+          if (-not $match.Success) {
+            Write-Warning "Could not find a $BLENDER_VER build on /download/daily/; checking /download/daily/archive/..."
+            $archivePage = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/archive/" -UseBasicParsing
+            if ($PARENT_SHA) {
+              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
+            }
+            if (-not $match -or -not $match.Success) {
+              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
+            }
+          }
+          if (-not $match.Success) {
+            Write-Error "Could not locate a Windows x64 build for Blender $BLENDER_VER on builder.blender.org!"
+            exit 1
+          }
+
+          $url = $match.Value
+          Write-Host "Downloading upstream archive from: $url"
+          Invoke-WebRequest -Uri $url -OutFile "C:\blender-upstream.zip"
+
+          Write-Host "Extracting Cycles GPU kernels (.cubin.zst, .ptx.zst, .fatbin.zst, .hipfb.zst)..."
+          $DEST = Join-Path $BUILD_BIN.FullName "$BLENDER_VER\scripts\addons_core\cycles\lib"
+          [System.IO.Directory]::CreateDirectory($DEST) | Out-Null
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("C:\blender-upstream.zip")
+          $count = 0
+          foreach ($entry in $zip.Entries) {
+            if ($entry.FullName -match "addons_core/cycles/lib/(.+\.(cubin\.zst|ptx\.zst|fatbin\.zst|hipfb\.zst))$") {
+              $destFile = Join-Path $DEST $matches[1]
+              [System.IO.Directory]::CreateDirectory((Split-Path $destFile)) | Out-Null
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destFile, $true)
+              $count++
+            }
+          }
+          $zip.Dispose()
+          Remove-Item -Force "C:\blender-upstream.zip"
+          Write-Host "Successfully injected $count Cycles GPU kernel binaries into $DEST."
+
+      - name: Package Release Archive
+        shell: pwsh
+        run: |
+          $VERSION = if ($env:GITHUB_REF -like "refs/tags/*") {
+            $env:GITHUB_REF -replace "refs/tags/", ""
+          } else {
+            "build-$env:GITHUB_RUN_NUMBER"
+          }
+          $ARTIFACT_NAME = "blender-windows-x64-$VERSION"
+          $ARCHIVE_NAME = "$ARTIFACT_NAME.zip"
+
+          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          if (-not $BUILD_BIN) {
+            Write-Error "Build output directory C:\build_blender\bin not found!"
+            exit 1
+          }
+
+          # Remove blender.pdb (~1.5 GB unstripped when pdbcopy.exe is absent on runner) to keep release archive lean
+          Remove-Item -Force (Join-Path $BUILD_BIN.FullName "blender.pdb") -ErrorAction SilentlyContinue
+
+          Write-Host "Packaging build output from $($BUILD_BIN.FullName) into $ARCHIVE_NAME..."
+          7z a -tzip $ARCHIVE_NAME "$($BUILD_BIN.FullName)\*"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "7z packaging failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          echo "VERSION=$VERSION" >> $env:GITHUB_ENV
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $env:GITHUB_ENV
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $env:GITHUB_ENV
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          files: ${{ env.ARCHIVE_NAME }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true

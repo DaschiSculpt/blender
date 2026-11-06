@@ -15,14 +15,17 @@ namespace blender {
 struct bContext;
 struct Depsgraph;
 struct Object;
+struct Multiresolution;
 struct wmOperatorType;
 namespace bke::pbvh {
 class Node;
 }
 
 namespace ed::sculpt_paint::hide {
+void sync_all_from_verts(Object &object);
 void sync_all_from_faces(Object &object);
 void mesh_show_all(const Depsgraph &depsgraph, Object &object, const IndexMask &node_mask);
+void multires_show_all(Depsgraph &depsgraph, Object &object, const IndexMask &node_mask);
 void grids_show_all(Depsgraph &depsgraph, Object &object, const IndexMask &node_mask);
 void tag_update_visibility(const bContext &C);
 

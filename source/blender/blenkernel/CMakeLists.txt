@@ -225,6 +225,9 @@ set(SRC
   intern/multires_subdiv.cc
   intern/multires_unsubdivide.cc
   intern/multires_versioning.cc
+  intern/multiresolution.cc
+  intern/multiresolution_coarse.cc
+  intern/multiresolution_uvs.cc
   intern/nla.cc
   intern/node.cc
   intern/node_enum_definition.cc
@@ -270,6 +273,7 @@ set(SRC
   intern/scene.cc
   intern/scene_context.cc
   intern/screen.cc
+  intern/sculpt_layer.cc
   intern/shader_fx.cc
   intern/shrinkwrap.cc
   intern/softbody.cc
@@ -480,6 +484,7 @@ set(SRC
   BKE_modifier.hh
   BKE_movieclip.hh
   BKE_multires.hh
+  BKE_multiresolution.hh
   BKE_nla.hh
   BKE_node.hh
   BKE_node_enum.hh
@@ -519,6 +524,7 @@ set(SRC
   BKE_scene_context.hh
   BKE_scene_runtime.hh
   BKE_screen.hh
+  BKE_sculpt_layer.hh
   BKE_shader_fx.hh
   BKE_shrinkwrap.hh
   BKE_softbody.h
@@ -805,12 +811,14 @@ if(WITH_GTESTS)
     intern/lib_remap_test.cc
     intern/main_namemap_test.cc
     intern/main_test.cc
+    intern/multiresolution_test.cc
     intern/nla_test.cc
     intern/node_socket_value_iter_test.cc
     intern/node_socket_value_test.cc
     intern/path_templates_test.cc
     intern/recents_test.cc
     intern/scene_test.cc
+    intern/sculpt_layer_test.cc
     intern/sound_reader_cache_test.cc
     intern/subdiv_ccg_test.cc
     intern/tracking_test.cc

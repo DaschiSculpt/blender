@@ -10,6 +10,7 @@
 
 #include <variant>
 
+#include "BKE_multiresolution.hh"
 #include "BKE_paint_types.hh"
 
 #include "BLI_array.hh"
@@ -24,8 +25,6 @@
 #include "BLI_string_ref.hh"
 #include "BLI_utility_mixins.hh"
 #include "BLI_vector.hh"
-
-#include "BKE_paint_types.hh"
 
 #include "DNA_brush_enums.h"
 #include "DNA_meshdata_types.h"
@@ -356,16 +355,11 @@ struct SculptTopologyIslandCache {
 
 using ActiveVert = std::variant<std::monostate, int, BMVert *>;
 
-/* Helper return struct for associated data. */
-struct PersistentMultiresData {
-  Span<float3> positions;
-  Span<float3> normals;
-  MutableSpan<float> displacements;
-};
-
 struct SculptSession : NonCopyable, NonMovable {
   /* The current active shapekey for the mesh. Only non-null for Type::Mesh */
   KeyBlock *shapekey_active = nullptr;
+
+  SculptLayer *sculpt_layer_active = nullptr;
 
   /* Edges to adjacent faces. */
   Array<int> edge_to_face_offsets;
@@ -397,11 +391,14 @@ struct SculptSession : NonCopyable, NonMovable {
   Array<float3x3, 0> deform_imats;
 
   /**
-   * Normals corresponding to the #deform_cos evaluated/deform positions. Stored as a #SharedCache
+   * Normals corresponding to the sculpt display positions. Stored as a #SharedCache
    * for consistency with mesh caches in #MeshRuntime::vert_normals_cache.
    */
   SharedCache<Vector<float3>> vert_normals_deform;
   SharedCache<Vector<float3>> face_normals_deform;
+
+  Array<float3, 0> layers_cos;
+  bool layers_only_eval = false;
 
   /* Pool for texture evaluations. */
   ImagePool *tex_pool = nullptr;
@@ -436,20 +433,6 @@ struct SculptSession : NonCopyable, NonMovable {
 
   /* Boundary Brush Preview */
   std::unique_ptr<SculptBoundaryPreview> boundary_preview;
-
-  /* "Persistent" positions and normals for multires. (For mesh the
-   * ".sculpt_persistent_co" attribute is used, etc.). */
-  struct {
-    Array<float3> sculpt_persistent_co;
-    Array<float3> sculpt_persistent_no;
-    Array<float> sculpt_persistent_disp;
-
-    /* The stored state for the SubdivCCG at the time of attribute population, used to roughly
-     * determine if the topology when accessed at a current point in time is equivalent to when
-     * it was originally stored. */
-    int grids_num = -1;
-    int grid_size = -1;
-  } persistent;
 
   /* Contains information used by tools and brushes that require different logic based on boundary
    * elements. Typically used for anything which needs to consider neighbor values.
@@ -541,15 +524,6 @@ struct SculptSession : NonCopyable, NonMovable {
 
   void set_active_vert(ActiveVert vert);
   void clear_active_elements(bool persist_last_active);
-
-  /**
-   * Retrieves the current persistent multires data.
-   *
-   * Potentially used for the layer and cloth brushes.
-   *
-   * \returns an empty optional if the current data cannot be used
-   */
-  std::optional<PersistentMultiresData> persistent_multires_data();
 };
 
 void BKE_sculptsession_free(Object *ob);
@@ -581,6 +555,9 @@ void BKE_sculpt_color_layer_create_if_needed(Object *object);
  * it's the last modifier on the stack and it is not on the first level.
  */
 MultiresModifierData *BKE_sculpt_multires_active(const Scene *scene, Object *ob);
+
+bool BKE_eval_layers_only(const Depsgraph &depsgraph, Object *ob_orig);
+
 int BKE_sculpt_get_grid_num_verts(const Object &object);
 int BKE_sculpt_get_grid_num_faces(const Object &object);
 

@@ -14,6 +14,7 @@
 #include "BKE_attribute.h"
 #include "BKE_editmesh.hh"
 #include "BKE_mesh_types.hh"
+#include "BKE_multiresolution.hh"
 
 #include "RNA_define.hh"
 #include "RNA_enum_types.hh"
@@ -120,11 +121,14 @@ static const EnumPropertyItem rna_enum_mesh_remesh_mode_items[] = {
 #  include "BKE_main.hh"
 #  include "BKE_mesh.hh"
 #  include "BKE_mesh_runtime.hh"
+#  include "BKE_multiresolution.hh"
 #  include "BKE_report.hh"
+#  include "BKE_sculpt_layer.hh"
 
 #  include "DEG_depsgraph.hh"
 
 #  include "ED_mesh.hh" /* XXX Bad level call */
+#  include "ED_sculpt.hh"
 
 #  include "WM_api.hh"
 
@@ -265,6 +269,95 @@ static void rna_Mesh_update_positions_tag(Main *bmain, Scene *scene, PointerRNA 
 {
   rna_Mesh_update_data_legacy_deg_tag_all(bmain, scene, ptr);
 }
+
+static void rna_SculptLayer_update(bContext *C, PointerRNA *ptr)
+{
+  ID *id = ptr->owner_id;
+  if (id == nullptr || id->us <= 0) {
+    return;
+  }
+
+  Object *ob = CTX_data_active_object(C);
+  Depsgraph *depsgraph = CTX_data_depsgraph_pointer(C);
+  if (ob != nullptr && depsgraph != nullptr && ob->data == id &&
+      (ob->mode & OB_MODE_SCULPT) != 0 && id->us == 1)
+  {
+    const SculptLayer &changed_layer = *static_cast<const SculptLayer *>(ptr->data);
+    const bool positions_updated = bke::sculpt_layer::update_eval_positions(
+        *ob, *depsgraph, changed_layer);
+    if (positions_updated) {
+      DEG_id_tag_update(&ob->id, ID_RECALC_SHADING);
+      WM_main_add_notifier(NC_OBJECT | ND_DRAW, &ob);
+      WM_main_add_notifier(NC_GEOM | ND_DATA, id);
+      return;
+    }
+  }
+
+  DEG_id_tag_update(id, ID_RECALC_GEOMETRY);
+  WM_main_add_notifier(NC_GEOM | ND_DATA, id);
+}
+
+#  define SCULPT_LAYER_SLIDER_TOL 0.001f
+
+static void rna_SculptLayer_opacity_set(PointerRNA *ptr, float value)
+{
+  SculptLayer *layer = static_cast<SculptLayer *>(ptr->data);
+  layer->opacity = math::clamp(value, layer->slider_min, layer->slider_max);
+}
+
+static void rna_SculptLayer_opacity_range(
+    PointerRNA *ptr, float *min, float *max, float * /*softmin*/, float * /*softmax*/)
+{
+  const SculptLayer *layer = static_cast<const SculptLayer *>(ptr->data);
+
+  *min = layer->slider_min;
+  *max = layer->slider_max;
+}
+
+static void rna_SculptLayer_slider_min_range(
+    PointerRNA *ptr, float *min, float *max, float * /*softmin*/, float * /*softmax*/)
+{
+  const SculptLayer *layer = static_cast<const SculptLayer *>(ptr->data);
+
+  *min = -10.0f;
+  *max = layer->slider_max - SCULPT_LAYER_SLIDER_TOL;
+}
+
+static void rna_SculptLayer_slider_min_set(PointerRNA *ptr, float value)
+{
+  SculptLayer *layer = static_cast<SculptLayer *>(ptr->data);
+  float min, max, softmin, softmax;
+
+  rna_SculptLayer_slider_min_range(ptr, &min, &max, &softmin, &softmax);
+  layer->slider_min = math::clamp(value, min, max);
+}
+
+static void rna_SculptLayer_slider_max_range(
+    PointerRNA *ptr, float *min, float *max, float * /*softmin*/, float * /*softmax*/)
+{
+  const SculptLayer *layer = static_cast<const SculptLayer *>(ptr->data);
+
+  *min = layer->slider_min + SCULPT_LAYER_SLIDER_TOL;
+  *max = 10.0f;
+}
+
+static void rna_SculptLayer_slider_max_set(PointerRNA *ptr, float value)
+{
+  SculptLayer *layer = static_cast<SculptLayer *>(ptr->data);
+  float min, max, softmin, softmax;
+
+  rna_SculptLayer_slider_max_range(ptr, &min, &max, &softmin, &softmax);
+  layer->slider_max = math::clamp(value, min, max);
+}
+
+static void rna_SculptLayer_update_minmax(bContext *C, PointerRNA *ptr)
+{
+  SculptLayer *layer = static_cast<SculptLayer *>(ptr->data);
+  layer->opacity = math::clamp(layer->opacity, layer->slider_min, layer->slider_max);
+  rna_SculptLayer_update(C, ptr);
+}
+
+#  undef SCULPT_LAYER_SLIDER_TOL
 
 /** \} */
 
@@ -764,6 +857,40 @@ static void rna_MeshVertex_undeformed_co_get(PointerRNA *ptr, float values[3])
   else {
     copy_v3_v3(values, position);
   }
+}
+
+static std::optional<std::string> rna_SculptLayer_path(const PointerRNA *ptr)
+{
+  const SculptLayer *layer = static_cast<const SculptLayer *>(ptr->data);
+  return fmt::format("sculpt_layers[\"{}\"]", BLI_str_escape(layer->name));
+}
+
+static void rna_SculptLayer_name_set(PointerRNA *ptr, const char *value)
+{
+  SculptLayer *layer = static_cast<SculptLayer *>(ptr->data);
+  Mesh *mesh = rna_mesh(ptr);
+
+  bke::sculpt_layer::rename_layer(*mesh, *layer, value);
+}
+
+static void rna_SculptLayer_name_update(bContext *C, PointerRNA *ptr)
+{
+  ID *id = ptr->owner_id;
+  if (id == nullptr || id->us <= 0) {
+    return;
+  }
+
+  Object *ob = CTX_data_active_object(C);
+  if (ob != nullptr && ob->data == id && (ob->mode & OB_MODE_SCULPT) != 0 && id->us == 1 &&
+      bke::sculpt_layer::can_use_fast_path_update(*ob))
+  {
+    bke::sculpt_layer::clear_layer_non_zero_nodes_cache(*ob);
+    WM_main_add_notifier(NC_GEOM | ND_DATA, id);
+    return;
+  }
+
+  DEG_id_tag_update(id, ID_RECALC_GEOMETRY);
+  WM_main_add_notifier(NC_GEOM | ND_DATA, id);
 }
 
 /* uv_layers */
@@ -1966,6 +2093,141 @@ static bool rna_Mesh_is_editmode_get(PointerRNA *ptr)
   return (mesh->runtime->edit_mesh != nullptr);
 }
 
+static bool rna_Mesh_use_dynamic_topology_sculpting_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return (mesh->flag & ME_SCULPT_DYNAMIC_TOPOLOGY) != 0;
+}
+
+static bool rna_Mesh_has_multires_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires != nullptr;
+}
+
+static bool rna_Mesh_multires_topology_matches_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr) {
+    return true;
+  }
+  return bke::multiresolution::base_counts_match(*mesh);
+}
+
+static bool rna_Mesh_multires_use_linear_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires_use_linear != 0;
+}
+
+static void rna_Mesh_multires_use_linear_set(PointerRNA *ptr, bool value)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  mesh->multires_use_linear = value ? 1 : 0;
+}
+
+static int rna_Mesh_multires_curr_level_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires ? mesh->multires->curr_level : 0;
+}
+
+static int rna_Mesh_multires_sculpt_level_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires ? mesh->multires->sculpt_level : 0;
+}
+
+static void rna_Mesh_multires_sculpt_level_range(
+    PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  *min = *softmin = 0;
+  *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
+}
+
+static void rna_Mesh_multires_sculpt_level_set(PointerRNA *ptr, int value)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
+    return;
+  }
+  mesh->multires->sculpt_level = math::clamp(value, 0, mesh->multires->top_level);
+}
+
+static void rna_Mesh_multires_sculpt_level_update(bContext *C, PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr) {
+    return;
+  }
+  Object *ob = CTX_data_active_object(C);
+  const int target_lvl = mesh->multires->sculpt_level;
+  ed::sculpt_paint::multires::set_sculpt_level(C, ob, *mesh, target_lvl);
+}
+
+static int rna_Mesh_multires_top_level_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires ? mesh->multires->top_level : 0;
+}
+
+static int rna_Mesh_multires_view_level_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires ? mesh->multires->view_level : 0;
+}
+
+static void rna_Mesh_multires_view_level_range(
+    PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  *min = *softmin = 0;
+  *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
+}
+
+static void rna_Mesh_multires_view_level_set(PointerRNA *ptr, int value)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
+    return;
+  }
+  mesh->multires->view_level = math::clamp(value, 0, mesh->multires->top_level);
+}
+
+static void rna_Mesh_multires_view_level_update(bContext *C, PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr) {
+    return;
+  }
+  Object *ob = CTX_data_active_object(C);
+  ed::sculpt_paint::multires::view_level_changed(C, ob, *mesh);
+}
+
+static int rna_Mesh_multires_render_level_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires ? mesh->multires->render_level : 0;
+}
+
+static void rna_Mesh_multires_render_level_range(
+    PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  *min = *softmin = 0;
+  *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
+}
+
+static void rna_Mesh_multires_render_level_set(PointerRNA *ptr, int value)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
+    return;
+  }
+  mesh->multires->render_level = math::clamp(value, 0, mesh->multires->top_level);
+}
+
 static bool rna_Mesh_materials_override_apply(Main *bmain,
                                               RNAPropertyOverrideApplyContext &rnaapply_ctx)
 {
@@ -2935,6 +3197,60 @@ static void rna_def_looptri_poly_value(BlenderRNA *brna)
   RNA_def_property_clear_flag(prop, PROP_EDITABLE);
 }
 
+static void rna_def_sculpt_layer(BlenderRNA *brna)
+{
+  StructRNA *srna = RNA_def_struct(brna, "SculptLayer", nullptr);
+  RNA_def_struct_sdna(srna, "SculptLayer");
+  RNA_def_struct_path_func(srna, "rna_SculptLayer_path");
+  RNA_def_struct_ui_text(srna, "Sculpt Layer", "A sculpt displacement layer");
+  RNA_def_struct_ui_icon(srna, ICON_SCULPTMODE_HLT);
+
+  PropertyRNA *prop = RNA_def_property(srna, "name", PROP_STRING, PROP_NONE);
+  RNA_def_struct_name_property(srna, prop);
+  RNA_def_property_string_sdna(prop, nullptr, "name");
+  RNA_def_property_string_maxlength(prop, 64);
+  RNA_def_property_string_funcs(prop, nullptr, nullptr, "rna_SculptLayer_name_set");
+  RNA_def_property_ui_text(prop, "Name", "Unique name of this sculpt layer");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_SculptLayer_name_update");
+
+  prop = RNA_def_property(srna, "opacity", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "opacity");
+  RNA_def_property_float_default(prop, 1.0f);
+  RNA_def_property_float_funcs(
+      prop, nullptr, "rna_SculptLayer_opacity_set", "rna_SculptLayer_opacity_range");
+  RNA_def_property_ui_range(prop, -10.0f, 10.0f, 10, 3);
+  RNA_def_property_ui_text(prop, "Opacity", "Blending factor of the layer displacement");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_SculptLayer_update");
+
+  prop = RNA_def_property(srna, "is_visible", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "is_visible", 0);
+  RNA_def_property_ui_text(prop, "Visible", "Whether this layer contributes to the mesh shape");
+  RNA_def_property_ui_icon(prop, ICON_HIDE_ON, 1);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_SculptLayer_update");
+
+  prop = RNA_def_property(srna, "slider_min", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "slider_min");
+  RNA_def_property_range(prop, -10.0f, 10.0f);
+  RNA_def_property_float_funcs(
+      prop, nullptr, "rna_SculptLayer_slider_min_set", "rna_SculptLayer_slider_min_range");
+  RNA_def_property_ui_text(prop, "Slider Min", "Minimum for opacity slider");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_SculptLayer_update_minmax");
+
+  prop = RNA_def_property(srna, "slider_max", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "slider_max");
+  RNA_def_property_range(prop, -10.0f, 10.0f);
+  RNA_def_property_float_default(prop, 1.0f);
+  RNA_def_property_float_funcs(
+      prop, nullptr, "rna_SculptLayer_slider_max_set", "rna_SculptLayer_slider_max_range");
+  RNA_def_property_ui_text(prop, "Slider Max", "Maximum for opacity slider");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_SculptLayer_update_minmax");
+}
+
 static void rna_def_mesh(BlenderRNA *brna)
 {
   StructRNA *srna;
@@ -3336,6 +3652,83 @@ static void rna_def_mesh(BlenderRNA *brna)
   RNA_def_property_clear_flag(prop, PROP_PTR_NO_OWNERSHIP);
   RNA_def_property_ui_text(prop, "Shape Keys", "");
 
+  prop = RNA_def_property(srna, "sculpt_layers", PROP_COLLECTION, PROP_NONE);
+  RNA_def_property_collection_sdna(prop, nullptr, "sculpt_layers", "sculpt_layers_len");
+  RNA_def_property_struct_type(prop, "SculptLayer");
+  RNA_def_property_override_flag(prop, PROPOVERRIDE_IGNORE);
+  RNA_def_property_ui_text(prop, "Sculpt Layers", "Sculpt displacement layers");
+
+  prop = RNA_def_property(srna, "active_sculpt_layer_index", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "active_layer_index");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
+  RNA_def_property_range(prop, -1, INT_MAX);
+  RNA_def_property_ui_text(prop, "Active Sculpt Layer Index", "Index of the active sculpt layer");
+  RNA_def_property_update(prop, 0, "rna_Mesh_update_draw");
+
+  prop = RNA_def_property(srna, "use_dynamic_topology_sculpting", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop, "rna_Mesh_use_dynamic_topology_sculpting_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop,
+                           "Dynamic Topology Sculpting",
+                           "True if dynamic topology sculpting is active on this mesh");
+
+  prop = RNA_def_property(srna, "has_multires", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop, "rna_Mesh_has_multires_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Has Multires", "True if this mesh has multiresolution data");
+
+  prop = RNA_def_property(srna, "multires_topology_matches", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop, "rna_Mesh_multires_topology_matches_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(
+      prop, "Multiresolution Topology Matches", "False if base mesh counts changed");
+
+  prop = RNA_def_property(srna, "multires_use_linear", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(
+      prop, "rna_Mesh_multires_use_linear_get", "rna_Mesh_multires_use_linear_set");
+  RNA_def_property_ui_text(prop, "Linear", "True if subdivision is linear");
+
+  prop = RNA_def_property(srna, "multires_curr_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop, "rna_Mesh_multires_curr_level_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(
+      prop, "Current Level", "Resident multires level (0 outside sculpt mode)");
+
+  prop = RNA_def_property(srna, "multires_sculpt_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_Mesh_multires_sculpt_level_get",
+                             "rna_Mesh_multires_sculpt_level_set",
+                             "rna_Mesh_multires_sculpt_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_Mesh_multires_sculpt_level_update");
+  RNA_def_property_ui_text(prop, "Sculpt Level", "Multires level used for sculpting");
+
+  prop = RNA_def_property(srna, "multires_top_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop, "rna_Mesh_multires_top_level_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Top Level", "Highest multires subdivision level");
+
+  prop = RNA_def_property(srna, "multires_view_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_Mesh_multires_view_level_get",
+                             "rna_Mesh_multires_view_level_set",
+                             "rna_Mesh_multires_view_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_Mesh_multires_view_level_update");
+  RNA_def_property_ui_text(prop, "View Level", "Multires level used for object-mode display");
+
+  prop = RNA_def_property(srna, "multires_render_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_Mesh_multires_render_level_get",
+                             "rna_Mesh_multires_render_level_set",
+                             "rna_Mesh_multires_render_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_update(prop, NC_GEOM | ND_DATA, nullptr);
+  RNA_def_property_ui_text(prop, "Render Level", "Multires level used for rendering");
+
   /* texture space */
   prop = RNA_def_property(srna, "use_auto_texspace", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "texspace_flag", ME_TEXSPACE_FLAG_AUTO);
@@ -3425,6 +3818,7 @@ void RNA_def_mesh(BlenderRNA *brna)
   rna_def_mpolygon(brna);
   rna_def_mloopuv(brna);
   rna_def_mloopcol(brna);
+  rna_def_sculpt_layer(brna);
 }
 
 }  // namespace blender

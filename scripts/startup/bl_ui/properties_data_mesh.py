@@ -195,6 +195,184 @@ class DATA_PT_texture_space(MeshButtonsPanel, Panel):
         layout.prop(mesh, "texspace_size", text="Size")
 
 
+class MESH_MT_sculpt_layer_operators(Menu):
+    bl_label = "Sculpt Layer Operators"
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.operator("sculpt.layer_duplicate", icon='DUPLICATE')
+        layout.operator("sculpt.layer_merge_down")
+        layout.operator("sculpt.layer_merge_to_base")
+
+
+def draw_sculpt_layers(layout, mesh):
+    row = layout.row()
+    row.template_sculpt_layer_tree()
+
+    col = row.column(align=True)
+    col.operator("sculpt.layer_add", icon='ADD', text="")
+    col.operator("sculpt.layer_remove", icon='REMOVE', text="")
+    col.separator()
+    col.menu("MESH_MT_sculpt_layer_operators", icon='DOWNARROW_HLT', text="")
+    col.separator()
+    col.operator("sculpt.layer_move", icon='TRIA_UP', text="").direction = 'UP'
+    col.operator("sculpt.layer_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
+
+    active_idx = mesh.active_sculpt_layer_index
+    if 0 <= active_idx < len(mesh.sculpt_layers):
+        layer = mesh.sculpt_layers[active_idx]
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(layer, "opacity", text="Opacity", slider=True)
+
+        sub = col.column(align=True)
+        sub.prop(layer, "slider_min", text="Range Min")
+        sub.prop(layer, "slider_max", text="Range Max")
+
+
+class DATA_PT_sculpt_layers(MeshButtonsPanel, Panel):
+    bl_label = "Layers"
+    COMPAT_ENGINES = {
+        'BLENDER_RENDER',
+        'BLENDER_EEVEE',
+        'BLENDER_WORKBENCH',
+    }
+
+    @classmethod
+    def poll(cls, context):
+        engine = context.engine
+        obj = context.object
+        return (obj and obj.type == 'MESH' and (engine in cls.COMPAT_ENGINES))
+
+    def draw(self, context):
+        draw_sculpt_layers(self.layout, context.mesh)
+
+
+def draw_multires(layout, mesh, ob=None):
+    is_dyntopo = (ob and ob.use_dynamic_topology_sculpting) or getattr(mesh, "use_dynamic_topology_sculpting", False)
+    sculpt_level = mesh.multires_sculpt_level
+    top_level = mesh.multires_top_level
+    topology_ok = (not mesh.has_multires or mesh.multires_topology_matches) and not is_dyntopo
+
+    if mesh.has_multires and not topology_ok:
+        box = layout.box()
+        box.label(text="Base topology changed.", icon='ERROR')
+        box.label(text="Multires data is stale.")
+        layout.separator()
+    elif is_dyntopo:
+        layout.label(text="Disabled in Dynamic Topology", icon='INFO')
+        layout.separator()
+
+    col = layout.column(align=True)
+    col.enabled = topology_ok
+    col.prop(mesh, "multires_sculpt_level", text="Sculpt Level")
+    col.prop(mesh, "multires_view_level", text="View Level")
+    col.prop(mesh, "multires_render_level", text="Render Level")
+
+    layout.separator()
+
+    col = layout.column()
+    col.enabled = topology_ok
+    col.prop(mesh, "multires_use_linear", text="Use linear subdivision")
+    row = col.row()
+    row.operator("sculpt.multires_subdiv", text="Subdivide")
+
+    layout.separator()
+
+    row = layout.row(align=True)
+    row.enabled = topology_ok
+    sub = row.row(align=True)
+    sub.enabled = sculpt_level > 0
+    sub.operator("sculpt.multires_delete_lower", text="Delete Lower")
+    sub = row.row(align=True)
+    sub.enabled = sculpt_level < top_level
+    sub.operator("sculpt.multires_delete_higher", text="Delete Higher")
+
+
+def draw_multires_bake(layout, sculpt, mesh, ob=None):
+    is_dyntopo = (ob and ob.use_dynamic_topology_sculpting) or getattr(mesh, "use_dynamic_topology_sculpting", False)
+    top_level = mesh.multires_top_level
+    topology_ok = (not mesh.has_multires or mesh.multires_topology_matches) and not is_dyntopo
+
+    bake_settings = sculpt.multires_bake
+
+    col = layout.column()
+    col.enabled = topology_ok and top_level > 0
+    col.template_ID(bake_settings, "image", new="image.new", open="image.open")
+
+    layout.separator()
+
+    col = layout.column()
+    col.enabled = topology_ok and top_level > 0
+
+    col.prop(bake_settings, "type", text="Type")
+
+    if bake_settings.type == 'VECTOR_DISPLACEMENT':
+        col.prop(bake_settings, "space", text="Space")
+    elif bake_settings.type == 'DISPLACEMENT':
+        col.prop(bake_settings, "use_normalize", text="Normalize")
+
+    col.prop(bake_settings, "margin", text="Margin")
+
+    layout.separator()
+
+    col = layout.column()
+    col.enabled = topology_ok and top_level > 0 and (bake_settings.image is not None)
+    bake_op = col.operator("sculpt.multires_bake", text="Bake")
+    bake_op.type = bake_settings.type
+    bake_op.space = bake_settings.space
+    bake_op.use_normalize = bake_settings.use_normalize
+    bake_op.image = bake_settings.image.name if bake_settings.image else ""
+    bake_op.margin = bake_settings.margin
+
+
+class DATA_PT_multires(MeshButtonsPanel, Panel):
+    bl_label = "Multiresolution"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {
+        'BLENDER_RENDER',
+        'BLENDER_EEVEE',
+        'BLENDER_WORKBENCH',
+    }
+
+    @classmethod
+    def poll(cls, context):
+        engine = context.engine
+        obj = context.object
+        return (obj and obj.type == 'MESH' and (engine in cls.COMPAT_ENGINES))
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        draw_multires(layout, context.mesh, ob=context.object)
+
+
+class DATA_PT_multires_bake(MeshButtonsPanel, Panel):
+    bl_label = "Bake"
+    bl_parent_id = "DATA_PT_multires"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {
+        'BLENDER_RENDER',
+        'BLENDER_EEVEE',
+        'BLENDER_WORKBENCH',
+    }
+
+    @classmethod
+    def poll(cls, context):
+        engine = context.engine
+        obj = context.object
+        return (obj and obj.type == 'MESH' and (engine in cls.COMPAT_ENGINES) and
+                context.tool_settings.sculpt and obj.data.has_multires)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        draw_multires_bake(layout, context.tool_settings.sculpt, context.mesh, ob=context.object)
+
+
 class DATA_PT_vertex_groups(MeshButtonsPanel, Panel):
     bl_label = "Vertex Groups"
     COMPAT_ENGINES = {
@@ -729,10 +907,14 @@ classes = (
     MESH_MT_shape_key_tree_context_menu,
     MESH_MT_color_attribute_context_menu,
     MESH_MT_attribute_context_menu,
+    MESH_MT_sculpt_layer_operators,
     MESH_UL_vgroups,
     MESH_UL_uvmaps,
     MESH_UL_attributes,
     DATA_PT_context_mesh,
+    DATA_PT_multires,
+    DATA_PT_multires_bake,
+    DATA_PT_sculpt_layers,
     DATA_PT_vertex_groups,
     DATA_PT_shape_keys,
     DATA_PT_uv_texture,

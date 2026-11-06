@@ -631,6 +631,26 @@ struct BakeData {
   struct Object *cage_object = nullptr;
 };
 
+enum MultiresBakeType : int8_t {
+  MULTIRES_BAKE_NORMALS = 0,
+  MULTIRES_BAKE_DISPLACEMENT = 1,
+  MULTIRES_BAKE_VECTOR_DISPLACEMENT = 2,
+};
+
+enum MultiresBakeSpace : int8_t {
+  MULTIRES_BAKE_SPACE_TANGENT = 0,
+  MULTIRES_BAKE_SPACE_OBJECT = 1,
+};
+
+struct MultiresBakeSettings {
+  struct Image *image = nullptr;
+  MultiresBakeType type = MULTIRES_BAKE_NORMALS;
+  MultiresBakeSpace space = MULTIRES_BAKE_SPACE_TANGENT;
+  short margin = 16;
+  char use_normalize = 0;
+  char _pad[3] = {};
+};
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -1557,6 +1577,13 @@ struct Sculpt {
   /** For use by operators. */
   DNA_DEPRECATED struct CurveMapping *automasking_cavity_curve_op = nullptr;
   struct Object *gravity_object = nullptr;
+
+  int morph_store_mode = 0;
+  int morph_skip_undo = 0;
+  int morph_use_mask = 0;
+  int morph_use_hide = 0;
+
+  struct MultiresBakeSettings multires_bake;
 };
 
 struct CurvesSculpt {

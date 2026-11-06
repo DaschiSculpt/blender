@@ -10,6 +10,8 @@
 
 #include <queue>
 
+#include "DNA_multires_types.h"
+
 #include "BLI_bit_vector.hh"
 #include "BLI_function_ref.hh"
 #include "BLI_offset_indices.hh"
@@ -43,6 +45,28 @@ struct FillDataMesh {
   void execute(Object &object,
                GroupedSpan<int> vert_to_face_map,
                FunctionRef<bool(int from_v, int to_v)> func);
+};
+
+struct FillDataMultires {
+  std::queue<bke::multiresolution::MultiresCoord> queue;
+  BitVector<> visited_verts;
+  Span<int> fake_neighbors;
+
+  FillDataMultires(int size) : visited_verts(size) {}
+  FillDataMultires(int size, Span<int> fake_neighbors)
+      : visited_verts(size), fake_neighbors(fake_neighbors)
+  {
+    BLI_assert(fake_neighbors.is_empty() || size == fake_neighbors.size());
+  }
+
+  void add_initial(const bke::multiresolution::MultiresCoord vert);
+  void add_initial(const Multiresolution &multires, const Span<int> verts);
+  void add_and_skip_initial(const bke::multiresolution::MultiresCoord vert, const int index);
+  void execute(const Object &object,
+               const Multiresolution &multires,
+               const bke::multiresolution::BaseTopology &base_topo,
+               FunctionRef<bool(bke::multiresolution::MultiresCoord from_v,
+                                bke::multiresolution::MultiresCoord to_v)> func);
 };
 
 struct FillDataGrids {

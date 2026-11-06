@@ -2820,6 +2820,11 @@ void RNA_api_ui_layout(StructRNA *srna)
   func = RNA_def_function(srna, "template_shape_key_tree", "ed::object::shapekey::template_tree");
   RNA_def_function_ui_description(func, "Shape Key tree view");
   RNA_def_function_flag(func, FUNC_USE_CONTEXT);
+
+  func = RNA_def_function(
+      srna, "template_sculpt_layer_tree", "ed::sculpt::template_sculpt_layer_tree");
+  RNA_def_function_ui_description(func, "Sculpt Layer tree view");
+  RNA_def_function_flag(func, FUNC_USE_CONTEXT);
 }
 
 }  // namespace blender

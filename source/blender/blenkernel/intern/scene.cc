@@ -726,10 +726,24 @@ static void scene_foreach_toolsettings(LibraryForeachIDData *data,
     if (toolsett->sculpt) {
       toolsett->sculpt->gravity_object = gravity_object;
     }
+
+    Image *bake_image = toolsett->sculpt ? toolsett->sculpt->multires_bake.image : nullptr;
+    Image *bake_image_old = toolsett_old->sculpt->multires_bake.image;
+    BKE_LIB_FOREACHID_UNDO_PRESERVE_PROCESS_IDSUPER_P(data,
+                                                      &bake_image,
+                                                      do_undo_restore,
+                                                      SCENE_FOREACH_UNDO_RESTORE,
+                                                      reader,
+                                                      &bake_image_old,
+                                                      IDWALK_CB_USER);
+    if (toolsett->sculpt) {
+      toolsett->sculpt->multires_bake.image = bake_image;
+    }
     /* Do not re-assign `gravity_object_old` object if both current and old data are the same
      * (foreach_id case), that would nullify assignment above, making remapping cases fail. */
     if (toolsett_old != toolsett) {
       toolsett_old->sculpt->gravity_object = gravity_object_old;
+      toolsett_old->sculpt->multires_bake.image = bake_image_old;
     }
   }
   if (toolsett_old->gp_paint) {

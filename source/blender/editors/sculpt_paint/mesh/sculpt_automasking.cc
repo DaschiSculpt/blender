@@ -41,6 +41,9 @@
 #include <cmath>
 
 namespace blender::ed::sculpt_paint::auto_mask {
+
+using MultiresCoord = bke::multiresolution::MultiresCoord;
+
 const Cache *active_cache_get(const SculptSession &ss)
 {
   if (ss.cache) {
@@ -377,6 +380,111 @@ static void calc_blurred_cavity_mesh(const Depsgraph &depsgraph,
   cavity_factors[vert] = calc_cavity_factor(automasking, factor_sum);
 }
 
+static void calc_blurred_cavity_multires(const Object &object,
+                                         const Cache &automasking,
+                                         const int steps,
+                                         const int vert_idx,
+                                         MutableSpan<float> cavity_factors)
+{
+  struct CavityBlurVert {
+    int vert;
+    int depth;
+  };
+
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+  const Multiresolution &multires = *mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+  const Span<float3> positions = multires.positions();
+  const Span<float3> normals = multires.normals();
+  const Span<bool> hidden = multires.hidden_verts();
+
+  AccumulatedVert all_verts;
+  AccumulatedVert verts_in_range;
+  const int num_steps = steps + 1;
+
+  std::queue<CavityBlurVert> queue;
+  Set<int, 64> visited_verts;
+
+  const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+
+  auto calc_index = [&](const MultiresCoord coord) -> int { return coord.to_index(offsets); };
+
+  const MultiresCoord vert = multires.coord_from_index(vert_idx);
+
+  const CavityBlurVert initial{vert_idx, 0};
+  visited_verts.add_new(initial.vert);
+  queue.push(initial);
+
+  const float3 starting_position = positions[calc_index(vert)];
+
+  Vector<MultiresCoord> neighbors;
+  while (!queue.empty()) {
+    const CavityBlurVert blurvert = queue.front();
+    queue.pop();
+
+    const int curr_vert_idx = blurvert.vert;
+
+    const float3 &blur_vert_position = positions[curr_vert_idx];
+    const float3 &blur_vert_normal = normals[curr_vert_idx];
+
+    const float dist_to_start = math::distance(blur_vert_position, starting_position);
+
+    all_verts.position += blur_vert_position;
+    all_verts.distance += dist_to_start;
+    all_verts.count++;
+
+    if (blurvert.depth < num_steps) {
+      verts_in_range.position += blur_vert_position;
+      verts_in_range.normal += blur_vert_normal;
+      verts_in_range.count++;
+    }
+
+    if (blurvert.depth >= num_steps) {
+      continue;
+    }
+
+    const MultiresCoord curr_vert = multires.coord_from_index(curr_vert_idx);
+    Multiresolution::calc_neighbors(
+        curr_vert, base_topo, multires.grid_size(), offsets, hidden, neighbors);
+    for (const MultiresCoord neighbor : neighbors) {
+      const int neighbor_idx = calc_index(neighbor);
+      if (visited_verts.contains(neighbor_idx)) {
+        continue;
+      }
+
+      visited_verts.add_new(neighbor_idx);
+      queue.push({neighbor_idx, blurvert.depth + 1});
+    }
+  }
+
+  BLI_assert(all_verts.count != verts_in_range.count);
+
+  if (all_verts.count == 0) {
+    all_verts.position = positions[vert_idx];
+  }
+  else {
+    all_verts.position /= float(all_verts.count);
+    all_verts.distance /= all_verts.count;
+  }
+
+  if (verts_in_range.count == 0) {
+    verts_in_range.position = positions[vert_idx];
+  }
+  else {
+    verts_in_range.position /= float(verts_in_range.count);
+  }
+
+  verts_in_range.normal = math::normalize(verts_in_range.normal);
+  if (math::dot(verts_in_range.normal, verts_in_range.normal) == 0.0f) {
+    verts_in_range.normal = normals[vert_idx];
+  }
+
+  const float3 vec = all_verts.position - verts_in_range.position;
+  float factor_sum = math::dot(vec, verts_in_range.normal) / all_verts.distance;
+  cavity_factors[vert_idx] = calc_cavity_factor(automasking, factor_sum);
+}
+
 static void calc_blurred_cavity_grids(const Object &object,
                                       const Cache &automasking,
                                       const int steps,
@@ -598,6 +706,19 @@ static void calc_cavity_factor_mesh(const Depsgraph &depsgraph,
                              automasking.settings.cavity_blur_steps,
                              vert,
                              const_cast<Cache &>(automasking).cavity_factor);
+  }
+}
+
+static void calc_cavity_factor_multires(const Cache &automasking,
+                                        const Object &object,
+                                        const int vert)
+{
+  if (automasking.cavity_factor[vert] == -1.0f) {
+    calc_blurred_cavity_multires(object,
+                                 automasking,
+                                 automasking.settings.cavity_blur_steps,
+                                 vert,
+                                 const_cast<Cache &>(automasking).cavity_factor);
   }
 }
 
@@ -849,6 +970,268 @@ void calc_interpolated_face_factors(const Depsgraph &depsgraph,
           flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_VIEW_NORMAL))
       {
         factor *= calc_view_normal_factor(automasking, object, vert_normals[vert]);
+      }
+
+      if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_CAVITY_ALL)) {
+        BLI_assert(automasking.cavity_factor[vert] != -1.0f);
+        factor *= process_cavity_factor(automasking, automasking.cavity_factor[vert]);
+      }
+    }
+    factors[i] *= sum * math::rcp(float(face_verts.size()));
+  }
+}
+
+void calc_multires_factors(const Depsgraph &depsgraph,
+                           const Object &object,
+                           const Multiresolution &multires,
+                           const bke::multiresolution::BaseTopology &base_topo,
+                           const Cache &automasking,
+                           const bke::pbvh::MultiresNode &node,
+                           const MutableSpan<float> factors)
+{
+  PRF_scope(ProfileCategory::Editor);
+  const SculptSession &ss = *object.runtime->sculpt_session;
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = multires.positions().slice(node_range);
+  const Span<float3> normals = multires.normals().slice(node_range);
+
+  Span<float3> orig_normals;
+  if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BRUSH_NORMAL) ||
+      flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_VIEW_NORMAL))
+  {
+    if (std::optional<OrigPositionData> orig_data = orig_position_data_lookup_multires(object,
+                                                                                       node))
+    {
+      orig_normals = orig_data->normals;
+    }
+  }
+  const Span<float3> normals_for_symm = orig_normals.is_empty() ? normals : orig_normals;
+
+  /* If the cache is initialized with valid info, use the cache. This is used when the
+   * automasking information can't be computed in real time per vertex and needs to be
+   * initialized for the whole mesh when the stroke starts. */
+  if (!automasking.factor.is_empty()) {
+    for (const int i : node_range.index_range()) {
+      factors[i] *= automasking.factor[node_range[i]];
+    }
+  }
+
+  const bool do_occlusion = flag_is_set(automasking.settings.flags,
+                                        BRUSH_AUTOMASKING_VIEW_OCCLUSION) &&
+                            flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_VIEW_NORMAL);
+  if (do_occlusion) {
+    for (const int i : node_range.index_range()) {
+      const int vert = node_range[i];
+      const bool occluded = calc_view_occlusion_factor(
+          depsgraph, const_cast<Cache &>(automasking), object, vert, positions[i]);
+      if (occluded) {
+        factors[i] = 0.0f;
+      }
+    }
+  }
+
+  const int current_symmetry_pass = ss.cache ? ss.cache->mirror_symmetry_pass : 0;
+  if (!automasking.settings.topology_use_brush_limit &&
+      flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_TOPOLOGY))
+  {
+    for (const int i : node_range.index_range()) {
+      const int vert = node_range[i];
+      if (islands::vert_id_get(ss, vert) !=
+          automasking.settings.initial_island_nr[current_symmetry_pass])
+      {
+        factors[i] = 0.0f;
+      }
+    }
+  }
+
+  const bool has_coord_flags = flag_is_set(automasking.settings.flags,
+                                           BRUSH_AUTOMASKING_FACE_SETS |
+                                               BRUSH_AUTOMASKING_BOUNDARY_EDGES |
+                                               BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS);
+  if (has_coord_flags) {
+    multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+
+    const Span<int> face_sets = multires.face_sets();
+
+    if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_FACE_SETS)) {
+      if (automasking.settings.initial_face_set != face_set_none_id) {
+        for (const int i : node_range.index_range()) {
+          const int vert = node_range[i];
+          const MultiresCoord coord = multires.coord_from_index(vert);
+          if (!face_set::vert_has_face_set(
+                  coord, base_topo, grid_size, face_sets, automasking.settings.initial_face_set))
+          {
+            factors[i] = 0.0f;
+          }
+        }
+      }
+    }
+
+    if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BOUNDARY_EDGES)) {
+      for (const int i : node_range.index_range()) {
+        const int vert = node_range[i];
+        const MultiresCoord coord = multires.coord_from_index(vert);
+        if (boundary::vert_is_boundary(coord, base_topo.boundary_verts, base_topo.boundary_edges))
+        {
+          factors[i] = 0.0f;
+        }
+      }
+    }
+
+    if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS)) {
+      for (const int i : node_range.index_range()) {
+        const int vert = node_range[i];
+        const MultiresCoord coord = multires.coord_from_index(vert);
+        const bool ignore = ss.cache && ss.cache->brush &&
+                            ss.cache->brush->sculpt_brush_type ==
+                                SCULPT_BRUSH_TYPE_DRAW_FACE_SETS &&
+                            (automasking.settings.initial_face_set == face_set_none_id ||
+                             face_set::vert_face_set_get(coord, base_topo, grid_size, face_sets) ==
+                                 ss.cache->paint_face_set);
+
+        if (!ignore && !face_set::vert_has_unique_face_set(coord, base_topo, grid_size, face_sets))
+        {
+          factors[i] = 0.0f;
+        }
+      }
+    }
+  }
+
+  if ((ss.cache || ss.filter_cache) &&
+      flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BRUSH_NORMAL))
+  {
+    for (const int i : node_range.index_range()) {
+      factors[i] *= calc_brush_normal_factor(automasking, object, normals_for_symm[i]);
+    }
+  }
+
+  if ((ss.cache || ss.filter_cache) &&
+      flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_VIEW_NORMAL))
+  {
+    for (const int i : node_range.index_range()) {
+      factors[i] *= calc_view_normal_factor(automasking, object, normals_for_symm[i]);
+    }
+  }
+
+  if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_CAVITY_ALL)) {
+    for (const int i : node_range.index_range()) {
+      const int vert = node_range[i];
+      BLI_assert(automasking.cavity_factor[vert] != -1.0f);
+      factors[i] *= process_cavity_factor(automasking, automasking.cavity_factor[vert]);
+    }
+  }
+}
+
+void calc_face_factors(const Depsgraph &depsgraph,
+                       const Object &object,
+                       const Multiresolution &multires,
+                       const bke::multiresolution::BaseTopology &base_topo,
+                       const Cache &automasking,
+                       const Span<int> face_indices,
+                       const MutableSpan<float> factors)
+{
+  PRF_scope(ProfileCategory::Editor);
+  const SculptSession &ss = *object.runtime->sculpt_session;
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const Span<int> corner_verts = multires.corner_verts();
+  const Span<float3> positions = multires.positions();
+  const Span<float3> normals = multires.normals();
+
+  const bool has_coord_flags = flag_is_set(automasking.settings.flags,
+                                           BRUSH_AUTOMASKING_FACE_SETS |
+                                               BRUSH_AUTOMASKING_BOUNDARY_EDGES |
+                                               BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS);
+  if (has_coord_flags) {
+    multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+  }
+  const Span<int> face_sets = multires.face_sets();
+
+  for (const int i : face_indices.index_range()) {
+    const Span<int> face_verts = corner_verts.slice(face_indices[i] * 4, 4);
+    float sum = 0.0f;
+    for (const int vert : face_verts) {
+      float factor = 1.0f;
+      BLI_SCOPED_DEFER([&]() { sum += factor; });
+
+      /* If the cache is initialized with valid info, use the cache. This is used when the
+       * automasking information can't be computed in real time per vertex and needs to be
+       * initialized for the whole mesh when the stroke starts. */
+      if (!automasking.factor.is_empty()) {
+        factor *= automasking.factor[vert];
+      }
+
+      const bool do_occlusion = flag_is_set(automasking.settings.flags,
+                                            BRUSH_AUTOMASKING_VIEW_OCCLUSION) &&
+                                flag_is_set(automasking.settings.flags,
+                                            BRUSH_AUTOMASKING_VIEW_NORMAL);
+      if (do_occlusion) {
+        const bool occluded = calc_view_occlusion_factor(
+            depsgraph, const_cast<Cache &>(automasking), object, vert, positions[vert]);
+        if (occluded) {
+          factor = 0.0f;
+          continue;
+        }
+      }
+
+      const int current_symmetry_pass = ss.cache ? ss.cache->mirror_symmetry_pass : 0;
+      if (!automasking.settings.topology_use_brush_limit &&
+          flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_TOPOLOGY) &&
+          islands::vert_id_get(ss, vert) !=
+              automasking.settings.initial_island_nr[current_symmetry_pass])
+      {
+        factor = 0.0f;
+        continue;
+      }
+
+      const MultiresCoord coord = has_coord_flags ? multires.coord_from_index(vert) :
+                                                    MultiresCoord();
+
+      if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_FACE_SETS)) {
+        if (automasking.settings.initial_face_set != face_set_none_id &&
+            !face_set::vert_has_face_set(
+                coord, base_topo, grid_size, face_sets, automasking.settings.initial_face_set))
+        {
+          factor = 0.0f;
+          continue;
+        }
+      }
+
+      if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BOUNDARY_EDGES)) {
+        if (boundary::vert_is_boundary(coord, base_topo.boundary_verts, base_topo.boundary_edges))
+        {
+          factor = 0.0f;
+          continue;
+        }
+      }
+
+      if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS)) {
+        const bool ignore = ss.cache && ss.cache->brush &&
+                            ss.cache->brush->sculpt_brush_type ==
+                                SCULPT_BRUSH_TYPE_DRAW_FACE_SETS &&
+                            (automasking.settings.initial_face_set == face_set_none_id ||
+                             face_set::vert_face_set_get(coord, base_topo, grid_size, face_sets) ==
+                                 ss.cache->paint_face_set);
+
+        if (!ignore && !face_set::vert_has_unique_face_set(coord, base_topo, grid_size, face_sets))
+        {
+          factor = 0.0f;
+          continue;
+        }
+      }
+
+      if ((ss.cache || ss.filter_cache) &&
+          flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_BRUSH_NORMAL))
+      {
+        factor *= calc_brush_normal_factor(automasking, object, normals[vert]);
+      }
+
+      if ((ss.cache || ss.filter_cache) &&
+          flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_VIEW_NORMAL))
+      {
+        factor *= calc_view_normal_factor(automasking, object, normals[vert]);
       }
 
       if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_CAVITY_ALL)) {
@@ -1213,6 +1596,36 @@ static void fill_constrained_topology_automasking_factors_mesh(const Depsgraph &
   });
 }
 
+static void fill_constrained_topology_automasking_factors_multires(Object &ob,
+                                                                   MutableSpan<float> factors)
+{
+  SculptSession &ss = *ob.runtime->sculpt_session;
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
+  const Mesh &mesh = *id_cast<const Mesh *>(ob.data);
+  const Multiresolution &multires = *mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+  const Span<float3> positions = multires.positions();
+
+  const float radius = ss.cache->radius;
+  const int active_vert = ss.active_vert_index();
+
+  multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+  flood_fill::FillDataMultires flood = flood_fill::FillDataMultires(positions.size());
+  flood.add_initial(multires, find_symm_verts_multires(ob, active_vert, radius));
+
+  const ePaintSymmetryFlags symm = mesh_symmetry_xyz_get(ob);
+
+  float3 location = positions[active_vert];
+
+  auto calc_index = [&](const MultiresCoord coord) { return coord.to_index(pbvh.offsets); };
+
+  flood.execute(ob, multires, base_topo, [&](MultiresCoord from_v, MultiresCoord to_v) {
+    factors[calc_index(from_v)] = 1.0f;
+    factors[calc_index(to_v)] = 1.0f;
+    return is_vertex_inside_brush_radius_symm(positions[calc_index(to_v)], location, radius, symm);
+  });
+}
+
 static void fill_constrained_topology_automasking_factors_grids(Object &ob,
                                                                 const SubdivCCG &subdiv_ccg,
                                                                 MutableSpan<float> factors)
@@ -1287,6 +1700,9 @@ static void fill_constrained_topology_automasking_factors(const Depsgraph &depsg
       fill_constrained_topology_automasking_factors_mesh(
           depsgraph, ob, bke::pbvh::vert_positions_eval(depsgraph, ob), factors);
       break;
+    case bke::pbvh::Type::Multires:
+      fill_constrained_topology_automasking_factors_multires(ob, factors);
+      break;
     case bke::pbvh::Type::Grids:
       fill_constrained_topology_automasking_factors_grids(ob, *ss.subdiv_ccg, factors);
       break;
@@ -1357,6 +1773,74 @@ static void init_boundary_masking_mesh(Object &object,
   }
 
   for (const int i : IndexRange(num_verts)) {
+    if (edge_distance[i] == EDGE_DISTANCE_INF) {
+      continue;
+    }
+
+    const float p = 1.0f - (float(edge_distance[i]) / float(propagation_steps));
+    const float edge_boundary_automask = pow2f(p);
+
+    factors[i] *= (1.0f - edge_boundary_automask);
+  }
+}
+
+static void init_boundary_masking_multires(Object &object,
+                                           const BoundaryAutomaskMode mode,
+                                           const int propagation_steps,
+                                           MutableSpan<float> factors)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const Mesh &mesh = *id_cast<Mesh *>(object.data);
+  const Multiresolution &multires = *mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+  const int grid_size = multires.grid_size();
+  multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+  const Span<float3> positions = multires.positions();
+  const Span<bool> hidden = multires.hidden_verts();
+
+  const bke::AttributeAccessor attributes = mesh.attributes();
+  const VArraySpan face_sets = *attributes.lookup<int>(".sculpt_face_set", bke::AttrDomain::Face);
+
+  Array<int> edge_distance(positions.size(), EDGE_DISTANCE_INF);
+  for (const int i : positions.index_range()) {
+    const MultiresCoord coord = multires.coord_from_index(i);
+    switch (mode) {
+      case BoundaryAutomaskMode::Edges:
+        if (boundary::vert_is_boundary(coord, base_topo.boundary_verts, base_topo.boundary_edges))
+        {
+          edge_distance[i] = 0;
+        }
+        break;
+      case BoundaryAutomaskMode::FaceSets:
+        if (!face_set::vert_has_unique_face_set(coord, base_topo, grid_size, face_sets)) {
+          edge_distance[i] = 0;
+        }
+        break;
+    }
+  }
+
+  const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+
+  Vector<MultiresCoord> neighbors;
+  for (const int propagation_it : IndexRange(propagation_steps)) {
+    for (const int i : positions.index_range()) {
+      if (edge_distance[i] != EDGE_DISTANCE_INF) {
+        continue;
+      }
+
+      const MultiresCoord coord = multires.coord_from_index(i);
+      Multiresolution::calc_neighbors(coord, base_topo, grid_size, offsets, hidden, neighbors);
+
+      for (const MultiresCoord neighbor : neighbors) {
+        const int neighbor_idx = neighbor.to_index(offsets);
+        if (edge_distance[neighbor_idx] == propagation_it) {
+          edge_distance[i] = propagation_it + 1;
+        }
+      }
+    }
+  }
+
+  for (const int i : positions.index_range()) {
     if (edge_distance[i] == EDGE_DISTANCE_INF) {
       continue;
     }
@@ -1510,6 +1994,9 @@ static void init_boundary_masking(Object &object,
   switch (bke::object::pbvh_get(object)->type()) {
     case bke::pbvh::Type::Mesh:
       init_boundary_masking_mesh(object, depsgraph, mode, propagation_steps, factors);
+      break;
+    case bke::pbvh::Type::Multires:
+      init_boundary_masking_multires(object, mode, propagation_steps, factors);
       break;
     case bke::pbvh::Type::Grids:
       init_boundary_masking_grids(object, mode, propagation_steps, factors);
@@ -1706,6 +2193,22 @@ void Cache::calc_cavity_factor(const Depsgraph &depsgraph,
             const Span<int> verts = nodes[i].verts();
             for (const int vert : verts) {
               calc_cavity_factor_mesh(depsgraph, *this, object, vert);
+            }
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      const int grid_size = multires.grid_size();
+      multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+      node_mask.foreach_index(
+          [&](const int i) {
+            for (const int vert : nodes[i].range(grid_size)) {
+              calc_cavity_factor_multires(*this, object, vert);
             }
           },
           exec_mode::grain_size(1));

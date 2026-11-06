@@ -39,6 +39,11 @@ struct MeshLocalData {
   Vector<float> distances;
 };
 
+struct MultiresLocalData {
+  Vector<float> factors;
+  Vector<float> distances;
+};
+
 struct GridLocalData {
   Vector<float> factors;
   Vector<float> distances;
@@ -58,6 +63,18 @@ static void apply_positions_faces(const Sculpt &sd,
   SculptSession &ss = *object.runtime->sculpt_session;
   clip_and_lock_translations(sd, ss, position_data.eval, verts, translations);
   position_data.deform(translations, verts);
+}
+
+static void apply_positions_multires(const Sculpt &sd,
+                                     const Object &object,
+                                     const MutableSpan<float3> curr_positions,
+                                     const MutableSpan<float3> translations,
+                                     const MultiresDeformData &deform_data,
+                                     const IndexRange node_range)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  clip_and_lock_translations(sd, ss, curr_positions, translations);
+  deform_data.deform(node_range, translations);
 }
 
 static void apply_positions_grids(const Sculpt &sd,
@@ -220,6 +237,127 @@ static void do_relax_face_sets_brush_mesh(const Depsgraph &depsgraph,
                               translations.as_mutable_span().slice(node_vert_offsets[pos]),
                               position_data);
         bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+      },
+      exec_mode::grain_size(1));
+  pbvh.tag_positions_changed(node_mask);
+  pbvh.flush_bounds_to_parents();
+}
+
+BLI_NOINLINE static void calc_factors_multires(const Depsgraph &depsgraph,
+                                               const Multiresolution &multires,
+                                               const bke::multiresolution::BaseTopology &base_topo,
+                                               const Brush &brush,
+                                               const Span<int> face_sets,
+                                               const bke::pbvh::MultiresNode &node,
+                                               const float strength,
+                                               const bool relax_face_sets,
+                                               Object &object,
+                                               MultiresLocalData &tls,
+                                               const MutableSpan<float3> node_positions,
+                                               const MutableSpan<float> factors)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  node_positions.copy_from(multires.positions().slice(node_range));
+  const Span<float3> node_normals = multires.normals().slice(node_range);
+
+  fill_factor_from_hide_and_mask(multires.hidden_verts(), multires.masks(), node_range, factors);
+  filter_region_clip_factors(ss, node_positions, factors);
+  if (brush.flag & BRUSH_FRONTFACE) {
+    calc_front_face(cache.view_normal_symm, node_normals, factors);
+  }
+
+  tls.distances.resize(node_positions.size());
+  const MutableSpan<float> distances = tls.distances;
+  calc_brush_distances(ss, node_positions, eBrushFalloffShape(brush.falloff_shape), distances);
+  filter_distances_with_radius(cache.radius, distances, factors);
+  apply_hardness_to_distances(cache, distances);
+  calc_brush_strength_factors(cache, brush, distances, factors);
+
+  auto_mask::calc_multires_factors(
+      depsgraph, object, multires, base_topo, cache.automasking.get(), node, factors);
+
+  scale_factors(factors, strength);
+
+  calc_brush_texture_factors(PaintMode::Sculpt, ss, brush, node_positions, factors);
+
+  face_set::filter_verts_with_unique_face_sets_multires(
+      base_topo, face_sets, relax_face_sets, grid_size, node, factors);
+}
+
+static void do_relax_face_sets_brush_multires(const Depsgraph &depsgraph,
+                                              const Sculpt &sd,
+                                              const Brush &brush,
+                                              Object &object,
+                                              const IndexMask &node_mask,
+                                              const float strength,
+                                              const bool relax_face_sets)
+{
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+  const MultiresDeformData deform_data(mesh);
+  const int grid_size = multires.grid_size();
+
+  const bke::AttributeAccessor attributes = mesh.attributes();
+  const Span<int> face_sets = multires.face_sets();
+
+  Array<int> node_offset_data;
+  const OffsetIndices<int> node_vert_offsets = create_node_vert_offsets(
+      grid_size, nodes, node_mask, node_offset_data);
+
+  Array<float3> current_positions(node_vert_offsets.total_size());
+  Array<float3> translations(node_vert_offsets.total_size());
+  Array<float> factors(node_vert_offsets.total_size());
+
+  threading::EnumerableThreadSpecific<MultiresLocalData> all_tls;
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        MultiresLocalData &tls = all_tls.local();
+        calc_factors_multires(depsgraph,
+                              multires,
+                              base_topo,
+                              brush,
+                              face_sets,
+                              nodes[i],
+                              strength,
+                              relax_face_sets,
+                              object,
+                              tls,
+                              current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
+                              factors.as_mutable_span().slice(node_vert_offsets[pos]));
+      },
+      exec_mode::grain_size(1));
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        smooth::calc_relaxed_translations_multires(
+            object,
+            multires,
+            base_topo,
+            nodes[i],
+            face_sets,
+            relax_face_sets,
+            factors.as_span().slice(node_vert_offsets[pos]),
+            translations.as_mutable_span().slice(node_vert_offsets[pos]));
+      },
+      exec_mode::grain_size(1));
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        const IndexRange node_range = nodes[i].range(grid_size);
+        apply_positions_multires(sd,
+                                 object,
+                                 current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
+                                 translations.as_mutable_span().slice(node_vert_offsets[pos]),
+                                 deform_data,
+                                 node_range);
+        bke::pbvh::update_node_bounds_multires(
+            grid_size, deform_data.positions, pbvh.offsets, nodes[i]);
       },
       exec_mode::grain_size(1));
   pbvh.tag_positions_changed(node_mask);
@@ -568,6 +706,114 @@ static void do_topology_relax_brush_mesh(const Depsgraph &depsgraph,
   pbvh.flush_bounds_to_parents();
 }
 
+BLI_NOINLINE static void calc_topology_relax_factors_multires(
+    const Depsgraph &depsgraph,
+    Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const Brush &brush,
+    const float strength,
+    const Object &object,
+    const bke::pbvh::MultiresNode &node,
+    MultiresLocalData &tls,
+    const MutableSpan<float3> node_positions,
+    const MutableSpan<float> factors)
+{
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+
+  node_positions.copy_from(multires.positions().slice(node_range));
+
+  const OrigPositionData orig_data = orig_position_data_get_multires(object, node);
+
+  tls.distances.resize(node_positions.size());
+  calc_factors_common_multires(depsgraph,
+                               brush,
+                               object,
+                               multires,
+                               base_topo,
+                               orig_data.positions,
+                               orig_data.normals,
+                               node,
+                               factors,
+                               tls.distances);
+
+  scale_factors(factors, strength);
+}
+
+static void do_topology_relax_brush_multires(const Depsgraph &depsgraph,
+                                             const Sculpt &sd,
+                                             const Brush &brush,
+                                             Object &object,
+                                             const IndexMask &node_mask,
+                                             const float strength)
+{
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const MultiresDeformData deform_data(base_mesh);
+  const int grid_size = multires.grid_size();
+
+  const Span<int> face_sets = multires.face_sets();
+
+  Array<int> node_offset_data;
+  const OffsetIndices<int> node_vert_offsets = create_node_vert_offsets(
+      grid_size, nodes, node_mask, node_offset_data);
+
+  Array<float3> current_positions(node_vert_offsets.total_size());
+  Array<float3> translations(node_vert_offsets.total_size());
+  Array<float> factors(node_vert_offsets.total_size());
+
+  threading::EnumerableThreadSpecific<MultiresLocalData> all_tls;
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        MultiresLocalData &tls = all_tls.local();
+        calc_topology_relax_factors_multires(
+            depsgraph,
+            multires,
+            base_topo,
+            brush,
+            strength,
+            object,
+            nodes[i],
+            tls,
+            current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
+            factors.as_mutable_span().slice(node_vert_offsets[pos]));
+      },
+      exec_mode::grain_size(1));
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        smooth::calc_relaxed_translations_multires(
+            object,
+            multires,
+            base_topo,
+            nodes[i],
+            face_sets,
+            false,
+            factors.as_span().slice(node_vert_offsets[pos]),
+            translations.as_mutable_span().slice(node_vert_offsets[pos]));
+      },
+      exec_mode::grain_size(1));
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        const IndexRange node_range = nodes[i].range(grid_size);
+        apply_positions_multires(sd,
+                                 object,
+                                 current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
+                                 translations.as_mutable_span().slice(node_vert_offsets[pos]),
+                                 deform_data,
+                                 node_range);
+        bke::pbvh::update_node_bounds_multires(
+            grid_size, deform_data.positions, pbvh.offsets, nodes[i]);
+      },
+      exec_mode::grain_size(1));
+  pbvh.tag_positions_changed(node_mask);
+  pbvh.flush_bounds_to_parents();
+}
+
 BLI_NOINLINE static void calc_topology_relax_factors_grids(const Depsgraph &depsgraph,
                                                            const Brush &brush,
                                                            const float strength,
@@ -791,6 +1037,10 @@ void do_relax_face_sets_brush(const Depsgraph &depsgraph,
         do_relax_face_sets_brush_mesh(
             depsgraph, sd, brush, object, node_mask, strength * strength, relax_face_sets);
         break;
+      case bke::pbvh::Type::Multires:
+        do_relax_face_sets_brush_multires(
+            depsgraph, sd, brush, object, node_mask, strength * strength, relax_face_sets);
+        break;
       case bke::pbvh::Type::Grids:
         do_relax_face_sets_brush_grids(
             depsgraph, sd, brush, object, node_mask, strength * strength, relax_face_sets);
@@ -824,6 +1074,9 @@ void do_topology_relax_brush(const Depsgraph &depsgraph,
     switch (bke::object::pbvh_get(object)->type()) {
       case bke::pbvh::Type::Mesh:
         do_topology_relax_brush_mesh(depsgraph, sd, brush, object, node_mask, strength);
+        break;
+      case bke::pbvh::Type::Multires:
+        do_topology_relax_brush_multires(depsgraph, sd, brush, object, node_mask, strength);
         break;
       case bke::pbvh::Type::Grids:
         do_topology_relax_brush_grids(depsgraph, sd, brush, object, node_mask, strength);

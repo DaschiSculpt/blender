@@ -13,12 +13,15 @@
 #include "BLI_ordered_edge.hh"
 #include "BLI_set.hh"
 
+#include "BKE_multiresolution.hh"
+#include "BKE_paint_bvh.hh"
 #include "BKE_subdiv_ccg.hh"
-
+//
 namespace blender {
 
 struct BMVert;
 struct Object;
+struct Multiresolution;
 struct SubdivCCG;
 struct SubdivCCGCoord;
 namespace bke {
@@ -75,6 +78,15 @@ void neighbor_data_average_mesh_check_loose(Span<T> src,
                                             MutableSpan<T> dst);
 
 template<typename T>
+void neighbor_data_average_node_multires(const Multiresolution &multires,
+                                         const bke::multiresolution::BaseTopology &base_topo,
+                                         const bke::pbvh::MultiresNode &node,
+                                         const bke::multiresolution::OffsetsSpan &offsets,
+                                         const Span<T> attr,
+                                         const MutableSpan<T> dst,
+                                         const Span<bool> hidden);
+
+template<typename T>
 void average_data_grids(const SubdivCCG &subdiv_ccg,
                         Span<T> src,
                         Span<int> grids,
@@ -112,6 +124,14 @@ void calc_relaxed_translations_faces(Span<float3> vert_positions,
                                      Span<int> verts,
                                      Span<float> factors,
                                      MutableSpan<float3> translations);
+void calc_relaxed_translations_multires(const Object &object,
+                                        const Multiresolution &multires,
+                                        const bke::multiresolution::BaseTopology &base_topo,
+                                        const bke::pbvh::MultiresNode &node,
+                                        const Span<int> face_sets,
+                                        const bool filter_boundary_face_sets,
+                                        const Span<float> factors,
+                                        const MutableSpan<float3> translations);
 void calc_relaxed_translations_grids(const SubdivCCG &subdiv_ccg,
                                      OffsetIndices<int> faces,
                                      Span<int> corner_verts,

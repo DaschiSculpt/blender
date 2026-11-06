@@ -28,6 +28,7 @@ struct Sculpt;
 struct SculptSession;
 namespace bke::pbvh {
 struct MeshNode;
+struct MultiresNode;
 struct GridsNode;
 struct BMeshNode;
 }  // namespace bke::pbvh
@@ -143,6 +144,25 @@ inline void calc_vert_factors(const Depsgraph &depsgraph,
     calc_vert_factors(depsgraph, object, *cache, node, verts, factors);
   }
 }
+void calc_multires_factors(const Depsgraph &depsgraph,
+                           const Object &object,
+                           const Multiresolution &multires,
+                           const bke::multiresolution::BaseTopology &base_topo,
+                           const Cache &automasking,
+                           const bke::pbvh::MultiresNode &node,
+                           const MutableSpan<float> factors);
+inline void calc_multires_factors(const Depsgraph &depsgraph,
+                                  const Object &object,
+                                  const Multiresolution &multires,
+                                  const bke::multiresolution::BaseTopology &base_topo,
+                                  const Cache *cache,
+                                  const bke::pbvh::MultiresNode &node,
+                                  const MutableSpan<float> factors)
+{
+  if (cache) {
+    calc_multires_factors(depsgraph, object, multires, base_topo, *cache, node, factors);
+  }
+}
 void calc_grids_factors(const Depsgraph &depsgraph,
                         const Object &object,
                         const Cache &automasking,
@@ -193,6 +213,14 @@ void calc_interpolated_face_factors(const Depsgraph &depsgraph,
                                     const bke::pbvh::MeshNode &node,
                                     Span<int> face_indices,
                                     MutableSpan<float> factors);
+
+void calc_face_factors(const Depsgraph &depsgraph,
+                       const Object &object,
+                       const Multiresolution &multires,
+                       const bke::multiresolution::BaseTopology &base_topo,
+                       const Cache &automasking,
+                       const Span<int> face_indices,
+                       const MutableSpan<float> factors);
 
 }  // namespace ed::sculpt_paint::auto_mask
 

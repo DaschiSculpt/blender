@@ -12,11 +12,13 @@
 #include "DNA_attribute_types.h"
 #include "DNA_customdata_types.h"
 #include "DNA_defs.h"
+#include "DNA_multires_types.h"
 
 #include "BLI_enum_flags.hh"
 
 #include <optional>
 
+#include "BLI_bit_span.hh"
 #include "BLI_index_mask_fwd.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_memory_counter_fwd.hh"
@@ -52,6 +54,8 @@ struct Material;
 struct MCol;
 struct MEdge;
 struct MFace;
+struct Multiresolution;
+struct SculptLayer;
 
 /** #Mesh.texspace_flag */
 enum eMesh_TexSpaceFlag : char {
@@ -193,6 +197,14 @@ struct Mesh {
   CustomData edge_data;
   CustomData face_data;
   CustomData corner_data;
+
+  struct SculptLayer *sculpt_layers = nullptr;
+  int sculpt_layers_len = 0;
+  int active_layer_index = -1;
+
+  struct Multiresolution *multires = nullptr;
+  char multires_use_linear = 0;
+  char _pad[7] = {};
 
   /**
    * List of vertex group (#bDeformGroup) names and flags only. Actual weights are stored in dvert.
@@ -483,7 +495,16 @@ struct Mesh {
   /**
    * Cached information about vertices that aren't used by faces (but may be used by loose edges).
    */
+
   const IndexMask &verts_no_face() const;
+
+  OffsetIndices<int> edge_to_face_map_offsets() const;
+  GroupedSpan<int> edge_to_face_map() const;
+  OffsetIndices<int> vert_to_edge_map_offsets() const;
+  GroupedSpan<int> vert_to_edge_map() const;
+  BitSpan face_edge_reversed() const;
+  BitSpan boundary_edges() const;
+  BitSpan boundary_verts() const;
   /**
    * True if the mesh has no faces or edges "inside" of other faces. Those edges or faces would
    * reuse a subset of the vertices of a face. Knowing the mesh is "clean" or "good" can mean
@@ -585,6 +606,8 @@ struct Mesh {
   void tag_visibility_changed();
   /** Call when changing the "material_index" attribute. */
   void tag_material_index_changed();
+
+  Span<SculptLayer> sculpt_layers_as_span() const;
 #endif
 };
 

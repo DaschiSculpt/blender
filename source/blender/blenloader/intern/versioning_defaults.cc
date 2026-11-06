@@ -561,6 +561,7 @@ static void blo_update_defaults_scene(Main *bmain, Scene *scene)
 
   if (ts->sculpt) {
     ts->sculpt->automasking_boundary_edges_propagation_steps = 1;
+    ts->sculpt->multires_bake.margin = 16;
   }
 
   /* Ensure input_samples has a correct default value of 1. */

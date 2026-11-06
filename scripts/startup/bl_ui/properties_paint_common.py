@@ -994,22 +994,14 @@ def brush_settings(layout, context, brush, popover=False):
         if capabilities.has_height:
             layout.prop(brush, "height", slider=True, text="Height")
 
+        if sculpt_brush_type in {'LAYER', 'CLOTH'}:
+            layout.prop(brush, "use_morph_as_base")
+
         if capabilities.has_plane_height:
             layout.prop(brush, "plane_height", slider=True, text="Height")
 
         if capabilities.has_plane_depth:
             layout.prop(brush, "plane_depth", slider=True, text="Depth")
-
-        # use_persistent, set_persistent_base
-        if capabilities.has_persistence:
-            layout.separator()
-            col = layout.column()
-            # Persistent base is not supported when Dyntopo is enabled.
-            if context.sculpt_object and context.sculpt_object.use_dynamic_topology_sculpting:
-                col.enabled = False
-            col.prop(brush, "use_persistent")
-            col.operator("sculpt.set_persistent_base")
-            layout.separator()
 
         if capabilities.has_color:
             ups = UnifiedPaintPanel.paint_settings_from_mode(context, 'SCULPT').unified_paint_settings

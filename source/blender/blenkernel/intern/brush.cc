@@ -890,7 +890,6 @@ void BKE_brush_debug_print_state(Brush *br)
   BR_TEST_FLAG(BRUSH_SPACING_PRESSURE);
   BR_TEST_FLAG(BRUSH_DIR_IN);
   BR_TEST_FLAG(BRUSH_SMOOTH_STROKE);
-  BR_TEST_FLAG(BRUSH_PERSISTENT);
   BR_TEST_FLAG(BRUSH_ACCUMULATE);
   BR_TEST_FLAG(BRUSH_LOCK_ALPHA);
   BR_TEST_FLAG(BRUSH_ORIGINAL_NORMAL);
@@ -902,6 +901,7 @@ void BKE_brush_debug_print_state(Brush *br)
   BR_TEST_FLAG(BRUSH_SMOOTH_PRESSURE);
   BR_TEST_FLAG(BRUSH_PLANE_TRIM);
   BR_TEST_FLAG(BRUSH_FRONTFACE);
+  BR_TEST_FLAG(BRUSH_USE_MORPH_AS_BASE);
 
   BR_TEST_FLAG_OVERLAY(BRUSH_OVERLAY_CURSOR);
   BR_TEST_FLAG_OVERLAY(BRUSH_OVERLAY_PRIMARY);
@@ -1899,6 +1899,8 @@ bool supports_dyntopo(const Brush &brush)
                SCULPT_BRUSH_TYPE_CLOTH,
                SCULPT_BRUSH_TYPE_THUMB,
                SCULPT_BRUSH_TYPE_LAYER,
+               SCULPT_BRUSH_TYPE_MORPH,
+               SCULPT_BRUSH_TYPE_ERASE_LAYER,
                SCULPT_BRUSH_TYPE_DISPLACEMENT_ERASER,
                SCULPT_BRUSH_TYPE_DRAW_SHARP,
                SCULPT_BRUSH_TYPE_SLIDE_RELAX,
@@ -1927,6 +1929,8 @@ bool supports_accumulate(const Brush &brush)
               SCULPT_BRUSH_TYPE_CLAY_THUMB,
               SCULPT_BRUSH_TYPE_ROTATE,
               SCULPT_BRUSH_TYPE_PLANE,
+              SCULPT_BRUSH_TYPE_ERASE_LAYER,
+              SCULPT_BRUSH_TYPE_MORPH,
               SCULPT_BRUSH_TYPE_SCENE_PROJECT);
 }
 bool supports_topology_rake(const Brush &brush)
@@ -1970,7 +1974,11 @@ bool supports_tip_roundness(const Brush &brush)
               SCULPT_BRUSH_TYPE_PLANE,
               SCULPT_BRUSH_TYPE_SCENE_PROJECT,
               SCULPT_BRUSH_TYPE_SLIDE_RELAX) ||
-         ELEM(brush.sculpt_brush_type, SCULPT_BRUSH_TYPE_SMOOTH, SCULPT_BRUSH_TYPE_THUMB);
+         ELEM(brush.sculpt_brush_type,
+              SCULPT_BRUSH_TYPE_SMOOTH,
+              SCULPT_BRUSH_TYPE_THUMB,
+              SCULPT_BRUSH_TYPE_MORPH,
+              SCULPT_BRUSH_TYPE_ERASE_LAYER);
 }
 bool supports_hardness(const Brush &brush)
 {
@@ -2007,10 +2015,6 @@ bool supports_rake(const Brush &brush)
 bool supports_rake_factor(const Brush &brush)
 {
   return ELEM(brush.sculpt_brush_type, SCULPT_BRUSH_TYPE_SNAKE_HOOK);
-}
-bool supports_persistence(const Brush &brush)
-{
-  return ELEM(brush.sculpt_brush_type, SCULPT_BRUSH_TYPE_LAYER, SCULPT_BRUSH_TYPE_CLOTH);
 }
 bool supports_pinch_factor(const Brush &brush)
 {
@@ -2058,6 +2062,8 @@ bool supports_secondary_cursor_color(const Brush &brush)
               SCULPT_BRUSH_TYPE_PINCH,
               SCULPT_BRUSH_TYPE_CREASE,
               SCULPT_BRUSH_TYPE_LAYER,
+              SCULPT_BRUSH_TYPE_MORPH,
+              SCULPT_BRUSH_TYPE_ERASE_LAYER,
               SCULPT_BRUSH_TYPE_MASK);
 }
 bool supports_smooth_stroke(const Brush &brush)

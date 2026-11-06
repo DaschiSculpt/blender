@@ -195,6 +195,13 @@ class Sculpts : Overlay {
         }
         break;
       }
+      case bke::pbvh::Type::Multires: {
+        const Mesh &base_mesh = *id_cast<const Mesh *>(object_orig->data);
+        if (base_mesh.multires->masks().is_empty() && base_mesh.multires->face_sets().is_empty()) {
+          return;
+        }
+        break;
+      }
       case bke::pbvh::Type::Grids: {
         const SubdivCCG &subdiv_ccg = *sculpt_session->subdiv_ccg;
         const Mesh &base_mesh = DRW_object_get_data_for_drawing<Mesh>(*object_orig);

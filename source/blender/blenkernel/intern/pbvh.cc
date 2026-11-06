@@ -28,10 +28,12 @@
 #include "BKE_attribute.hh"
 #include "BKE_ccg.hh"
 #include "BKE_mesh.hh"
+#include "BKE_multires.hh"
 #include "BKE_object.hh"
 #include "BKE_paint.hh"
 #include "BKE_paint_bvh.hh"
 #include "BKE_paint_bvh_pixels.hh"
+#include "BKE_sculpt_layer.hh"
 #include "BKE_subdiv_ccg.hh"
 
 #include "DEG_depsgraph_query.hh"
@@ -40,6 +42,7 @@
 
 #include "bmesh.hh"
 
+#include "BLI_timeit.hh"
 #include "pbvh_intern.hh"
 
 namespace blender {
@@ -78,55 +81,221 @@ int partition_material_indices(const Span<int> material_indices, MutableSpan<int
   return split - faces.begin();
 }
 
+static void atomic_min(std::atomic<int> &a, int value)
+{
+  int curr = a.load(std::memory_order_relaxed);
+  while (value < curr && !a.compare_exchange_weak(curr, value, std::memory_order_relaxed)) {
+  }
+}
+
+BLI_NOINLINE static void build_multires_leaf_nodes(const int lvl,
+                                                   const int verts_num,
+                                                   const int edges_num,
+                                                   const OffsetIndices<int> faces,
+                                                   const Span<int> corner_verts,
+                                                   const Span<int> corner_edges,
+                                                   const MutableSpan<int> vert_indices,
+                                                   const MutableSpan<int> edge_indices,
+                                                   const MutableSpan<int> vert_offsets,
+                                                   const MutableSpan<int> edge_offsets,
+                                                   const MutableSpan<int> face_offsets,
+                                                   MutableSpan<MultiresNode> nodes)
+{
+  Array<std::atomic<int>> vert_owner(verts_num);
+  threading::memory_bandwidth_bound_task(vert_owner.as_span().size_in_bytes(), [&]() {
+    threading::parallel_for(IndexRange(verts_num), 8192, [&](const IndexRange range) {
+      for (int i : range) {
+        vert_owner[i].store(INT_MAX, std::memory_order_relaxed);
+      }
+    });
+  });
+
+  Array<std::atomic<int>> edge_owner(edges_num);
+  threading::memory_bandwidth_bound_task(edge_owner.as_span().size_in_bytes(), [&]() {
+    threading::parallel_for(IndexRange(edges_num), 8192, [&](const IndexRange range) {
+      for (int i : range) {
+        edge_owner[i].store(INT_MAX, std::memory_order_relaxed);
+      }
+    });
+  });
+
+  Array<Set<int>> unique_verts(nodes.size());
+  Array<Set<int>> unique_edges(nodes.size());
+
+  threading::parallel_for(nodes.index_range(), 8, [&](const IndexRange range) {
+    for (const int i : range) {
+      const MultiresNode &node = nodes[i];
+
+      for (const int face_idx : node.face_indices_) {
+        const IndexRange face = faces[face_idx];
+        unique_verts[i].add_multiple(corner_verts.slice(face));
+        unique_edges[i].add_multiple(corner_edges.slice(face));
+      }
+
+      for (const int vert : unique_verts[i]) {
+        atomic_min(vert_owner[vert], i);
+      }
+      for (const int edge : unique_edges[i]) {
+        atomic_min(edge_owner[edge], i);
+      }
+    }
+  });
+
+  struct NodeInfo {
+    Array<int> verts;
+    Array<int> edges;
+    int owned_verts;
+    int verts_offset;
+    int owned_edges;
+    int edges_offset;
+  };
+  Array<NodeInfo> info(nodes.size());
+
+  threading::parallel_for(nodes.index_range(), 8, [&](const IndexRange range) {
+    for (const int i : range) {
+      new (&info[i].verts) Array<int>(unique_verts[i].size());
+      std::copy(unique_verts[i].begin(), unique_verts[i].end(), info[i].verts.begin());
+
+      auto split_it = std::partition(info[i].verts.begin(), info[i].verts.end(), [&](int v) {
+        return vert_owner[v].load(std::memory_order_relaxed) == i;
+      });
+      info[i].owned_verts = std::distance(info[i].verts.begin(), split_it);
+      std::sort(info[i].verts.begin(), split_it);
+      std::sort(split_it, info[i].verts.end());
+      nodes[i].shared_verts_.add_multiple(info[i].verts.as_span().drop_front(info[i].owned_verts));
+
+      new (&info[i].edges) Array<int>(unique_edges[i].size());
+      std::copy(unique_edges[i].begin(), unique_edges[i].end(), info[i].edges.begin());
+
+      split_it = std::partition(info[i].edges.begin(), info[i].edges.end(), [&](int e) {
+        return edge_owner[e].load(std::memory_order_relaxed) == i;
+      });
+      info[i].owned_edges = std::distance(info[i].edges.begin(), split_it);
+      std::sort(info[i].edges.begin(), split_it);
+      std::sort(split_it, info[i].edges.end());
+      nodes[i].shared_edges_.add_multiple(info[i].edges.as_span().drop_front(info[i].owned_edges));
+    }
+  });
+
+  const int verts_per_edge = (1 << lvl) - 1;
+  const int verts_per_face = verts_per_edge * verts_per_edge;
+  int global_offset = 0;
+  int verts_offset = 0;
+  int edges_offset = 0;
+
+  for (int i = 0; i < nodes.size(); i++) {
+    nodes[i].offset_ = global_offset;
+    global_offset += info[i].owned_verts + info[i].owned_edges * verts_per_edge +
+                     nodes[i].face_indices_.size() * verts_per_face;
+
+    info[i].verts_offset = verts_offset;
+    verts_offset += info[i].owned_verts;
+
+    info[i].edges_offset = edges_offset;
+    edges_offset += info[i].owned_edges;
+  }
+
+  threading::parallel_for(nodes.index_range(), 8, [&](const IndexRange range) {
+    for (const int i : range) {
+      if (info[i].owned_verts > 0) {
+        const MutableSpan<int> local_vert_indices = vert_indices.slice(info[i].verts_offset,
+                                                                       info[i].owned_verts);
+        local_vert_indices.copy_from(info[i].verts.as_span().take_front(info[i].owned_verts));
+        nodes[i].vert_indices_ = local_vert_indices;
+      }
+      if (info[i].owned_edges > 0) {
+        const MutableSpan<int> local_edge_indices = edge_indices.slice(info[i].edges_offset,
+                                                                       info[i].owned_edges);
+        local_edge_indices.copy_from(info[i].edges.as_span().take_front(info[i].owned_edges));
+        nodes[i].edge_indices_ = local_edge_indices;
+      }
+      int offset = nodes[i].offset_;
+
+      for (const int j : IndexRange(info[i].owned_verts)) {
+        vert_offsets[info[i].verts[j]] = offset;
+        offset++;
+      }
+      for (const int j : IndexRange(info[i].owned_edges)) {
+        edge_offsets[info[i].edges[j]] = offset;
+        offset += verts_per_edge;
+      }
+
+      nodes[i].corners_num = 0;
+      for (const int face_idx : nodes[i].face_indices_) {
+        nodes[i].corners_num += faces[face_idx].size();
+        face_offsets[face_idx] = offset;
+        offset += verts_per_face;
+      }
+    }
+  });
+
+  nodes[0].faces_offset_ = 0;
+  const int faces_per_grid = 1 << (2 * lvl);
+  for (int i = 1; i < nodes.size(); i++) {
+    nodes[i].faces_offset_ = nodes[i - 1].faces_offset_ + nodes[i].faces().size() * faces_per_grid;
+  }
+}
+
 BLI_NOINLINE static void build_mesh_leaf_nodes(const int verts_num,
                                                const OffsetIndices<int> faces,
                                                const Span<int> corner_verts,
                                                MutableSpan<MeshNode> nodes)
 {
   PRF_scope(ProfileCategory::Core);
-  Array<Array<int>> verts_per_node(nodes.size(), NoInitialization());
-  threading::parallel_for(nodes.index_range(), 8, [&](const IndexRange range) {
-    Set<int> verts;
-    for (const int i : range) {
-      MeshNode &node = nodes[i];
 
-      verts.clear();
-      int corners_count = 0;
-      for (const int face_index : node.face_indices_) {
-        const IndexRange face = faces[face_index];
-        verts.add_multiple(corner_verts.slice(face));
-        corners_count += face.size();
+  IndexMaskMemory memory;
+  const IndexMask leaf_mask = IndexMask::from_predicate(
+      nodes.index_range(),
+      memory,
+      [&](const int i) { return nodes[i].face_indices_.size() > 0; },
+      exec_mode::grain_size(4096));
+
+  Array<std::atomic<int>> vert_owner(verts_num);
+
+  threading::memory_bandwidth_bound_task(vert_owner.as_span().size_in_bytes(), [&]() {
+    threading::parallel_for(IndexRange(verts_num), 8192, [&](const IndexRange range) {
+      for (int i : range) {
+        vert_owner[i].store(INT_MAX, std::memory_order_relaxed);
       }
-      nodes[i].corners_num_ = corners_count;
-
-      new (&verts_per_node[i]) Array<int>(verts.size());
-      std::copy(verts.begin(), verts.end(), verts_per_node[i].begin());
-      std::ranges::sort(verts_per_node[i]);
-    }
+    });
   });
 
-  Vector<int> owned_verts;
-  Vector<int> shared_verts;
-  BitVector<> vert_used(verts_num);
-  for (const int i : nodes.index_range()) {
-    MeshNode &node = nodes[i];
+  leaf_mask.foreach_index(
+      [&](const int node_idx) {
+        MeshNode &node = nodes[node_idx];
+        node.vert_indices_.clear();
 
-    owned_verts.clear();
-    shared_verts.clear();
-    for (const int vert : verts_per_node[i]) {
-      if (vert_used[vert]) {
-        shared_verts.append(vert);
-      }
-      else {
-        vert_used[vert].set();
-        owned_verts.append(vert);
-      }
-    }
-    node.unique_verts_num_ = owned_verts.size();
-    node.vert_indices_.reserve(owned_verts.size() + shared_verts.size());
-    node.vert_indices_.add_multiple(owned_verts);
-    node.vert_indices_.add_multiple(shared_verts);
-  }
+        int corners_num = 0;
+        for (const int face_idx : node.face_indices_) {
+          const IndexRange face = faces[face_idx];
+          corners_num += face.size();
+          node.vert_indices_.add_multiple(corner_verts.slice(face));
+        }
+        node.corners_num_ = corners_num;
+
+        for (const int vert : node.vert_indices_) {
+          atomic_min(vert_owner[vert], node_idx);
+        }
+      },
+      exec_mode::grain_size(8));
+
+  leaf_mask.foreach_index(
+      [&](const int node_idx) {
+        MeshNode &node = nodes[node_idx];
+        Array<int> scratch(node.vert_indices_.as_span());
+        node.vert_indices_.clear_and_keep_capacity();
+
+        auto split_it = std::partition(scratch.begin(), scratch.end(), [&](int v) {
+          return vert_owner[v].load(std::memory_order_relaxed) == node_idx;
+        });
+
+        std::sort(scratch.begin(), split_it);
+        std::sort(split_it, scratch.end());
+
+        node.unique_verts_num_ = std::distance(scratch.begin(), split_it);
+        node.vert_indices_.add_multiple(scratch);
+      },
+      exec_mode::grain_size(8));
 }
 
 bool leaf_needs_material_split(const Span<int> faces, const Span<int> material_indices)
@@ -218,6 +387,256 @@ static void build_nodes_recursive_mesh(const Span<int> material_indices,
                              depth + 1,
                              faces.drop_front(split),
                              nodes);
+}
+
+static void build_nodes_recursive_multires(const Span<int> material_indices,
+                                           const int lvl,
+                                           const int leaf_limit,
+                                           const int node_index,
+                                           const int parent_index,
+                                           const std::optional<Bounds<float3>> &bounds_precalc,
+                                           const Span<float3> face_centers,
+                                           const int depth,
+                                           MutableSpan<int> faces,
+                                           Vector<MultiresNode> &nodes)
+{
+  PRF_scope(ProfileCategory::Core);
+  BLI_assert(parent_index >= -1);
+
+  MultiresNode &node = nodes[node_index];
+  node.parent_ = parent_index;
+  const int faces_per_grid = 1 << (2 * lvl);
+
+  if (faces.size() <= 1) {
+    node.flag_ |= Node::Leaf;
+    node.face_indices_ = faces;
+    return;
+  }
+
+  const bool below_leaf_limit = faces.size() * faces_per_grid <= leaf_limit ||
+                                depth >= STACK_FIXED_DEPTH - 1;
+  if (below_leaf_limit) {
+    if (!leaf_needs_material_split(faces, material_indices)) {
+      node.flag_ |= Node::Leaf;
+      node.face_indices_ = faces;
+      return;
+    }
+  }
+
+  nodes[node_index].children_offset_ = nodes.size();
+  nodes.resize(nodes.size() + 2);
+
+  int split;
+  if (!below_leaf_limit) {
+    Bounds<float3> bounds;
+    if (bounds_precalc) {
+      bounds = *bounds_precalc;
+    }
+    else {
+      bounds = threading::parallel_reduce(
+          faces.index_range(),
+          1024,
+          negative_bounds(),
+          [&](const IndexRange range, Bounds<float3> value) {
+            for (const int face : faces.slice(range)) {
+              math::min_max(face_centers[face], value.min, value.max);
+            }
+            return value;
+          },
+          merge_bounds);
+    }
+    const int axis = math::dominant_axis(bounds.max - bounds.min);
+
+    split = partition_along_axis(
+        face_centers, faces, axis, math::midpoint(bounds.min[axis], bounds.max[axis]));
+  }
+  else {
+    split = partition_material_indices(material_indices, faces);
+  }
+
+  build_nodes_recursive_multires(material_indices,
+                                 lvl,
+                                 leaf_limit,
+                                 nodes[node_index].children_offset_,
+                                 node_index,
+                                 std::nullopt,
+                                 face_centers,
+                                 depth + 1,
+                                 faces.take_front(split),
+                                 nodes);
+  build_nodes_recursive_multires(material_indices,
+                                 lvl,
+                                 leaf_limit,
+                                 nodes[node_index].children_offset_ + 1,
+                                 node_index,
+                                 std::nullopt,
+                                 face_centers,
+                                 depth + 1,
+                                 faces.drop_front(split),
+                                 nodes);
+}
+
+static void store_nodes_recursive_multires(const int curr_idx,
+                                           const Span<MultiresNode> nodes,
+                                           const MutableSpan<int> face_counts)
+{
+  const MultiresNode &node = nodes[curr_idx];
+
+  if (node.flag_ & Node::Leaf) {
+    face_counts[curr_idx] = node.faces().size();
+  }
+  else {
+    face_counts[curr_idx] = -1;
+
+    const int children_offset = node.children_offset_;
+    store_nodes_recursive_multires(children_offset, nodes, face_counts);
+    store_nodes_recursive_multires(children_offset + 1, nodes, face_counts);
+  }
+}
+
+static void restore_nodes_recursive_multires(const int curr_idx,
+                                             const int parent_idx,
+                                             int &curr_offset,
+                                             int &next_child_offset,
+                                             MutableSpan<MultiresNode> nodes,
+                                             const Span<int> face_counts,
+                                             const Span<int> face_indices)
+{
+  nodes[curr_idx].parent_ = parent_idx;
+
+  if (face_counts[curr_idx] != -1) {
+    nodes[curr_idx].flag_ |= Node::Leaf;
+    nodes[curr_idx].face_indices_ = face_indices.slice(curr_offset, face_counts[curr_idx]);
+    curr_offset += face_counts[curr_idx];
+    return;
+  }
+
+  const int children_offset = next_child_offset;
+  nodes[curr_idx].children_offset_ = children_offset;
+
+  next_child_offset += 2;
+
+  restore_nodes_recursive_multires(
+      children_offset, curr_idx, curr_offset, next_child_offset, nodes, face_counts, face_indices);
+  restore_nodes_recursive_multires(children_offset + 1,
+                                   curr_idx,
+                                   curr_offset,
+                                   next_child_offset,
+                                   nodes,
+                                   face_counts,
+                                   face_indices);
+}
+
+void Tree::store_nodes_multires(const Span<MultiresNode> nodes,
+                                const MutableSpan<int> r_face_counts)
+{
+  store_nodes_recursive_multires(0, nodes, r_face_counts);
+}
+
+Tree Tree::from_stored_nodes_multires(const int lvl, const Mesh &base_mesh)
+{
+  Tree pbvh(Type::Multires);
+  Vector<MultiresNode> &nodes = std::get<Vector<MultiresNode>>(pbvh.nodes_);
+  const Multiresolution &multires = *base_mesh.multires;
+  Span<int> face_indices = multires.bvh_face_indices(lvl);
+  Span<int> face_counts = multires.bvh_face_counts(lvl);
+  nodes.resize(face_counts.size());
+  int curr_offset = 0;
+  int next_child_offset = 1;
+
+  const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh, lvl);
+  pbvh.face_indices.reinitialize(base_topo.faces_num);
+  pbvh.face_indices.as_mutable_span().copy_from(face_indices);
+  restore_nodes_recursive_multires(
+      0, -1, curr_offset, next_child_offset, nodes, face_counts, pbvh.face_indices);
+
+  BLI_assert(next_child_offset == nodes.size());
+
+  pbvh.vert_indices.reinitialize(base_topo.verts_num);
+  pbvh.edge_indices.reinitialize(base_topo.edges_num);
+  pbvh.offsets.verts.reinitialize(base_topo.verts_num);
+  pbvh.offsets.edges.reinitialize(base_topo.edges_num);
+  pbvh.offsets.faces.reinitialize(base_topo.faces_num);
+
+  const int base_lvl = multires.base_level(lvl);
+  build_multires_leaf_nodes(lvl - base_lvl,
+                            base_topo.verts_num,
+                            base_topo.edges_num,
+                            base_topo.faces,
+                            base_topo.corner_verts,
+                            base_topo.corner_edges,
+                            pbvh.vert_indices,
+                            pbvh.edge_indices,
+                            pbvh.offsets.verts,
+                            pbvh.offsets.edges,
+                            pbvh.offsets.faces,
+                            nodes);
+
+  return pbvh;
+}
+
+Tree Tree::from_multires(const int lvl,
+                         const bke::multiresolution::BaseTopology &base_topo,
+                         const Span<float3> vert_positions,
+                         const Span<int> material_indices)
+{
+  PRF_scope(ProfileCategory::Core);
+
+  Tree pbvh(Type::Multires);
+  const OffsetIndices<int> faces = base_topo.faces;
+  const Span<int> corner_verts = base_topo.corner_verts;
+  if (faces.is_empty()) {
+    return pbvh;
+  }
+
+  constexpr int leaf_limit = MULTIRES_LEAF_LIMIT;
+  BLI_assert(material_indices.is_empty() || material_indices.size() == faces.size());
+
+  Array<float3> face_centers(faces.size());
+  const Bounds<float3> bounds = threading::parallel_reduce(
+      faces.index_range(),
+      1024,
+      negative_bounds(),
+      [&](const IndexRange range, const Bounds<float3> &init) {
+        Bounds<float3> current = init;
+        for (const int face : range) {
+          const Bounds<float3> bounds = calc_face_bounds(vert_positions,
+                                                         corner_verts.slice(faces[face]));
+          face_centers[face] = bounds.center();
+          current = bounds::merge(current, bounds);
+        }
+        return current;
+      },
+      merge_bounds);
+
+  pbvh.face_indices.reinitialize(base_topo.faces_num);
+  array_utils::fill_index_range<int>(pbvh.face_indices);
+
+  Vector<MultiresNode> &nodes = std::get<Vector<MultiresNode>>(pbvh.nodes_);
+  nodes.resize(1);
+  build_nodes_recursive_multires(
+      material_indices, lvl, leaf_limit, 0, -1, bounds, face_centers, 0, pbvh.face_indices, nodes);
+
+  pbvh.vert_indices.reinitialize(base_topo.verts_num);
+  pbvh.edge_indices.reinitialize(base_topo.edges_num);
+  pbvh.offsets.verts.reinitialize(base_topo.verts_num);
+  pbvh.offsets.edges.reinitialize(base_topo.edges_num);
+  pbvh.offsets.faces.reinitialize(base_topo.faces_num);
+
+  build_multires_leaf_nodes(lvl,
+                            base_topo.verts_num,
+                            base_topo.edges_num,
+                            base_topo.faces,
+                            base_topo.corner_verts,
+                            base_topo.corner_edges,
+                            pbvh.vert_indices,
+                            pbvh.edge_indices,
+                            pbvh.offsets.verts,
+                            pbvh.offsets.edges,
+                            pbvh.offsets.faces,
+                            nodes);
+
+  return pbvh;
 }
 
 Tree Tree::from_spatially_organized_mesh(const Mesh &mesh)
@@ -316,7 +735,7 @@ Tree Tree::from_mesh(const Mesh &mesh)
   }
 
   constexpr int leaf_limit = MESH_LEAF_LIMIT;
-  static_assert(leaf_limit < std::numeric_limits<MeshNode::LocalVertMapIndexT>::max());
+  static_assert(leaf_limit < std::numeric_limits<LocalVertMapIndexT>::max());
 
   Array<float3> face_centers(faces.size());
   const Bounds<float3> bounds = threading::parallel_reduce(
@@ -567,6 +986,9 @@ Tree::Tree(const Type type) : type_(type)
     case bke::pbvh::Type::Mesh:
       nodes_ = Vector<MeshNode>();
       break;
+    case bke::pbvh::Type::Multires:
+      nodes_ = Vector<MultiresNode>();
+      break;
     case bke::pbvh::Type::Grids:
       nodes_ = Vector<GridsNode>();
       break;
@@ -585,6 +1007,10 @@ template<> Span<MeshNode> Tree::nodes() const
 {
   return std::get<Vector<MeshNode>>(this->nodes_);
 }
+template<> Span<MultiresNode> Tree::nodes() const
+{
+  return std::get<Vector<MultiresNode>>(this->nodes_);
+}
 template<> Span<GridsNode> Tree::nodes() const
 {
   return std::get<Vector<GridsNode>>(this->nodes_);
@@ -596,6 +1022,10 @@ template<> Span<BMeshNode> Tree::nodes() const
 template<> MutableSpan<MeshNode> Tree::nodes()
 {
   return std::get<Vector<MeshNode>>(this->nodes_);
+}
+template<> MutableSpan<MultiresNode> Tree::nodes()
+{
+  return std::get<Vector<MultiresNode>>(this->nodes_);
 }
 template<> MutableSpan<GridsNode> Tree::nodes()
 {
@@ -611,14 +1041,70 @@ Tree::~Tree()
   pixels_free(this);
 }
 
-void Tree::tag_positions_changed(const IndexMask &node_mask)
+void Tree::finalize_multires(const Mesh &base_mesh)
+{
+  Multiresolution &multires = *base_mesh.multires;
+  const MutableSpan<MultiresNode> nodes = this->nodes<MultiresNode>();
+
+  multires.runtime->coarse_view.reset();
+  multires.runtime->rebuild(base_mesh, this->offsets);
+  multires.hide_face_flush();
+
+  tag_positions_changed(nodes.index_range());
+  if (!multires.masks().is_empty()) {
+    tag_masks_changed(nodes.index_range());
+  }
+  if (!multires.colors().is_empty()) {
+    // todo: get color attribute name from mesh
+    tag_attribute_changed(nodes.index_range(), "Color");
+  }
+  if (!multires.hidden_verts().is_empty()) {
+    threading::parallel_for(nodes.index_range(), 8, [&](const IndexRange range) {
+      for (const int i : range) {
+        node_update_visibility_multires(multires.hidden_verts(), multires.grid_size(), nodes[i]);
+      }
+    });
+  }
+  update_bounds_multires(multires.positions(), multires.grid_size());
+  bke::pbvh::store_bounds_orig(*this);
+  update_mask_multires(multires, nodes.index_range(), *this);
+}
+
+static void set_dirty_bits(BitVector<> &bits, const IndexMask &node_mask)
+{
+  bits.resize(std::max(bits.size(), node_mask.min_array_size()), false);
+  node_mask.set_bits(bits);
+}
+
+void Tree::enable_dirty_tracking() const
+{
+  if (!this->dirty_nodes_) {
+    this->dirty_nodes_.emplace();
+  }
+}
+
+DirtyNodes Tree::take_dirty_nodes() const
+{
+  if (!this->dirty_nodes_) {
+    return {};
+  }
+  return std::exchange(*this->dirty_nodes_, DirtyNodes());
+}
+
+void Tree::tag_positions_changed(const IndexMask &node_mask, const bool keep_layer_cache)
 {
   bounds_dirty_.resize(std::max(bounds_dirty_.size(), node_mask.min_array_size()), false);
   normals_dirty_.resize(std::max(normals_dirty_.size(), node_mask.min_array_size()), false);
   node_mask.set_bits(bounds_dirty_);
   node_mask.set_bits(normals_dirty_);
+  if (this->dirty_nodes_) {
+    set_dirty_bits(this->dirty_nodes_->positions, node_mask);
+  }
   if (this->draw_data) {
     this->draw_data->tag_positions_changed(node_mask);
+  }
+  if (!keep_layer_cache) {
+    this->layer_non_zero_nodes_cache_.clear();
   }
 }
 
@@ -626,6 +1112,9 @@ void Tree::tag_visibility_changed(const IndexMask &node_mask)
 {
   visibility_dirty_.resize(std::max(visibility_dirty_.size(), node_mask.min_array_size()), false);
   node_mask.set_bits(visibility_dirty_);
+  if (this->dirty_nodes_) {
+    set_dirty_bits(this->dirty_nodes_->visibility, node_mask);
+  }
   if (this->draw_data) {
     this->draw_data->tag_visibility_changed(node_mask);
   }
@@ -640,6 +1129,9 @@ void Tree::tag_topology_changed(const IndexMask &node_mask)
 
 void Tree::tag_face_sets_changed(const IndexMask &node_mask)
 {
+  if (this->dirty_nodes_) {
+    set_dirty_bits(this->dirty_nodes_->face_sets, node_mask);
+  }
   if (this->draw_data) {
     this->draw_data->tag_face_sets_changed(node_mask);
   }
@@ -647,6 +1139,9 @@ void Tree::tag_face_sets_changed(const IndexMask &node_mask)
 
 void Tree::tag_masks_changed(const IndexMask &node_mask)
 {
+  if (this->dirty_nodes_) {
+    set_dirty_bits(this->dirty_nodes_->masks, node_mask);
+  }
   if (this->draw_data) {
     this->draw_data->tag_masks_changed(node_mask);
   }
@@ -654,6 +1149,21 @@ void Tree::tag_masks_changed(const IndexMask &node_mask)
 
 void Tree::tag_attribute_changed(const IndexMask &node_mask, const StringRef attribute_name)
 {
+  if (attribute_name == ".sculpt_mask") {
+    if (this->dirty_nodes_) {
+      set_dirty_bits(this->dirty_nodes_->masks, node_mask);
+    }
+  }
+  else if (attribute_name == ".sculpt_face_set") {
+    if (this->dirty_nodes_) {
+      set_dirty_bits(this->dirty_nodes_->face_sets, node_mask);
+    }
+  }
+  else {
+    if (this->dirty_nodes_) {
+      set_dirty_bits(this->dirty_nodes_->colors, node_mask);
+    }
+  }
   if (this->draw_data) {
     this->draw_data->tag_attribute_changed(node_mask, attribute_name);
   }
@@ -800,6 +1310,7 @@ enum class PositionSource : int8_t {
   EvalDeform,
   Orig,
   RuntimeDeform,
+  LayersDisplay,
 };
 
 struct PositionSourceResult {
@@ -811,7 +1322,8 @@ static PositionSourceResult cache_source_get(const Object &object_orig, const Ob
 {
   const SculptSession &ss = *object_orig.runtime->sculpt_session;
   const Mesh &mesh_orig = *id_cast<const Mesh *>(object_orig.data);
-  BLI_assert(bke::object::pbvh_get(object_orig)->type() == Type::Mesh);
+  // BLI_assert(bke::object::pbvh_get(object_orig)->type() == Type::Mesh); ??? bug in main
+
   if (object_orig.mode & (OB_MODE_VERTEX_PAINT | OB_MODE_WEIGHT_PAINT)) {
     if (const Mesh *mesh_eval = BKE_object_get_evaluated_mesh_no_subsurf(&object_eval)) {
       if (mesh_topology_count_matches(*mesh_eval, mesh_orig)) {
@@ -832,6 +1344,15 @@ static PositionSourceResult cache_source_get(const Object &object_orig, const Ob
     return {PositionSource::RuntimeDeform, nullptr};
   }
 
+  if (ss.layers_only_eval && !ss.layers_cos.is_empty()) {
+    BLI_assert(ss.layers_cos.size() == mesh_orig.verts_num);
+    return {PositionSource::LayersDisplay, nullptr};
+  }
+
+  if (const Mesh *mesh_eval = BKE_object_get_mesh_deform_eval(&object_eval)) {
+    return {PositionSource::EvalDeform, mesh_eval};
+  }
+
   return {PositionSource::Orig, nullptr};
 }
 
@@ -849,6 +1370,9 @@ static const SharedCache<Vector<float3>> &vert_normals_cache_eval(const Object &
     case PositionSource::Eval:
       return result.mesh_eval->runtime->vert_normals_true_cache;
     case PositionSource::RuntimeDeform:
+    case PositionSource::LayersDisplay:
+      /* Layers-only display reuses the deform normal caches: the two position buffers
+       * (#deform_cos vs #layers_cos) are mutually exclusive. */
       return ss.vert_normals_deform;
     case PositionSource::Orig:
       return mesh_orig.runtime->vert_normals_true_cache;
@@ -876,6 +1400,7 @@ static const SharedCache<Vector<float3>> &face_normals_cache_eval(const Object &
     case PositionSource::Eval:
       return result.mesh_eval->runtime->face_normals_true_cache;
     case PositionSource::RuntimeDeform:
+    case PositionSource::LayersDisplay:
       return ss.face_normals_deform;
     case PositionSource::Orig:
       return mesh_orig.runtime->face_normals_true_cache;
@@ -894,7 +1419,7 @@ static Span<float3> vert_positions_eval(const Object &object_orig, const Object 
 {
   const SculptSession &ss = *object_orig.runtime->sculpt_session;
   const Mesh &mesh_orig = *id_cast<const Mesh *>(object_orig.data);
-  BLI_assert(bke::object::pbvh_get(object_orig)->type() == Type::Mesh);
+  // BLI_assert(bke::object::pbvh_get(object_orig)->type() == Type::Mesh); ??? bug in main
   const PositionSourceResult result = cache_source_get(object_orig, object_eval);
   switch (result.cache_source) {
     case PositionSource::EvalDeform:
@@ -903,6 +1428,8 @@ static Span<float3> vert_positions_eval(const Object &object_orig, const Object 
       return result.mesh_eval->vert_positions();
     case PositionSource::RuntimeDeform:
       return ss.deform_cos;
+    case PositionSource::LayersDisplay:
+      return ss.layers_cos;
     case PositionSource::Orig:
       return mesh_orig.vert_positions();
   }
@@ -923,6 +1450,9 @@ static MutableSpan<float3> vert_positions_eval_for_write(Object &object_orig, Ob
       return const_cast<Mesh *>(result.mesh_eval)->vert_positions_for_write();
     case PositionSource::RuntimeDeform:
       return ss.deform_cos;
+    case PositionSource::LayersDisplay: {
+      return ss.layers_cos.as_mutable_span();
+    }
     case PositionSource::Orig:
       return mesh_orig.vert_positions_for_write();
   }
@@ -1147,6 +1677,266 @@ static void update_normals_mesh(Object &object_orig,
   }
 }
 
+BLI_INLINE float3 calc_inner_border_normal(const int r,
+                                           const int c,
+                                           const int grid_size,
+                                           const Span<float3> positions,
+                                           const Span<int> faces)
+{
+  const int face_idx_BL = (r * (grid_size + 1) + c) * 4;
+  const int face_idx_TR = ((r + 1) * (grid_size + 1) + (c + 1)) * 4;
+  const float3 pL = positions[faces[face_idx_BL + 3]];
+  const float3 pU = positions[faces[face_idx_TR + 3]];
+  const float3 pR = positions[faces[face_idx_TR + 1]];
+  const float3 pD = positions[faces[face_idx_BL + 1]];
+  return math::normalize(math::cross(pR - pL, pU - pD));
+}
+
+void calc_normals_multires_node(const bke::multiresolution::BaseTopology &base_topo,
+                                const bke::multiresolution::OffsetsSpan &offsets,
+                                const int virtual_lvl,
+                                const Span<int> corner_verts,
+                                const Span<float3> positions,
+                                const MultiresNode &node,
+                                const MutableSpan<float3> r_node_normals)
+{
+  const int grid_size = Multiresolution::grid_size(virtual_lvl);
+  const int faces_per_corner = Multiresolution::faces_per_corner(virtual_lvl);
+  const int faces_per_quad_grid = faces_per_corner * 4;
+  const Span<int2> base_edges = base_topo.edges;
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const Span<int> base_corner_to_face = base_topo.corner_to_face_map;
+  const Span<int> base_corner_edges = base_topo.corner_edges;
+  const GroupedSpan<int> base_vert_to_corners = base_topo.vert_to_corner_map;
+  const GroupedSpan<int> base_edge_to_faces = base_topo.edge_to_face_map;
+  const BitSpan face_edge_reversed = base_topo.face_edge_reversed;
+
+  const std::array<int, 4> local_idx_to_local_face = {
+      0, grid_size, faces_per_quad_grid - 1, (grid_size + 1) * grid_size};
+
+  const Span<int> node_verts = node.verts();
+
+  for (const int j : node_verts.index_range()) {
+    const int vert = node_verts[j];
+    const Span<int> vert_corners = base_vert_to_corners[vert];
+    float3 vert_normal = float3(0.0f);
+
+    for (const int corner : vert_corners) {
+      const int base_face_idx = base_corner_to_face[corner];
+      const IndexRange face_range = base_faces[base_face_idx];
+      const int face_start = face_range.start();
+      const int local_corner = corner - face_start;
+      const int local_face = face_range.size() == 4 ? local_idx_to_local_face[local_corner] :
+                                                      local_corner;
+
+      const int multires_face_offset = (face_range.start() * faces_per_corner + local_face) * 4;
+      const int v0 = corner_verts[multires_face_offset + 0];
+      const int v1 = corner_verts[multires_face_offset + 1];
+      const int v2 = corner_verts[multires_face_offset + 2];
+      const int v3 = corner_verts[multires_face_offset + 3];
+      const float3 p0 = positions[v0];
+      const float3 p1 = positions[v1];
+      const float3 p2 = positions[v2];
+      const float3 p3 = positions[v3];
+
+      vert_normal += math::cross(p2 - p0, p3 - p1);
+    }
+    r_node_normals[j] = math::normalize(vert_normal);
+  }
+
+  const Span<int> node_edges = node.edges();
+
+  for (const int j : node_edges.index_range()) {
+    const int edge_idx = node_edges[j];
+    const Span<int> adj_faces = base_edge_to_faces[edge_idx];
+    const int edge_offset = node_verts.size() + j * grid_size;
+    const Span<float3> edge_internal_verts = positions.slice(node.offset() + edge_offset,
+                                                             grid_size);
+    const int2 edge = base_edges[edge_idx];
+    const float3 v0 = positions[offsets.verts[edge[0]]];
+    const float3 v1 = positions[offsets.verts[edge[1]]];
+    const float3 right_first = grid_size > 1 ? edge_internal_verts[1] : v1;
+
+    if (adj_faces.size() == 2) {
+      int grid_offset[2];
+      int local_idx[2];
+      bool is_reversed[2];
+
+      for (int f = 0; f < 2; f++) {
+        const int face_idx = adj_faces[f];
+        const IndexRange face_range = base_faces[face_idx];
+        const int corner_start = face_range.start();
+        const Span<int> face_edges = base_corner_edges.slice(face_range);
+        local_idx[f] = face_edges.first_index(edge_idx);
+        is_reversed[f] = face_edge_reversed[corner_start + local_idx[f]];
+        grid_offset[f] = offsets.faces[face_idx];
+      }
+
+      int left_inner_border_idx = 0;
+      int right_inner_border_idx = 1;
+      for (int f = 0; f < 2; f++) {
+        if (is_reversed[f]) {
+          right_inner_border_idx = f;
+          left_inner_border_idx = 1 - f;
+        }
+      }
+      const int left = left_inner_border_idx;
+      const int right = right_inner_border_idx;
+
+      const float3 left_first = positions[Multiresolution::grid_inner_border_index(
+          grid_offset[left], local_idx[left], is_reversed[left], grid_size, 0)];
+      const float3 right_first_inner = positions[Multiresolution::grid_inner_border_index(
+          grid_offset[right], local_idx[right], is_reversed[right], grid_size, 0)];
+      r_node_normals[edge_offset] = math::normalize(
+          math::cross(right_first_inner - left_first, right_first - v0));
+
+      for (int k = 1; k < grid_size - 1; k++) {
+        const float3 left_pos = positions[Multiresolution::grid_inner_border_index(
+            grid_offset[left], local_idx[left], is_reversed[left], grid_size, k)];
+        const float3 right_pos = positions[Multiresolution::grid_inner_border_index(
+            grid_offset[right], local_idx[right], is_reversed[right], grid_size, k)];
+        r_node_normals[edge_offset + k] = math::normalize(math::cross(
+            right_pos - left_pos, edge_internal_verts[k + 1] - edge_internal_verts[k - 1]));
+      }
+
+      if (grid_size > 1) {
+        const int last = grid_size - 1;
+        const float3 left_last = positions[Multiresolution::grid_inner_border_index(
+            grid_offset[left], local_idx[left], is_reversed[left], grid_size, last)];
+        const float3 right_last = positions[Multiresolution::grid_inner_border_index(
+            grid_offset[right], local_idx[right], is_reversed[right], grid_size, last)];
+        r_node_normals[edge_offset + last] = math::normalize(
+            math::cross(right_last - left_last, v1 - edge_internal_verts[last - 1]));
+      }
+    }
+    else if (adj_faces.size() == 1) {
+      const int face_idx = adj_faces[0];
+      const IndexRange face_range = base_faces[face_idx];
+      const int corner_start = face_range.start();
+      const Span<int> face_edges = base_corner_edges.slice(face_range);
+      const int local_idx = face_edges.first_index(edge_idx);
+
+      const bool is_reversed = face_edge_reversed[corner_start + local_idx];
+      const int offset = offsets.faces[face_idx];
+
+      auto get_cross_tangent = [&](const int k) {
+        const float3 inner_pos = positions[Multiresolution::grid_inner_border_index(
+            offset, local_idx, is_reversed, grid_size, k)];
+        return is_reversed ? (inner_pos - edge_internal_verts[k]) :
+                             (edge_internal_verts[k] - inner_pos);
+      };
+
+      r_node_normals[edge_offset] = math::normalize(
+          math::cross(get_cross_tangent(0), right_first - v0));
+
+      for (int k = 1; k < grid_size - 1; k++) {
+        r_node_normals[edge_offset + k] = math::normalize(math::cross(
+            get_cross_tangent(k), edge_internal_verts[k + 1] - edge_internal_verts[k - 1]));
+      }
+
+      if (grid_size > 1) {
+        const int last = grid_size - 1;
+        r_node_normals[edge_offset + last] = math::normalize(
+            math::cross(get_cross_tangent(last), v1 - edge_internal_verts[last - 1]));
+      }
+    }
+  }
+
+  const Span<int> node_faces = node.faces();
+  const int node_face_offset = node_verts.size() + grid_size * node_edges.size();
+
+  if (grid_size == 1) {
+    for (const int j : node_faces.index_range()) {
+      const int face_idx = node_faces[j];
+      const int face_offset = node_face_offset + j;
+      const IndexRange face_range = base_faces[face_idx];
+
+      float3 face_normal = float3(0.0f);
+
+      for (const int corner : face_range) {
+        const int multires_face_offset = corner * 4;
+        const int v0 = corner_verts[multires_face_offset + 0];
+        const int v1 = corner_verts[multires_face_offset + 1];
+        const int v2 = corner_verts[multires_face_offset + 2];
+        const int v3 = corner_verts[multires_face_offset + 3];
+
+        const float3 p0 = positions[v0];
+        const float3 p1 = positions[v1];
+        const float3 p2 = positions[v2];
+        const float3 p3 = positions[v3];
+
+        face_normal += math::cross(p1 - p0, p2 - p0);
+        face_normal += math::cross(p2 - p0, p3 - p0);
+      }
+
+      r_node_normals[face_offset] = math::normalize(face_normal);
+    }
+  }
+  else {
+    for (const int j : node_faces.index_range()) {
+      const int face_idx = node_faces[j];
+      const int face_offset = node_face_offset + j * grid_size * grid_size;
+      const Span<float3> grid = positions.slice(node.offset() + face_offset,
+                                                grid_size * grid_size);
+      const Span<int> subfaces = corner_verts.slice(face_idx * faces_per_quad_grid * 4,
+                                                    faces_per_quad_grid * 4);
+      int curr_offset = face_offset;
+
+      for (const int c : IndexRange(grid_size)) {
+        r_node_normals[curr_offset++] = calc_inner_border_normal(
+            0, c, grid_size, positions, subfaces);
+      }
+      for (int r = 1; r < grid_size - 1; r++) {
+        r_node_normals[curr_offset++] = calc_inner_border_normal(
+            r, 0, grid_size, positions, subfaces);
+
+        for (int c = 1; c < grid_size - 1; c++) {
+          const int grid_offset = r * grid_size + c;
+          r_node_normals[curr_offset++] = math::normalize(
+              math::cross(grid[grid_offset + 1] - grid[grid_offset - 1],
+                          grid[grid_offset + grid_size] - grid[grid_offset - grid_size]));
+        }
+
+        r_node_normals[curr_offset++] = calc_inner_border_normal(
+            r, grid_size - 1, grid_size, positions, subfaces);
+      }
+      for (const int c : IndexRange(grid_size)) {
+        r_node_normals[curr_offset++] = calc_inner_border_normal(
+            grid_size - 1, c, grid_size, positions, subfaces);
+      }
+    }
+  }
+}
+
+void calc_normals_multires(const bke::multiresolution::BaseTopology &base_topo,
+                           const bke::multiresolution::OffsetsSpan &offsets,
+                           const int virtual_lvl,
+                           const Span<int> corner_verts,
+                           const Span<float3> positions,
+                           const Span<MultiresNode> nodes,
+                           const IndexMask &nodes_to_update,
+                           const MutableSpan<float3> r_normals)
+{
+  if (nodes_to_update.size() == 0) {
+    return;
+  }
+
+  const int grid_size = Multiresolution::grid_size(virtual_lvl);
+
+  nodes_to_update.foreach_index(
+      [&](const int node_idx) {
+        const MultiresNode &node = nodes[node_idx];
+        calc_normals_multires_node(base_topo,
+                                   offsets,
+                                   virtual_lvl,
+                                   corner_verts,
+                                   positions,
+                                   node,
+                                   r_normals.slice(node.range(grid_size)));
+      },
+      exec_mode::grain_size(1));
+}
+
 void Tree::update_normals(Object &object_orig, Object &object_eval)
 {
   PRF_scope(ProfileCategory::Core);
@@ -1156,6 +1946,34 @@ void Tree::update_normals(Object &object_orig, Object &object_eval)
   switch (this->type()) {
     case Type::Mesh: {
       update_normals_mesh(object_orig, object_eval, this->nodes<MeshNode>(), nodes_to_update);
+      break;
+    }
+    case Type::Multires: {
+      const Mesh &base_mesh = *id_cast<Mesh *>(object_orig.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const int virtual_lvl = multires.curr_level - multires.base_level(multires.curr_level);
+      const int expected_corner_verts = base_topo.corners_num *
+                                        Multiresolution::faces_per_corner(virtual_lvl) * 4;
+      const int expected_verts = multires.verts_num();
+      if (this->offsets.verts.size() != base_topo.verts_num ||
+          this->offsets.edges.size() != base_topo.edges_num ||
+          this->offsets.faces.size() != base_topo.faces_num ||
+          multires.corner_verts().size() != expected_corner_verts ||
+          multires.normals().size() != expected_verts ||
+          multires.positions().size() != expected_verts)
+      {
+        return;
+      }
+      calc_normals_multires(base_topo,
+                            this->offsets,
+                            virtual_lvl,
+                            multires.corner_verts(),
+                            multires.positions(),
+                            this->nodes<MultiresNode>(),
+                            nodes_to_update,
+                            multires.normals_for_write());
+
       break;
     }
     case Type::Grids: {
@@ -1198,6 +2016,28 @@ void update_node_bounds_mesh(const Span<float3> positions, MeshNode &node)
   Bounds<float3> bounds = negative_bounds();
   for (const int vert : node.all_verts()) {
     math::min_max(positions[vert], bounds.min, bounds.max);
+  }
+  node.bounds_ = bounds;
+}
+
+void update_node_bounds_multires(const int grid_size,
+                                 const Span<float3> positions,
+                                 const bke::multiresolution::OffsetsSpan &offsets,
+                                 MultiresNode &node)
+{
+  Bounds<float3> bounds = negative_bounds();
+
+  for (const int i : node.range(grid_size)) {
+    math::min_max(positions[i], bounds.min, bounds.max);
+  }
+  for (const int vert : node.shared_verts_) {
+    math::min_max(positions[offsets.verts[vert]], bounds.min, bounds.max);
+  }
+  for (const int edge : node.shared_edges_) {
+    const int edge_offset = offsets.edges[edge];
+    for (const int i : IndexRange(edge_offset, grid_size)) {
+      math::min_max(positions[i], bounds.min, bounds.max);
+    }
   }
   node.bounds_ = bounds;
 }
@@ -1279,6 +2119,20 @@ void Tree::update_bounds_mesh(const Span<float3> vert_positions)
   this->flush_bounds_to_parents();
 }
 
+void Tree::update_bounds_multires(const Span<float3> positions, const int grid_size)
+{
+  IndexMaskMemory memory;
+  const IndexMask nodes_to_update = IndexMask::from_bits(bounds_dirty_, memory);
+  if (nodes_to_update.is_empty()) {
+    return;
+  }
+  MutableSpan<MultiresNode> nodes = this->nodes<MultiresNode>();
+  nodes_to_update.foreach_index(
+      [&](const int i) { update_node_bounds_multires(grid_size, positions, offsets, nodes[i]); },
+      exec_mode::grain_size(1));
+  this->flush_bounds_to_parents();
+}
+
 void Tree::update_bounds_grids(const Span<float3> positions, const int grid_area)
 {
   IndexMaskMemory memory;
@@ -1309,20 +2163,26 @@ void Tree::update_bounds_bmesh(const BMesh & /*bm*/)
 void Tree::update_bounds(const Depsgraph &depsgraph, const Object &object)
 {
   PRF_scope(ProfileCategory::Core);
+  const SculptSession &ss = *object.runtime->sculpt_session;
+
   switch (this->type()) {
     case Type::Mesh: {
       const Span<float3> positions = bke::pbvh::vert_positions_eval(depsgraph, object);
       this->update_bounds_mesh(positions);
       break;
     }
+    case Type::Multires: {
+      const Mesh &mesh = *id_cast<Mesh *>(object.data);
+      const Multiresolution &multires = *mesh.multires;
+      this->update_bounds_multires(multires.positions(), multires.grid_size());
+      break;
+    }
     case Type::Grids: {
-      const SculptSession &ss = *object.runtime->sculpt_session;
       const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
       this->update_bounds_grids(subdiv_ccg.positions, subdiv_ccg.grid_area);
       break;
     }
     case Type::BMesh: {
-      const SculptSession &ss = *object.runtime->sculpt_session;
       this->update_bounds_bmesh(*ss.bm);
       break;
     }
@@ -1368,6 +2228,37 @@ void update_mask_mesh(const Mesh &mesh, const IndexMask &node_mask, Tree &pbvh)
 
   node_mask.foreach_index([&](const int i) { node_update_mask_mesh(mask, nodes[i]); },
                           exec_mode::grain_size(1));
+}
+
+void update_mask_multires(const Multiresolution &multires, const IndexMask &node_mask, Tree &pbvh)
+{
+  const MutableSpan<MultiresNode> nodes = pbvh.nodes<MultiresNode>();
+  if (multires.masks().is_empty()) {
+    node_mask.foreach_index([&](const int i) {
+      nodes[i].flag_ &= ~Node::FullyMasked;
+      nodes[i].flag_ |= Node::FullyUnmasked;
+    });
+    return;
+  }
+
+  node_mask.foreach_index(
+      [&](const int i) {
+        node_update_mask_multires(multires.masks(), multires.grid_size(), nodes[i]);
+      },
+      exec_mode::grain_size(1));
+}
+
+void node_update_mask_multires(const Span<float> masks, const int grid_size, MultiresNode &node)
+{
+  bool fully_masked = true;
+  bool fully_unmasked = true;
+  const Span<float> node_masks = masks.slice(node.range(grid_size));
+  for (const float mask : node_masks) {
+    fully_masked &= mask == 1.0f;
+    fully_unmasked &= mask <= 0.0f;
+  }
+  SET_FLAG_FROM_TEST(node.flag_, fully_masked, Node::FullyMasked);
+  SET_FLAG_FROM_TEST(node.flag_, fully_unmasked, Node::FullyUnmasked);
 }
 
 void node_update_mask_grids(const CCGKey &key, const Span<float> masks, GridsNode &node)
@@ -1458,6 +2349,33 @@ static void update_visibility_faces(const Mesh &mesh,
                           exec_mode::grain_size(1));
 }
 
+void node_update_visibility_multires(const Span<bool> hidden_verts,
+                                     const int grid_size,
+                                     MultiresNode &node)
+{
+  BLI_assert(!hidden_verts.is_empty());
+  const Span<bool> node_hidden = hidden_verts.slice(node.range(grid_size));
+  const bool fully_hidden = std::all_of(
+      node_hidden.begin(), node_hidden.end(), [&](const bool value) { return value; });
+  SET_FLAG_FROM_TEST(node.flag_, fully_hidden, Node::FullyHidden);
+}
+
+static void update_visibility_multires(const Multiresolution &multires,
+                                       const MutableSpan<MultiresNode> nodes,
+                                       const IndexMask &node_mask)
+{
+  if (multires.hidden_verts().is_empty()) {
+    node_mask.foreach_index([&](const int i) { nodes[i].flag_ &= ~Node::FullyHidden; });
+    return;
+  }
+
+  node_mask.foreach_index(
+      [&](const int i) {
+        node_update_visibility_multires(multires.hidden_verts(), multires.grid_size(), nodes[i]);
+      },
+      exec_mode::grain_size(1));
+}
+
 void node_update_visibility_grids(const BitGroupVector<> &grid_hidden, GridsNode &node)
 {
   BLI_assert(!grid_hidden.is_empty());
@@ -1505,6 +2423,7 @@ static void update_visibility_bmesh(const MutableSpan<BMeshNode> nodes, const In
 void Tree::update_visibility(const Object &object)
 {
   PRF_scope(ProfileCategory::Core);
+  const Mesh &mesh = *id_cast<const Mesh *>(object.data);
   IndexMaskMemory memory;
   const IndexMask node_mask = IndexMask::from_bits(visibility_dirty_, memory);
   if (node_mask.is_empty()) {
@@ -1513,8 +2432,11 @@ void Tree::update_visibility(const Object &object)
   visibility_dirty_.clear_and_shrink();
   switch (this->type()) {
     case Type::Mesh: {
-      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
       update_visibility_faces(mesh, this->nodes<MeshNode>(), node_mask);
+      break;
+    }
+    case Type::Multires: {
+      update_visibility_multires(*mesh.multires, this->nodes<MultiresNode>(), node_mask);
       break;
     }
     case Type::Grids: {
@@ -1717,7 +2639,6 @@ void raycast(Tree &pbvh,
 {
   PRF_scope(ProfileCategory::Core);
   RaycastData rcd;
-
   isect_ray_aabb_v3_precalc(&rcd.ray, ray_start, ray_normal);
   rcd.original = original;
 
@@ -1731,16 +2652,16 @@ bool ray_face_intersection_quad(const float3 &ray_start,
                                 const float3 &t1,
                                 const float3 &t2,
                                 const float3 &t3,
-                                float *depth)
+                                float &depth)
 {
   float depth_test;
 
   if ((isect_ray_tri_watertight_v3(ray_start, isect_precalc, t0, t1, t2, &depth_test, nullptr) &&
-       (depth_test < *depth)) ||
+       (depth_test < depth)) ||
       (isect_ray_tri_watertight_v3(ray_start, isect_precalc, t0, t2, t3, &depth_test, nullptr) &&
-       (depth_test < *depth)))
+       (depth_test < depth)))
   {
-    *depth = depth_test;
+    depth = depth_test;
     return true;
   }
 
@@ -1923,7 +2844,7 @@ bool node_raycast_mesh(const MeshNode &node,
     }
   }
   else {
-    const MeshNode::LocalVertMap &vert_map = node.vert_indices_;
+    const LocalVertMap &vert_map = node.vert_indices_;
     for (const int i : face_indices.index_range()) {
       const int face_i = face_indices[i];
       if (!hide_poly.is_empty() && hide_poly[face_i]) {
@@ -1950,6 +2871,280 @@ bool node_raycast_mesh(const MeshNode &node,
                                    r_active_face_index,
                                    r_face_normal);
         }
+      }
+    }
+  }
+
+  return hit;
+}
+
+bool node_raycast_multires(const Mesh &base_mesh,
+                           const MultiresNode &node,
+                           const Span<int> vert_offsets,
+                           const Span<int> edge_offsets,
+                           const Span<float3> orig_positions,
+                           const float3 &ray_start,
+                           const float3 &ray_normal,
+                           const IsectRayPrecalc *isect_precalc,
+                           float &depth,
+                           int &r_active_vertex,
+                           int &r_active_face,
+                           float3 &r_face_normal)
+{
+  bool hit = false;
+  const Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const int grid_size = multires.grid_size();
+  const int faces_per_side = multires.faces_per_side();
+  const int faces_per_corner = multires.faces_per_corner();
+  const Span<int> corner_verts = multires.corner_verts();
+  const Span<float3> positions = multires.positions();
+  const Span<bool> hidden_faces = multires.hidden_faces();
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const Span<int> node_faces = node.faces();
+
+  auto check_quad_intersection = [&](const float3 &p0,
+                                     const float3 &p1,
+                                     const float3 &p2,
+                                     const float3 &p3,
+                                     const int subface_idx) -> int {
+    if (ray_face_intersection_quad(ray_start, isect_precalc, p0, p1, p2, p3, depth)) {
+      hit = true;
+      r_active_face = subface_idx;
+      normal_quad_v3(r_face_normal, p0, p1, p2, p3);
+
+      const float3 location = ray_start + ray_normal * depth;
+      int best_corner = 0;
+      float best_dist = math::distance_squared(location, p0);
+      std::array<float3, 3> pos = {p1, p2, p3};
+
+      for (int corner = 1; corner < 4; corner++) {
+        const float dist = math::distance_squared(location, pos[corner - 1]);
+        if (dist < best_dist) {
+          best_dist = dist;
+          best_corner = corner;
+        }
+      }
+      return best_corner;
+    }
+    return -1;
+  };
+
+  if (orig_positions.is_empty()) {
+    auto test_quad_global = [&](int v0, int v1, int v2, int v3, int subface_idx) {
+      if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+        return;
+      }
+      const int corner_idx = check_quad_intersection(
+          positions[v0], positions[v1], positions[v2], positions[v3], subface_idx);
+      if (corner_idx != -1) {
+        const int verts[4] = {v0, v1, v2, v3};
+        r_active_vertex = verts[corner_idx];
+      }
+    };
+
+    for (const int face_idx : node_faces) {
+      const IndexRange face_range = base_faces[face_idx];
+      const int subfaces_num = faces_per_corner * face_range.size();
+      const int subface_start = face_range.start() * faces_per_corner;
+      const Span<int> subfaces = corner_verts.slice(subface_start * 4, subfaces_num * 4);
+
+      for (int i = 0; i < subfaces_num; i++) {
+        test_quad_global(subfaces[i * 4 + 0],
+                         subfaces[i * 4 + 1],
+                         subfaces[i * 4 + 2],
+                         subfaces[i * 4 + 3],
+                         subface_start + i);
+      }
+    }
+  }
+  else {
+    const Span<int> base_corner_verts = base_topo.corner_verts;
+    const Span<int> base_corner_edges = base_topo.corner_edges;
+    const BitSpan face_edge_reversed = base_topo.face_edge_reversed;
+    const IndexRange node_range = node.range(grid_size);
+    const LocalVertMap shared_verts = node.shared_verts();
+    const LocalVertMap shared_edges = node.shared_edges();
+    const int shared_verts_offset = node.owned_verts_num(grid_size);
+    const int shared_edges_offset = shared_verts_offset + node.shared_verts().size();
+
+    auto calc_local_vert_offset = [&](const int vert) {
+      const int global_vert_offset = vert_offsets[vert];
+      return node_range.contains(global_vert_offset) ?
+                 global_vert_offset - node.offset() :
+                 shared_verts_offset + (int)shared_verts.index_of(vert);
+    };
+
+    auto calc_local_edge_offset = [&](const int edge) {
+      const int global_edge_offset = edge_offsets[edge];
+      return node_range.contains(global_edge_offset) ?
+                 global_edge_offset - node.offset() :
+                 shared_edges_offset + (int)shared_edges.index_of(edge) * grid_size;
+    };
+
+    int local_active_vertex = -1;
+
+    auto test_quad_local = [&](int v0, int v1, int v2, int v3, int subface_idx) {
+      if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+        return;
+      }
+      const int corner_idx = check_quad_intersection(orig_positions[v0],
+                                                     orig_positions[v1],
+                                                     orig_positions[v2],
+                                                     orig_positions[v3],
+                                                     subface_idx);
+      if (corner_idx != -1) {
+        const int verts[4] = {v0, v1, v2, v3};
+        local_active_vertex = verts[corner_idx];
+      }
+    };
+
+    if (grid_size == 1) {
+      static constexpr std::array<int, 4> quad_subface_to_corner = {0, 1, 3, 2};
+      const int first_face_vert_idx = node.verts().size() + node.edges().size();
+
+      for (const int j : node_faces.index_range()) {
+        const int face_idx = node_faces[j];
+        const IndexRange face_range = base_faces[face_idx];
+        const int num_corners = face_range.size();
+        const Span<int> face_verts = base_corner_verts.slice(face_range);
+        const Span<int> face_edges = base_corner_edges.slice(face_range);
+
+        const int face_vert_idx = first_face_vert_idx + j;
+        const int subface_start = face_range.start();
+
+        for (const int local_subface : IndexRange(num_corners)) {
+          const int corner = (num_corners == 4) ? quad_subface_to_corner[local_subface] :
+                                                  local_subface;
+          const int prev_corner = (corner - 1 + num_corners) % num_corners;
+
+          const int v_corner = calc_local_vert_offset(face_verts[corner]);
+          const int e_curr = calc_local_edge_offset(face_edges[corner]);
+          const int e_prev = calc_local_edge_offset(face_edges[prev_corner]);
+
+          test_quad_local(v_corner, e_curr, face_vert_idx, e_prev, subface_start + local_subface);
+        }
+      }
+    }
+    else {
+      for (const int j : node_faces.index_range()) {
+        const int face_idx = node_faces[j];
+        const IndexRange face_range = base_faces[face_idx];
+        const Span<int> face_verts = base_corner_verts.slice(face_range);
+        const Span<int> face_edges = base_corner_edges.slice(face_range);
+        const int corner_offset = face_range.start();
+        const std::array<bool, 4> reversed = {face_edge_reversed[corner_offset + 0],
+                                              face_edge_reversed[corner_offset + 1],
+                                              face_edge_reversed[corner_offset + 2],
+                                              face_edge_reversed[corner_offset + 3]};
+
+        const std::array<int, 4> local_vert_offsets = {calc_local_vert_offset(face_verts[0]),
+                                                       calc_local_vert_offset(face_verts[1]),
+                                                       calc_local_vert_offset(face_verts[2]),
+                                                       calc_local_vert_offset(face_verts[3])};
+
+        const std::array<int, 4> local_edge_offsets = {calc_local_edge_offset(face_edges[0]),
+                                                       calc_local_edge_offset(face_edges[1]),
+                                                       calc_local_edge_offset(face_edges[2]),
+                                                       calc_local_edge_offset(face_edges[3])};
+
+        const int grid_offset = node.verts().size() + node.edges().size() * grid_size +
+                                j * grid_size * grid_size;
+
+        auto get_grid_vert = [&](int r, int c) { return grid_offset + r * grid_size + c; };
+        int subface_idx = face_range.start() * faces_per_corner;
+        // first row
+        {
+          // first col
+          test_quad_local(local_vert_offsets[0],
+                          local_edge_offsets[0] + (reversed[0] ? grid_size - 1 : 0),
+                          get_grid_vert(0, 0),
+                          local_edge_offsets[3] + (reversed[3] ? 0 : grid_size - 1),
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(local_edge_offsets[0] + (reversed[0] ? grid_size - col : col - 1),
+                            local_edge_offsets[0] + (reversed[0] ? grid_size - col - 1 : col),
+                            get_grid_vert(0, col),
+                            get_grid_vert(0, col - 1),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(local_edge_offsets[0] + (reversed[0] ? 0 : grid_size - 1),
+                          local_vert_offsets[1],
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - 1 : 0),
+                          get_grid_vert(0, grid_size - 1),
+                          subface_idx++);
+        }
+
+        // middle rows
+        for (int row = 1; row < faces_per_side - 1; row++) {
+          // first col
+          test_quad_local(local_edge_offsets[3] + (reversed[3] ? row - 1 : grid_size - row),
+                          get_grid_vert(row - 1, 0),
+                          get_grid_vert(row, 0),
+                          local_edge_offsets[3] + (reversed[3] ? row : grid_size - 1 - row),
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(get_grid_vert(row - 1, col - 1),
+                            get_grid_vert(row - 1, col),
+                            get_grid_vert(row, col),
+                            get_grid_vert(row, col - 1),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(get_grid_vert(row - 1, grid_size - 1),
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - row : row - 1),
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - 1 - row : row),
+                          get_grid_vert(row, grid_size - 1),
+                          subface_idx++);
+        }
+
+        // last row
+        {
+          // first col
+          test_quad_local(local_edge_offsets[3] + (reversed[3] ? grid_size - 1 : 0),
+                          get_grid_vert(grid_size - 1, 0),
+                          local_edge_offsets[2] + (reversed[2] ? 0 : grid_size - 1),
+                          local_vert_offsets[3],
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(get_grid_vert(grid_size - 1, col - 1),
+                            get_grid_vert(grid_size - 1, col),
+                            local_edge_offsets[2] + (reversed[2] ? col : grid_size - 1 - col),
+                            local_edge_offsets[2] + (reversed[2] ? col - 1 : grid_size - col),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(get_grid_vert(grid_size - 1, grid_size - 1),
+                          local_edge_offsets[1] + (reversed[1] ? 0 : grid_size - 1),
+                          local_vert_offsets[2],
+                          local_edge_offsets[2] + (reversed[2] ? grid_size - 1 : 0),
+                          subface_idx++);
+        }
+      }
+    }
+
+    if (local_active_vertex != -1) {
+      if (local_active_vertex < node.owned_verts_num(grid_size)) {
+        r_active_vertex = local_active_vertex + node.offset();
+      }
+      else if (local_active_vertex < shared_edges_offset) {
+        const int local_shared_vert = local_active_vertex - shared_verts_offset;
+        r_active_vertex = vert_offsets[shared_verts[local_shared_vert]];
+      }
+      else {
+        const int local_shared_edge = (local_active_vertex - shared_edges_offset) / grid_size;
+        const int vert_index_in_edge = (local_active_vertex - shared_edges_offset) % grid_size;
+        r_active_vertex = edge_offsets[local_shared_edge] + vert_index_in_edge;
       }
     }
   }
@@ -1997,7 +3192,7 @@ bool node_raycast_grids(const SubdivCCG &subdiv_ccg,
                         const float3 &ray_start,
                         const float3 &ray_normal,
                         const IsectRayPrecalc *isect_precalc,
-                        float *depth,
+                        float &depth,
                         SubdivCCGCoord &r_active_vertex,
                         int &r_active_grid_index,
                         float3 &r_face_normal)
@@ -2034,7 +3229,7 @@ bool node_raycast_grids(const SubdivCCG &subdiv_ccg,
                                       x,
                                       y,
                                       co,
-                                      *depth,
+                                      depth,
                                       r_active_vertex,
                                       r_active_grid_index,
                                       r_face_normal);
@@ -2068,7 +3263,7 @@ bool node_raycast_grids(const SubdivCCG &subdiv_ccg,
                                       x,
                                       y,
                                       co,
-                                      *depth,
+                                      depth,
                                       r_active_vertex,
                                       r_active_grid_index,
                                       r_face_normal);
@@ -2237,7 +3432,7 @@ static bool pbvh_faces_node_nearest_to_ray(const MeshNode &node,
     }
   }
   else {
-    const MeshNode::LocalVertMap &vert_map = node.vert_indices_;
+    const LocalVertMap &vert_map = node.vert_indices_;
     for (const int i : face_indices.index_range()) {
       const int face_i = face_indices[i];
       if (!hide_poly.is_empty() && hide_poly[face_i]) {
@@ -2260,8 +3455,229 @@ static bool pbvh_faces_node_nearest_to_ray(const MeshNode &node,
   return hit;
 }
 
+bool node_nearest_to_ray_multires(const Mesh &base_mesh,
+                                  const MultiresNode &node,
+                                  const Span<int> vert_offsets,
+                                  const Span<int> edge_offsets,
+                                  const Span<float3> orig_positions,
+                                  const float3 &ray_start,
+                                  const float3 &ray_normal,
+                                  float *r_depth,
+                                  float *dist_sq)
+{
+  bool hit = false;
+  const Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const int grid_size = multires.grid_size();
+  const int faces_per_side = multires.faces_per_side();
+  const int faces_per_corner = multires.faces_per_corner();
+  const Span<int> corner_verts = multires.corner_verts();
+  const Span<float3> positions = multires.positions();
+  const Span<bool> hidden_faces = multires.hidden_faces();
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const Span<int> node_faces = node.faces();
+
+  if (orig_positions.is_empty()) {
+    for (const int face_idx : node_faces) {
+      const IndexRange face_range = base_faces[face_idx];
+      const int subfaces_num = faces_per_corner * face_range.size();
+      const int subface_start = face_range.start() * faces_per_corner;
+      const Span<int> subfaces = corner_verts.slice(subface_start * 4, subfaces_num * 4);
+
+      for (int i = 0; i < subfaces_num; i++) {
+        const int subface_idx = subface_start + i;
+        if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+          continue;
+        }
+        hit |= ray_face_nearest_quad(ray_start,
+                                     ray_normal,
+                                     positions[subfaces[i * 4 + 0]],
+                                     positions[subfaces[i * 4 + 1]],
+                                     positions[subfaces[i * 4 + 2]],
+                                     positions[subfaces[i * 4 + 3]],
+                                     r_depth,
+                                     dist_sq);
+      }
+    }
+  }
+  else {
+    const Span<int> base_corner_verts = base_topo.corner_verts;
+    const Span<int> base_corner_edges = base_topo.corner_edges;
+    const BitSpan face_edge_reversed = base_topo.face_edge_reversed;
+    const IndexRange node_range = node.range(grid_size);
+    const LocalVertMap shared_verts = node.shared_verts();
+    const LocalVertMap shared_edges = node.shared_edges();
+    const int shared_verts_offset = node.owned_verts_num(grid_size);
+    const int shared_edges_offset = shared_verts_offset + node.shared_verts().size();
+
+    auto calc_local_vert_offset = [&](const int vert) {
+      const int global_vert_offset = vert_offsets[vert];
+      return node_range.contains(global_vert_offset) ?
+                 global_vert_offset - node.offset() :
+                 shared_verts_offset + (int)shared_verts.index_of(vert);
+    };
+
+    auto calc_local_edge_offset = [&](const int edge) {
+      const int global_edge_offset = edge_offsets[edge];
+      return node_range.contains(global_edge_offset) ?
+                 global_edge_offset - node.offset() :
+                 shared_edges_offset + (int)shared_edges.index_of(edge) * grid_size;
+    };
+
+    auto test_quad_local = [&](int v0, int v1, int v2, int v3, int subface_idx) {
+      if (!hidden_faces.is_empty() && hidden_faces[subface_idx]) {
+        return;
+      }
+      hit |= ray_face_nearest_quad(ray_start,
+                                   ray_normal,
+                                   orig_positions[v0],
+                                   orig_positions[v1],
+                                   orig_positions[v2],
+                                   orig_positions[v3],
+                                   r_depth,
+                                   dist_sq);
+    };
+
+    if (grid_size == 1) {
+      static constexpr std::array<int, 4> quad_subface_to_corner = {0, 1, 3, 2};
+      const int first_face_vert_idx = node.verts().size() + node.edges().size();
+
+      for (const int j : node_faces.index_range()) {
+        const int face_idx = node_faces[j];
+        const IndexRange face_range = base_faces[face_idx];
+        const int num_corners = face_range.size();
+        const Span<int> face_verts = base_corner_verts.slice(face_range);
+        const Span<int> face_edges = base_corner_edges.slice(face_range);
+
+        const int face_vert_idx = first_face_vert_idx + j;
+        const int subface_start = face_range.start();
+
+        for (const int local_subface : IndexRange(num_corners)) {
+          const int corner = (num_corners == 4) ? quad_subface_to_corner[local_subface] :
+                                                  local_subface;
+          const int prev_corner = (corner - 1 + num_corners) % num_corners;
+
+          const int v_corner = calc_local_vert_offset(face_verts[corner]);
+          const int e_curr = calc_local_edge_offset(face_edges[corner]);
+          const int e_prev = calc_local_edge_offset(face_edges[prev_corner]);
+
+          test_quad_local(v_corner, e_curr, face_vert_idx, e_prev, subface_start + local_subface);
+        }
+      }
+    }
+    else {
+      for (const int j : node_faces.index_range()) {
+        const int face_idx = node_faces[j];
+        const IndexRange face_range = base_faces[face_idx];
+        const Span<int> face_verts = base_corner_verts.slice(face_range);
+        const Span<int> face_edges = base_corner_edges.slice(face_range);
+        const int corner_offset = face_range.start();
+        const std::array<bool, 4> reversed = {face_edge_reversed[corner_offset + 0],
+                                              face_edge_reversed[corner_offset + 1],
+                                              face_edge_reversed[corner_offset + 2],
+                                              face_edge_reversed[corner_offset + 3]};
+
+        const std::array<int, 4> local_vert_offsets = {calc_local_vert_offset(face_verts[0]),
+                                                       calc_local_vert_offset(face_verts[1]),
+                                                       calc_local_vert_offset(face_verts[2]),
+                                                       calc_local_vert_offset(face_verts[3])};
+
+        const std::array<int, 4> local_edge_offsets = {calc_local_edge_offset(face_edges[0]),
+                                                       calc_local_edge_offset(face_edges[1]),
+                                                       calc_local_edge_offset(face_edges[2]),
+                                                       calc_local_edge_offset(face_edges[3])};
+
+        const int grid_offset = node.verts().size() + node.edges().size() * grid_size +
+                                j * grid_size * grid_size;
+
+        auto get_grid_vert = [&](int r, int c) { return grid_offset + r * grid_size + c; };
+        int subface_idx = face_range.start() * faces_per_corner;
+        // first row
+        {
+          // first col
+          test_quad_local(local_vert_offsets[0],
+                          local_edge_offsets[0] + (reversed[0] ? grid_size - 1 : 0),
+                          get_grid_vert(0, 0),
+                          local_edge_offsets[3] + (reversed[3] ? 0 : grid_size - 1),
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(local_edge_offsets[0] + (reversed[0] ? grid_size - col : col - 1),
+                            local_edge_offsets[0] + (reversed[0] ? grid_size - col - 1 : col),
+                            get_grid_vert(0, col),
+                            get_grid_vert(0, col - 1),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(local_edge_offsets[0] + (reversed[0] ? 0 : grid_size - 1),
+                          local_vert_offsets[1],
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - 1 : 0),
+                          get_grid_vert(0, grid_size - 1),
+                          subface_idx++);
+        }
+
+        // middle rows
+        for (int row = 1; row < faces_per_side - 1; row++) {
+          // first col
+          test_quad_local(local_edge_offsets[3] + (reversed[3] ? row - 1 : grid_size - row),
+                          get_grid_vert(row - 1, 0),
+                          get_grid_vert(row, 0),
+                          local_edge_offsets[3] + (reversed[3] ? row : grid_size - 1 - row),
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(get_grid_vert(row - 1, col - 1),
+                            get_grid_vert(row - 1, col),
+                            get_grid_vert(row, col),
+                            get_grid_vert(row, col - 1),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(get_grid_vert(row - 1, grid_size - 1),
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - row : row - 1),
+                          local_edge_offsets[1] + (reversed[1] ? grid_size - 1 - row : row),
+                          get_grid_vert(row, grid_size - 1),
+                          subface_idx++);
+        }
+
+        // last row
+        {
+          // first col
+          test_quad_local(local_edge_offsets[3] + (reversed[3] ? grid_size - 1 : 0),
+                          get_grid_vert(grid_size - 1, 0),
+                          local_edge_offsets[2] + (reversed[2] ? 0 : grid_size - 1),
+                          local_vert_offsets[3],
+                          subface_idx++);
+
+          // middle cols
+          for (int col = 1; col < faces_per_side - 1; col++) {
+            test_quad_local(get_grid_vert(grid_size - 1, col - 1),
+                            get_grid_vert(grid_size - 1, col),
+                            local_edge_offsets[2] + (reversed[2] ? col : grid_size - 1 - col),
+                            local_edge_offsets[2] + (reversed[2] ? col - 1 : grid_size - col),
+                            subface_idx++);
+          }
+
+          // last col
+          test_quad_local(get_grid_vert(grid_size - 1, grid_size - 1),
+                          local_edge_offsets[1] + (reversed[1] ? 0 : grid_size - 1),
+                          local_vert_offsets[2],
+                          local_edge_offsets[2] + (reversed[2] ? grid_size - 1 : 0),
+                          subface_idx++);
+        }
+      }
+    }
+  }
+
+  return hit;
+}
+
 static bool pbvh_grids_node_nearest_to_ray(const SubdivCCG &subdiv_ccg,
-                                           GridsNode &node,
+                                           const GridsNode &node,
                                            const Span<float3> node_positions,
                                            const float ray_start[3],
                                            const float ray_normal[3],
@@ -2335,6 +3751,7 @@ bool find_nearest_to_ray_node(Tree &pbvh,
                               const Span<int3> corner_tris,
                               const Span<bool> hide_poly,
                               const SubdivCCG *subdiv_ccg,
+                              const Mesh &base_mesh,
                               const float ray_start[3],
                               const float ray_normal[3],
                               float *depth,
@@ -2343,6 +3760,7 @@ bool find_nearest_to_ray_node(Tree &pbvh,
   if (node.flag_ & Node::FullyHidden) {
     return false;
   }
+
   switch (pbvh.type()) {
     case Type::Mesh:
       return pbvh_faces_node_nearest_to_ray(static_cast<MeshNode &>(node),
@@ -2356,6 +3774,16 @@ bool find_nearest_to_ray_node(Tree &pbvh,
                                             ray_normal,
                                             depth,
                                             dist_sq);
+    case Type::Multires:
+      return node_nearest_to_ray_multires(base_mesh,
+                                          static_cast<MultiresNode &>(node),
+                                          pbvh.offsets.verts,
+                                          pbvh.offsets.edges,
+                                          node_positions,
+                                          ray_start,
+                                          ray_normal,
+                                          depth,
+                                          dist_sq);
     case Type::Grids:
       return pbvh_grids_node_nearest_to_ray(*subdiv_ccg,
                                             static_cast<GridsNode &>(node),
@@ -2438,85 +3866,6 @@ int BKE_pbvh_debug_draw_gen_get(bke::pbvh::Node &node)
   return node.debug_draw_gen_;
 }
 
-void BKE_pbvh_sync_visibility_from_verts(Object &object)
-{
-  using namespace blender::bke;
-  const SculptSession &ss = *object.runtime->sculpt_session;
-  switch (object::pbvh_get(object)->type()) {
-    case bke::pbvh::Type::Mesh: {
-      Mesh &mesh = *id_cast<Mesh *>(object.data);
-      mesh_hide_vert_flush(mesh);
-      break;
-    }
-    case bke::pbvh::Type::BMesh: {
-      BMesh &bm = *ss.bm;
-      BMIter iter;
-      BMVert *v;
-      BMEdge *e;
-      BMFace *f;
-
-      BM_ITER_MESH (f, &iter, &bm, BM_FACES_OF_MESH) {
-        BM_elem_flag_disable(f, BM_ELEM_HIDDEN);
-      }
-
-      BM_ITER_MESH (e, &iter, &bm, BM_EDGES_OF_MESH) {
-        BM_elem_flag_disable(e, BM_ELEM_HIDDEN);
-      }
-
-      BM_ITER_MESH (v, &iter, &bm, BM_VERTS_OF_MESH) {
-        if (!BM_elem_flag_test(v, BM_ELEM_HIDDEN)) {
-          continue;
-        }
-        BMIter iter_l;
-        BMLoop *l;
-
-        BM_ITER_ELEM (l, &iter_l, v, BM_LOOPS_OF_VERT) {
-          BM_elem_flag_enable(l->e, BM_ELEM_HIDDEN);
-          BM_elem_flag_enable(l->f, BM_ELEM_HIDDEN);
-        }
-      }
-      break;
-    }
-    case bke::pbvh::Type::Grids: {
-      Mesh &mesh = *id_cast<Mesh *>(object.data);
-      const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
-      const BitGroupVector<> &grid_hidden = subdiv_ccg.grid_hidden;
-      const CCGKey key = BKE_subdiv_ccg_key_top_level(subdiv_ccg);
-      const OffsetIndices faces = mesh.faces();
-
-      IndexMaskMemory memory;
-      const IndexMask hidden_faces =
-          !grid_hidden.is_empty() ?
-              IndexMask::from_predicate(
-                  faces.index_range(),
-                  memory,
-                  [&](const int i) {
-                    const IndexRange face = faces[i];
-                    return std::any_of(face.begin(), face.end(), [&](const int corner) {
-                      return grid_hidden[corner][key.grid_area - 1];
-                    });
-                  },
-                  exec_mode::grain_size(1024)) :
-              IndexMask();
-
-      MutableAttributeAccessor attributes = mesh.attributes_for_write();
-      if (hidden_faces.is_empty()) {
-        attributes.remove(".hide_poly");
-      }
-      else {
-        SpanAttributeWriter<bool> hide_poly = attributes.lookup_or_add_for_write_span<bool>(
-            ".hide_poly", AttrDomain::Face, AttributeInitConstruct());
-        hide_poly.span.fill(false);
-        index_mask::masked_fill(hide_poly.span, true, hidden_faces);
-        hide_poly.finish();
-      }
-
-      mesh_hide_face_flush(mesh);
-      break;
-    }
-  }
-}
-
 namespace bke::pbvh {
 
 IndexMask all_leaf_nodes(const Tree &pbvh, IndexMaskMemory &memory)
@@ -2570,6 +3919,112 @@ IndexMask search_nodes(const Tree &pbvh,
       pbvh.nodes_);
   std::ranges::sort(indices);
   return IndexMask::from_indices(indices.as_span(), memory);
+}
+
+static rctf calc_node_screen_bounds(const Bounds<float3> bounds, const float4x4 &mvp)
+{
+  rctf screen_rect;
+  BLI_rctf_init_minmax(&screen_rect);
+
+  auto expand_rect = [&](float4 clip) {
+    const float w = (math::abs(clip.w) > 1e-6f) ? clip.w : 1e-6f;
+    float2 ncd{clip.x / w, clip.y / w};
+    screen_rect.xmin = math::min(screen_rect.xmin, ncd.x);
+    screen_rect.ymin = math::min(screen_rect.ymin, ncd.y);
+    screen_rect.xmax = math::max(screen_rect.xmax, ncd.x);
+    screen_rect.ymax = math::max(screen_rect.ymax, ncd.y);
+  };
+
+  const float3 bmin = bounds.min;
+  const float3 bmax = bounds.max;
+  const float3 corners[8] = {{bmin.x, bmin.y, bmin.z},
+                             {bmax.x, bmin.y, bmin.z},
+                             {bmax.x, bmax.y, bmin.z},
+                             {bmin.x, bmax.y, bmin.z},
+                             {bmin.x, bmin.y, bmax.z},
+                             {bmax.x, bmin.y, bmax.z},
+                             {bmax.x, bmax.y, bmax.z},
+                             {bmin.x, bmax.y, bmax.z}};
+
+  std::array<float4, 8> clip;
+  std::array<bool, 8> in_front;
+  int in_front_cnt = 0;
+
+  for (int i = 0; i < 8; ++i) {
+    clip[i] = mvp * float4(corners[i], 1.0f);
+    in_front[i] = clip[i].w > 0.0f && (clip[i].z >= -clip[i].w);
+    if (in_front[i]) {
+      expand_rect(clip[i]);
+      in_front_cnt++;
+    }
+  }
+
+  if (in_front_cnt > 0 && in_front_cnt < 8) {
+    constexpr std::array<int2, 12> edges = {int2{0, 1},
+                                            int2{2, 3},
+                                            int2{4, 5},
+                                            int2{6, 7},
+                                            int2{0, 3},
+                                            int2{1, 2},
+                                            int2{4, 7},
+                                            int2{5, 6},
+                                            int2{0, 4},
+                                            int2{1, 5},
+                                            int2{2, 6},
+                                            int2{3, 7}};
+    for (const int2 &edge : edges) {
+      const int a = edge[0];
+      const int b = edge[1];
+      if (in_front[a] != in_front[b]) {
+        const float dA = clip[a].z + clip[a].w;
+        const float dB = clip[b].z + clip[b].w;
+        const float t = dA / (dA - dB);
+        expand_rect(math::interpolate(clip[a], clip[b], t));
+      }
+    }
+  }
+
+  screen_rect.xmin = math::max(screen_rect.xmin, -1.0f);
+  screen_rect.ymin = math::max(screen_rect.ymin, -1.0f);
+  screen_rect.xmax = math::min(screen_rect.xmax, 1.0f);
+  screen_rect.ymax = math::min(screen_rect.ymax, 1.0f);
+
+  if (screen_rect.xmin > screen_rect.xmax || screen_rect.ymin > screen_rect.ymax) {
+    BLI_rctf_init(&screen_rect, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  return screen_rect;
+}
+
+rctf calc_screen_bounds(const Tree &pbvh, const float4x4 &mvp, const IndexMask &node_mask)
+{
+  rctf screen_rect;
+  BLI_rctf_init_minmax(&screen_rect);
+
+  std::visit(
+      [&](const auto &nodes) {
+        node_mask.foreach_index([&](const int node_index) {
+          const rctf node_rect = calc_node_screen_bounds(nodes[node_index].bounds_, mvp);
+          BLI_rctf_union(&screen_rect, &node_rect);
+        });
+      },
+      pbvh.nodes_);
+
+  if (screen_rect.xmin > screen_rect.xmax || screen_rect.ymin > screen_rect.ymax) {
+    BLI_rctf_init(&screen_rect, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+
+  return screen_rect;
+}
+
+IndexMask filter_nodes_by_screen_rect(const Tree &pbvh,
+                                      const rctf screen_rect,
+                                      const float4x4 &mvp,
+                                      IndexMaskMemory &memory)
+{
+  return search_nodes(pbvh, memory, [&](const bke::pbvh::Node &node) {
+    const rctf node_rect = calc_node_screen_bounds(node.bounds_, mvp);
+    return BLI_rctf_isect(&screen_rect, &node_rect, nullptr);
+  });
 }
 
 }  // namespace bke::pbvh

@@ -53,18 +53,136 @@ namespace blender::ed::sculpt_paint::hide {
 /** \name Public API
  * \{ */
 
+static void multires_hide_vert_flush(Multiresolution &multires)
+{
+  bke::MutableAttributeAccessor attributes = multires.attributes_for_write();
+
+  const VArray<bool> hidden_verts = *attributes.lookup_or_default<bool>(
+      ".hide_vert", bke::AttrDomain::Point, false);
+
+  if (hidden_verts.is_single() && !hidden_verts.get_internal_single()) {
+    attributes.remove(".hide_poly");
+    return;
+  }
+
+  const MutableSpan<bool> hidden_faces = multires.hidden_faces_for_write();
+  const Span<int> corner_verts = multires.corner_verts();
+
+  threading::parallel_for(hidden_faces.index_range(), 4096, [&](const IndexRange range) {
+    for (const int subface_idx : range) {
+      const int v0 = corner_verts[subface_idx * 4 + 0];
+      const int v1 = corner_verts[subface_idx * 4 + 1];
+      const int v2 = corner_verts[subface_idx * 4 + 2];
+      const int v3 = corner_verts[subface_idx * 4 + 3];
+
+      hidden_faces[subface_idx] = hidden_verts[v0] || hidden_verts[v1] || hidden_verts[v2] ||
+                                  hidden_verts[v3];
+    }
+  });
+}
+
+void sync_all_from_verts(Object &object)
+{
+  using namespace blender::bke;
+  const SculptSession &ss = *object.runtime->sculpt_session;
+  const pbvh::Tree &pbvh = *object::pbvh_get(object);
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+
+  switch (pbvh.type()) {
+    case bke::pbvh::Type::Mesh: {
+      mesh_hide_vert_flush(mesh);
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      multires_hide_vert_flush(*mesh.multires);
+      break;
+    }
+    case bke::pbvh::Type::BMesh: {
+      BMesh &bm = *ss.bm;
+      BMIter iter;
+      BMVert *v;
+      BMEdge *e;
+      BMFace *f;
+
+      BM_ITER_MESH (f, &iter, &bm, BM_FACES_OF_MESH) {
+        BM_elem_flag_disable(f, BM_ELEM_HIDDEN);
+      }
+
+      BM_ITER_MESH (e, &iter, &bm, BM_EDGES_OF_MESH) {
+        BM_elem_flag_disable(e, BM_ELEM_HIDDEN);
+      }
+
+      BM_ITER_MESH (v, &iter, &bm, BM_VERTS_OF_MESH) {
+        if (!BM_elem_flag_test(v, BM_ELEM_HIDDEN)) {
+          continue;
+        }
+        BMIter iter_l;
+        BMLoop *l;
+
+        BM_ITER_ELEM (l, &iter_l, v, BM_LOOPS_OF_VERT) {
+          BM_elem_flag_enable(l->e, BM_ELEM_HIDDEN);
+          BM_elem_flag_enable(l->f, BM_ELEM_HIDDEN);
+        }
+      }
+      break;
+    }
+    case bke::pbvh::Type::Grids: {
+      Mesh &mesh = *id_cast<Mesh *>(object.data);
+      const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
+      const BitGroupVector<> &grid_hidden = subdiv_ccg.grid_hidden;
+      const CCGKey key = BKE_subdiv_ccg_key_top_level(subdiv_ccg);
+      const OffsetIndices faces = mesh.faces();
+
+      IndexMaskMemory memory;
+      const IndexMask hidden_faces =
+          !grid_hidden.is_empty() ?
+              IndexMask::from_predicate(
+                  faces.index_range(),
+                  memory,
+                  [&](const int i) {
+                    const IndexRange face = faces[i];
+                    return std::any_of(face.begin(), face.end(), [&](const int corner) {
+                      return grid_hidden[corner][key.grid_area - 1];
+                    });
+                  },
+                  exec_mode::grain_size(1024)) :
+              IndexMask();
+
+      MutableAttributeAccessor attributes = mesh.attributes_for_write();
+      if (hidden_faces.is_empty()) {
+        attributes.remove(".hide_poly");
+      }
+      else {
+        SpanAttributeWriter<bool> hide_poly = attributes.lookup_or_add_for_write_span<bool>(
+            ".hide_poly", AttrDomain::Face, AttributeInitConstruct());
+        hide_poly.span.fill(false);
+        index_mask::masked_fill(hide_poly.span, true, hidden_faces);
+        hide_poly.finish();
+      }
+
+      mesh_hide_face_flush(mesh);
+      break;
+    }
+  }
+}
+
 void sync_all_from_faces(Object &object)
 {
   SculptSession &ss = *object.runtime->sculpt_session;
   Mesh &mesh = *id_cast<Mesh *>(object.data);
 
   islands::invalidate(ss);
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
 
-  switch (bke::object::pbvh_get(object)->type()) {
+  switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       /* We may have adjusted the ".hide_poly" attribute, now make the hide status attributes for
        * vertices and edges consistent. */
       bke::mesh_hide_face_flush(mesh);
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      mesh.multires->hide_face_flush();
       break;
     }
     case bke::pbvh::Type::Grids: {
@@ -148,6 +266,36 @@ void mesh_show_all(const Depsgraph &depsgraph, Object &object, const IndexMask &
   pbvh.update_visibility(object);
 }
 
+void multires_show_all(Depsgraph &depsgraph, Object &object, const IndexMask &node_mask)
+{
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *mesh.multires;
+  const int grid_size = multires.grid_size();
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  const Span<bool> hidden_verts = multires.hidden_verts();
+
+  if (!hidden_verts.is_empty()) {
+    IndexMaskMemory memory;
+    const IndexMask changed_nodes = IndexMask::from_predicate(
+        node_mask,
+        memory,
+        [&](const int i) {
+          const Span<bool> node_hidden = hidden_verts.slice(nodes[i].range(grid_size));
+          return std::any_of(
+              node_hidden.begin(), node_hidden.end(), [&](const bool value) { return value; });
+        },
+        exec_mode::grain_size(1));
+
+    undo::push_nodes(depsgraph, object, changed_nodes, undo::Type::HideVert);
+    pbvh.tag_visibility_changed(changed_nodes);
+  }
+
+  multires.hidden_verts_free();
+  multires_hide_vert_flush(multires);
+  pbvh.update_visibility(object);
+}
+
 void grids_show_all(Depsgraph &depsgraph, Object &object, const IndexMask &node_mask)
 {
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -175,7 +323,7 @@ void grids_show_all(Depsgraph &depsgraph, Object &object, const IndexMask &node_
   }
 
   BKE_subdiv_ccg_grid_hidden_free(subdiv_ccg);
-  BKE_pbvh_sync_visibility_from_verts(object);
+  sync_all_from_verts(object);
   pbvh.update_visibility(object);
   multires_mark_as_modified(&depsgraph, &object, MULTIRES_HIDDEN_MODIFIED);
 }
@@ -328,6 +476,50 @@ static void vert_hide_update(const Depsgraph &depsgraph,
   }
 }
 
+static void multires_hide_update(
+    Depsgraph &depsgraph,
+    Object &object,
+    const IndexMask &node_mask,
+    const FunctionRef<void(const IndexRange, MutableSpan<bool>)> calc_hide)
+{
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *mesh.multires;
+  const int grid_size = multires.grid_size();
+  const MutableSpan<bool> hidden = multires.hidden_verts_for_write();
+  Array<bool> node_changed(node_mask.min_array_size(), false);
+
+  node_mask.foreach_index(
+      [&](const int i) {
+        const IndexRange node_range = nodes[i].range(grid_size);
+        MutableSpan<bool> node_hidden = hidden.slice(node_range);
+        Array<bool> hidden_new(node_hidden.size());
+        MutableSpan<bool>(hidden_new).copy_from(node_hidden);
+
+        calc_hide(node_range, hidden_new);
+
+        if (std::equal(
+                node_hidden.begin(), node_hidden.end(), hidden_new.begin(), hidden_new.end())) {
+          return;
+        }
+
+        node_changed[i] = true;
+        undo::push_node(depsgraph, object, &nodes[i], undo::Type::HideVert);
+        node_hidden.copy_from(hidden_new);
+        bke::pbvh::node_update_visibility_multires(hidden, grid_size, nodes[i]);
+      },
+      exec_mode::grain_size(1));
+
+  IndexMaskMemory memory;
+  const IndexMask changed_nodes = IndexMask::from_bools(node_changed, memory);
+  if (changed_nodes.is_empty()) {
+    return;
+  }
+  pbvh.tag_visibility_changed(changed_nodes);
+  sync_all_from_verts(object);
+}
+
 static void grid_hide_update(Depsgraph &depsgraph,
                              Object &object,
                              const IndexMask &node_mask,
@@ -382,7 +574,7 @@ static void grid_hide_update(Depsgraph &depsgraph,
   }
   pbvh.tag_visibility_changed(node_mask);
   multires_mark_as_modified(&depsgraph, &object, MULTIRES_HIDDEN_MODIFIED);
-  BKE_pbvh_sync_visibility_from_verts(object);
+  sync_all_from_verts(object);
 }
 
 static void partialvis_update_bmesh_verts(const Set<BMVert *, 0> &verts,
@@ -491,6 +683,24 @@ static void partialvis_all_update_mesh(const Depsgraph &depsgraph,
   }
 }
 
+static void partialvis_all_update_multires(Depsgraph &depsgraph,
+                                           Object &object,
+                                           const VisAction action,
+                                           const IndexMask &node_mask)
+{
+  switch (action) {
+    case VisAction::Hide:
+      multires_hide_update(
+          depsgraph, object, node_mask, [&](const IndexRange /*range*/, MutableSpan<bool> hidden) {
+            hidden.fill(true);
+          });
+      break;
+    case VisAction::Show:
+      multires_show_all(depsgraph, object, node_mask);
+      break;
+  }
+}
+
 static void partialvis_all_update_grids(Depsgraph &depsgraph,
                                         Object &object,
                                         const VisAction action,
@@ -545,6 +755,9 @@ static wmOperatorStatus hide_show_all_exec(bContext *C, wmOperator *op)
     case bke::pbvh::Type::Mesh:
       partialvis_all_update_mesh(*depsgraph, ob, action, node_mask);
       break;
+    case bke::pbvh::Type::Multires:
+      partialvis_all_update_multires(*depsgraph, ob, action, node_mask);
+      break;
     case bke::pbvh::Type::Grids:
       partialvis_all_update_grids(*depsgraph, ob, action, node_mask);
       break;
@@ -585,6 +798,36 @@ static void partialvis_masked_update_mesh(const Depsgraph &depsgraph,
           for (const int i : verts.index_range()) {
             if (mask[verts[i]] > 0.5f) {
               hide[i] = value;
+            }
+          }
+        });
+  }
+}
+
+static void partialvis_masked_update_multires(Depsgraph &depsgraph,
+                                              Object &object,
+                                              const VisAction action,
+                                              const IndexMask &node_mask)
+{
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *mesh.multires;
+
+  if (action == VisAction::Show && multires.hidden_verts().is_empty()) {
+    return;
+  }
+
+  const bool value = action_to_hide(action);
+  const Span<float> masks = multires.masks();
+
+  if (action == VisAction::Show && masks.is_empty()) {
+    multires_show_all(depsgraph, object, node_mask);
+  }
+  else if (!masks.is_empty()) {
+    multires_hide_update(
+        depsgraph, object, node_mask, [&](const IndexRange range, MutableSpan<bool> hidden) {
+          for (const int i : range.index_range()) {
+            if (masks[range[i]] > 0.5f) {
+              hidden[i] = value;
             }
           }
         });
@@ -661,6 +904,9 @@ static wmOperatorStatus hide_show_masked_exec(bContext *C, wmOperator *op)
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       partialvis_masked_update_mesh(*depsgraph, ob, action, node_mask);
+      break;
+    case bke::pbvh::Type::Multires:
+      partialvis_masked_update_multires(*depsgraph, ob, action, node_mask);
       break;
     case bke::pbvh::Type::Grids:
       partialvis_masked_update_grids(*depsgraph, ob, action, node_mask);
@@ -753,6 +999,42 @@ static void invert_visibility_mesh(const Depsgraph &depsgraph,
   pbvh.update_visibility(object);
 }
 
+static void invert_visibility_multires(Depsgraph &depsgraph,
+                                       Object &object,
+                                       const IndexMask &node_mask)
+{
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  const Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const int faces_per_corner = multires.faces_per_corner();
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const MutableSpan<bool> hidden_faces = multires.hidden_faces_for_write();
+
+  undo::push_nodes(depsgraph, object, node_mask, undo::Type::HideFace);
+
+  node_mask.foreach_index(
+      [&](const int i) {
+        for (const int face_idx : nodes[i].faces()) {
+          const IndexRange face_range = base_faces[face_idx];
+          const int first_subface_idx = face_range.start() * faces_per_corner;
+          const int subfaces_num = face_range.size() * faces_per_corner;
+
+          for (const int j : IndexRange(subfaces_num)) {
+            const int idx = first_subface_idx + j;
+            hidden_faces[idx] = !hidden_faces[idx];
+          }
+        }
+      },
+      exec_mode::grain_size(1));
+
+  multires.hide_face_flush();
+  pbvh.tag_visibility_changed(node_mask);
+  pbvh.update_visibility(object);
+}
+
 static void invert_visibility_grids(Depsgraph &depsgraph,
                                     Object &object,
                                     const IndexMask &node_mask)
@@ -775,7 +1057,7 @@ static void invert_visibility_grids(Depsgraph &depsgraph,
 
   pbvh.tag_visibility_changed(node_mask);
   multires_mark_as_modified(&depsgraph, &object, MULTIRES_HIDDEN_MODIFIED);
-  BKE_pbvh_sync_visibility_from_verts(object);
+  sync_all_from_verts(object);
 }
 
 static void invert_visibility_bmesh(const Depsgraph &depsgraph,
@@ -816,6 +1098,9 @@ static wmOperatorStatus visibility_invert_exec(bContext *C, wmOperator *op)
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       invert_visibility_mesh(depsgraph, object, node_mask);
+      break;
+    case bke::pbvh::Type::Multires:
+      invert_visibility_multires(depsgraph, object, node_mask);
       break;
     case bke::pbvh::Type::Grids:
       invert_visibility_grids(depsgraph, object, node_mask);
@@ -1015,6 +1300,183 @@ static void grow_shrink_visibility_mesh(const Depsgraph &depsgraph,
   hide_vert.finish();
 }
 
+template<bool value>
+static void affect_visibility_quad(const int v0,
+                                   const int v1,
+                                   const int v2,
+                                   const int v3,
+                                   const Span<bool> read_buffer,
+                                   MutableSpan<bool> write_buffer)
+{
+  if (read_buffer[v0] == value) {
+    write_buffer[v3] = value;
+    write_buffer[v1] = value;
+  }
+  if (read_buffer[v1] == value) {
+    write_buffer[v0] = value;
+    write_buffer[v2] = value;
+  }
+  if (read_buffer[v2] == value) {
+    write_buffer[v1] = value;
+    write_buffer[v3] = value;
+  }
+  if (read_buffer[v3] == value) {
+    write_buffer[v2] = value;
+    write_buffer[v0] = value;
+  }
+}
+
+static void flush_face_changes_multires(const Span<int> corner_verts,
+                                        const Span<bool> hide_vert,
+                                        MutableSpan<bool> hide_face)
+{
+  threading::parallel_for(hide_face.index_range(), 4096, [&](const IndexRange range) {
+    for (const int subface_idx : range) {
+      const int v0 = corner_verts[subface_idx * 4 + 0];
+      const int v1 = corner_verts[subface_idx * 4 + 1];
+      const int v2 = corner_verts[subface_idx * 4 + 2];
+      const int v3 = corner_verts[subface_idx * 4 + 3];
+
+      hide_face[subface_idx] = hide_vert[v0] || hide_vert[v1] || hide_vert[v2] || hide_vert[v3];
+    }
+  });
+}
+
+static void propagate_vertex_visibility_multires(Multiresolution &multires,
+                                                 DualBuffer &buffers,
+                                                 const VisAction action,
+                                                 const int iterations)
+{
+  const Span<int> corner_verts = multires.corner_verts();
+  const MutableSpan<bool> hidden_faces = multires.hidden_faces_for_write();
+
+  for (const int i : IndexRange(iterations)) {
+    Span<bool> read_buffer = buffers.read_buffer(i);
+    MutableSpan<bool> write_buffer = buffers.write_buffer(i);
+    write_buffer.copy_from(read_buffer);
+
+    threading::parallel_for(hidden_faces.index_range(), 4096, [&](const IndexRange range) {
+      for (const int subface_idx : range) {
+        if (!hidden_faces[subface_idx]) {
+          continue;
+        }
+
+        const int v0 = corner_verts[subface_idx * 4 + 0];
+        const int v1 = corner_verts[subface_idx * 4 + 1];
+        const int v2 = corner_verts[subface_idx * 4 + 2];
+        const int v3 = corner_verts[subface_idx * 4 + 3];
+
+        if (action == VisAction::Hide) {
+          affect_visibility_quad<true>(v0, v1, v2, v3, read_buffer, write_buffer);
+        }
+        else {
+          affect_visibility_quad<false>(v0, v1, v2, v3, read_buffer, write_buffer);
+        }
+      }
+    });
+
+    flush_face_changes_multires(corner_verts, write_buffer, hidden_faces);
+  }
+}
+
+static void grow_shrink_visibility_multires(const Depsgraph &depsgraph,
+                                            Object &object,
+                                            const IndexMask &node_mask,
+                                            const VisAction action,
+                                            const int iterations)
+{
+  const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+
+  if (multires.hidden_verts().is_empty()) {
+    return;
+  }
+
+  const MutableSpan<bool> hidden_verts = multires.hidden_verts_for_write();
+  const MutableSpan<bool> hidden_faces = multires.ensure_hidden_faces();
+  const Span<int> corner_verts = multires.corner_verts();
+
+  DualBuffer buffers;
+  buffers.back.reinitialize(hidden_verts.size());
+  buffers.front.reinitialize(hidden_verts.size());
+  buffers.back.as_mutable_span().copy_from(hidden_verts);
+  buffers.front.as_mutable_span().copy_from(hidden_verts);
+
+  Array<bool> orig_hidden_verts(hidden_verts.size());
+  orig_hidden_verts.as_mutable_span().copy_from(hidden_verts);
+
+  flush_face_changes_multires(corner_verts, hidden_verts, hidden_faces);
+
+  Array<bool> orig_hidden_faces(hidden_faces.size());
+  orig_hidden_faces.as_mutable_span().copy_from(hidden_faces);
+
+  propagate_vertex_visibility_multires(multires, buffers, action, iterations);
+
+  const Span<bool> last_buffer = buffers.write_buffer(iterations - 1);
+
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  const int grid_size = multires.grid_size();
+  const int faces_per_corner = multires.faces_per_corner();
+  const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+  const OffsetIndices<int> base_faces = base_topo.faces;
+
+  Array<bool> undo_nodes(node_mask.min_array_size(), false);
+  Array<bool> vis_nodes(node_mask.min_array_size(), false);
+
+  node_mask.foreach_index(
+      [&](const int i) {
+        const IndexRange node_range = nodes[i].range(grid_size);
+        const Span<bool> old_verts = orig_hidden_verts.as_span().slice(node_range);
+        const Span<bool> new_verts = last_buffer.slice(node_range);
+        const bool vert_changed = !std::equal(
+            old_verts.begin(), old_verts.end(), new_verts.begin());
+
+        if (vert_changed) {
+          undo_nodes[i] = true;
+        }
+
+        bool face_changed = false;
+        for (const int face_idx : nodes[i].faces()) {
+          const IndexRange face_range = base_faces[face_idx];
+          const int first_subface_idx = face_range.start() * faces_per_corner;
+          const int subfaces_num = face_range.size() * faces_per_corner;
+          const Span<bool> orig_sub = orig_hidden_faces.as_span().slice(first_subface_idx,
+                                                                        subfaces_num);
+          const Span<bool> new_sub = hidden_faces.slice(first_subface_idx, subfaces_num);
+
+          if (!std::equal(orig_sub.begin(), orig_sub.end(), new_sub.begin())) {
+            face_changed = true;
+            break;
+          }
+        }
+
+        if (vert_changed || face_changed) {
+          vis_nodes[i] = true;
+        }
+      },
+      exec_mode::grain_size(1));
+
+  IndexMaskMemory memory;
+  const IndexMask undo_mask = IndexMask::from_bools(undo_nodes, memory);
+  if (undo_mask.is_empty()) {
+    return;
+  }
+
+  undo::push_nodes(depsgraph, object, undo_mask, undo::Type::HideVert);
+  hidden_verts.copy_from(last_buffer);
+
+  const IndexMask vis_mask = IndexMask::from_bools(vis_nodes, memory);
+  vis_mask.foreach_index(
+      [&](const int i) {
+        bke::pbvh::node_update_visibility_multires(hidden_verts, grid_size, nodes[i]);
+      },
+      exec_mode::grain_size(1));
+
+  pbvh.tag_visibility_changed(vis_mask);
+  pbvh.update_visibility(object);
+}
+
 struct DualBitBuffer {
   BitGroupVector<> front;
   BitGroupVector<> back;
@@ -1102,7 +1564,7 @@ static void grow_shrink_visibility_grid(Depsgraph &depsgraph,
   pbvh.update_visibility(object);
 
   multires_mark_as_modified(&depsgraph, &object, MULTIRES_HIDDEN_MODIFIED);
-  BKE_pbvh_sync_visibility_from_verts(object);
+  sync_all_from_verts(object);
 }
 
 static Array<bool> duplicate_visibility_bmesh(const Object &object)
@@ -1165,6 +1627,9 @@ static wmOperatorStatus visibility_filter_exec(bContext *C, wmOperator *op)
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       grow_shrink_visibility_mesh(depsgraph, object, node_mask, mode, iterations);
+      break;
+    case bke::pbvh::Type::Multires:
+      grow_shrink_visibility_multires(depsgraph, object, node_mask, mode, iterations);
       break;
     case bke::pbvh::Type::Grids:
       grow_shrink_visibility_grid(depsgraph, object, node_mask, mode, iterations);
@@ -1275,6 +1740,30 @@ static void partialvis_gesture_update_mesh(gesture::GestureData &gesture_data)
       });
 }
 
+static void partialvis_gesture_update_multires(Depsgraph &depsgraph,
+                                               gesture::GestureData &gesture_data)
+{
+  HideShowOperation *operation = reinterpret_cast<HideShowOperation *>(gesture_data.operation);
+  Object *object = gesture_data.vc.obact;
+  const VisAction action = operation->action;
+  const IndexMask &node_mask = gesture_data.node_mask;
+
+  const Mesh &base_mesh = *id_cast<Mesh *>(object->data);
+  Multiresolution &multires = *base_mesh.multires;
+
+  const bool value = action_to_hide(action);
+  multires_hide_update(
+      depsgraph, *object, node_mask, [&](const IndexRange range, MutableSpan<bool> hidden) {
+        const Span<float3> positions = multires.positions().slice(range);
+        const Span<float3> normals = multires.normals().slice(range);
+        for (const int i : positions.index_range()) {
+          if (gesture::is_affected(gesture_data, positions[i], normals[i])) {
+            hidden[i] = value;
+          }
+        }
+      });
+}
+
 static void partialvis_gesture_update_grids(Depsgraph &depsgraph,
                                             gesture::GestureData &gesture_data)
 {
@@ -1354,6 +1843,9 @@ static void hide_show_apply_for_symmetry_pass(bContext &C, gesture::GestureData 
   switch (bke::object::pbvh_get(*gesture_data.vc.obact)->type()) {
     case bke::pbvh::Type::Mesh:
       partialvis_gesture_update_mesh(gesture_data);
+      break;
+    case bke::pbvh::Type::Multires:
+      partialvis_gesture_update_multires(*depsgraph, gesture_data);
       break;
     case bke::pbvh::Type::Grids:
       partialvis_gesture_update_grids(*depsgraph, gesture_data);

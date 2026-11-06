@@ -5422,6 +5422,10 @@ def km_sculpt(params):
          {"properties": [("level", -1), ("relative", True), ("ensure_modifier", False)]}),
         ("object.subdivision_set", {"type": 'TWO', "value": 'PRESS', "alt": True, "repeat": True},
          {"properties": [("level", 1), ("relative", True), ("ensure_modifier", False)]}),
+        # Multiresolution
+        ("sculpt.multires_subdiv", {"type": 'D', "value": 'PRESS', "ctrl": True}, None),
+        ("sculpt.multires_switch_up", {"type": 'D', "value": 'PRESS', "repeat": True}, None),
+        ("sculpt.multires_switch_down", {"type": 'D', "value": 'PRESS', "shift": True, "repeat": True}, None),
         # Mask
         ("paint.mask_flood_fill", {"type": 'M', "value": 'PRESS', "alt": True},
          {"properties": [("mode", 'VALUE'), ("value", 0.0)]}),

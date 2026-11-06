@@ -100,6 +100,40 @@ BLI_NOINLINE static void calc_neighbor_influence(const Span<float3> vert_positio
   }
 }
 
+BLI_NOINLINE static void calc_neighbor_influence(
+    const bke::pbvh::Tree &pbvh,
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const bke::pbvh::MultiresNode &node,
+    const MutableSpan<float3> translations)
+{
+  using MultiresCoord = bke::multiresolution::MultiresCoord;
+
+  const int node_offset = node.offset();
+  const int grid_size = multires.grid_size();
+  const Span<float3> positions = multires.positions();
+  const Span<bool> hidden = multires.hidden_verts();
+  const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+  Vector<MultiresCoord> neighbors;
+
+  node.foreach_coord(grid_size, [&](const int node_vert, MultiresCoord coord) {
+    const int vert = node_vert + node_offset;
+
+    const float3 &position = positions[vert];
+    const float3 &dir = translations[node_vert];
+
+    multires.calc_neighbors(coord, base_topo, grid_size, offsets, hidden, neighbors);
+
+    float3 final_translation(0);
+    for (const MultiresCoord neighbor : neighbors) {
+      const int neighbor_idx = neighbor.to_index(offsets);
+      add_neighbor_influence(position, dir, positions[neighbor_idx], final_translation);
+    }
+
+    translations[node_vert] = final_translation;
+  });
+}
+
 BLI_NOINLINE static void calc_neighbor_influence(const SubdivCCG &subdiv_ccg,
                                                  const Span<int> grids,
                                                  const MutableSpan<float3> translations)
@@ -227,6 +261,67 @@ static void calc_faces(const Depsgraph &depsgraph,
 
   clip_and_lock_translations(sd, ss, position_data.eval, verts, translations);
   position_data.deform(translations, verts);
+}
+
+static void calc_multires(const Depsgraph &depsgraph,
+                          const Sculpt &sd,
+                          Object &object,
+                          Multiresolution &multires,
+                          const bke::multiresolution::BaseTopology &base_topo,
+                          const bke::pbvh::Tree &pbvh,
+                          const Brush &brush,
+                          const float4x4 &mat,
+                          const bke::pbvh::MultiresNode &node,
+                          const MultiresDeformData &deform_data)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = deform_data.positions.slice(node_range);
+  const OrigPositionData orig_data = orig_position_data_get_multires(object, node);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(positions.size());
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> distances(positions.size());
+
+  if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+    Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> local_positions(positions.size());
+    calc_cube_tip_factors_common_multires(depsgraph,
+                                          brush,
+                                          object,
+                                          mat,
+                                          multires,
+                                          base_topo,
+                                          orig_data.positions,
+                                          orig_data.normals,
+                                          local_positions,
+                                          node,
+                                          factors,
+                                          distances);
+  }
+  else {
+    calc_factors_common_multires(depsgraph,
+                                 brush,
+                                 object,
+                                 multires,
+                                 base_topo,
+                                 orig_data.positions,
+                                 orig_data.normals,
+                                 node,
+                                 factors,
+                                 distances);
+  }
+
+  scale_factors(factors, cache.bstrength);
+
+  Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> translations(positions.size());
+  calc_translation_directions(brush, cache, positions, translations);
+  calc_neighbor_influence(pbvh, multires, base_topo, node, translations);
+  scale_translations(translations, factors);
+
+  clip_and_lock_translations(sd, ss, orig_data.positions, translations);
+  deform_data.deform(node_range, translations);
 }
 
 static void calc_grids(const Depsgraph &depsgraph,
@@ -378,6 +473,30 @@ void do_topology_slide_brush(const Depsgraph &depsgraph,
                        tls,
                        position_data);
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      Mesh &mesh = *id_cast<Mesh *>(object.data);
+      Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDeformData deform_data(mesh);
+      node_mask.foreach_index(
+          [&](const int i) {
+            calc_multires(depsgraph,
+                          sd,
+                          object,
+                          multires,
+                          base_topo,
+                          pbvh,
+                          brush,
+                          mat,
+                          nodes[i],
+                          deform_data);
+            bke::pbvh::update_node_bounds_multires(
+                multires.grid_size(), multires.positions(), pbvh.offsets, nodes[i]);
           },
           exec_mode::grain_size(1));
       break;

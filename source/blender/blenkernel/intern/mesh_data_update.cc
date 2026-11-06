@@ -11,6 +11,7 @@
 #include "DNA_key_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_meshdata_types.h"
+#include "DNA_multires_types.h"
 #include "DNA_object_types.h"
 #include "DNA_scene_types.h"
 
@@ -37,9 +38,11 @@
 #include "BKE_mesh_wrapper.hh"
 #include "BKE_modifier.hh"
 #include "BKE_multires.hh"
+#include "BKE_multiresolution.hh"
 #include "BKE_object.hh"
 #include "BKE_object_types.hh"
 #include "BKE_paint.hh"
+#include "BKE_sculpt_layer.hh"
 
 #include "BKE_shrinkwrap.hh"
 #include "DEG_depsgraph.hh"
@@ -931,6 +934,29 @@ static void mesh_build_extra_data(const Depsgraph &depsgraph,
   }
 }
 
+static void apply_sculpt_layers_to_evaluated_meshes(Object &object_orig, GeometrySet &geometry_set)
+{
+  const Mesh &mesh_orig = *id_cast<const Mesh *>(object_orig.data);
+  if (!bke::sculpt_layer::mesh_has_visible_layers(mesh_orig)) {
+    return;
+  }
+
+  if (geometry_set.has<GeometryComponentEditData>()) {
+    auto &component = geometry_set.get_component_for_write<GeometryComponentEditData>();
+    if (component.mesh_edit_hints_ && component.mesh_edit_hints_->mesh_deform) {
+      auto &deform_component = static_cast<MeshComponent &>(
+          component.mesh_edit_hints_->mesh_deform.ensure_mutable_inplace());
+      if (Mesh *mesh_deform = deform_component.get_for_write()) {
+        bke::sculpt_layer::evaluate_deform(mesh_orig, *mesh_deform);
+      }
+    }
+  }
+
+  if (Mesh *mesh_eval_for_write = geometry_set.get_mesh_for_write()) {
+    bke::sculpt_layer::evaluate_final(mesh_orig, *mesh_eval_for_write);
+  }
+}
+
 static void mesh_build_data(Depsgraph &depsgraph,
                             const Scene &scene,
                             Object &ob,
@@ -947,6 +973,29 @@ static void mesh_build_data(Depsgraph &depsgraph,
   if (Key *key = mesh_input.key) {
     mesh_eval_assign_key(geometry_set, key);
   }
+
+  Object &object_orig = *DEG_get_original(&ob);
+  const bool use_render = (DEG_get_mode(&depsgraph) == DAG_EVAL_RENDER);
+  if (use_render || (ob.mode & OB_MODE_ALL_SCULPT) == 0) {
+    const Mesh &mesh_orig = *id_cast<const Mesh *>(object_orig.data);
+
+    const int eval_level = mesh_orig.multires == nullptr ?
+                               0 :
+                               (use_render ? mesh_orig.multires->render_level :
+                                             mesh_orig.multires->view_level);
+    if (mesh_orig.multires && eval_level > 0 &&
+        bke::multiresolution::base_topology_matches(mesh_orig))
+    {
+      Mesh *multires_mesh = Multiresolution::eval_to_mesh(mesh_orig, eval_level);
+      geometry_set.replace_mesh(multires_mesh);
+      if (Key *key = mesh_input.key) {
+        mesh_eval_assign_key(geometry_set, key);
+      }
+    }
+  }
+
+  apply_sculpt_layers_to_evaluated_meshes(object_orig, geometry_set);
+
   const Mesh *mesh_eval = geometry_set.get_mesh();
 
   BKE_object_eval_assign_data(&ob, &const_cast<ID &>(mesh_eval->id), false);

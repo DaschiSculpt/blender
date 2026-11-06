@@ -107,13 +107,18 @@ set(SRC
   mesh/sculpt_geodesic.cc
   mesh/sculpt_gesture.cc
   mesh/sculpt_hide.cc
+  mesh/sculpt_layer.cc
   mesh/sculpt_mask_extract.cc
   mesh/sculpt_mask_init.cc
+  mesh/sculpt_morph.cc
+  mesh/sculpt_multires.cc
+  mesh/sculpt_multires_bake.cc
   mesh/sculpt_ops.cc
   mesh/sculpt_paint_color.cc
   mesh/sculpt_pose.cc
   mesh/sculpt_project.cc
   mesh/sculpt_smooth.cc
+  mesh/sculpt_storage_undo.cc
   mesh/sculpt_transform.cc
   mesh/sculpt_trim.cc
   mesh/sculpt_undo.cc
@@ -146,8 +151,11 @@ set(SRC
   mesh/sculpt_hide.hh
   mesh/sculpt_intern.hh
   mesh/sculpt_islands.hh
+  mesh/sculpt_morph.hh
+  mesh/sculpt_multires.hh
   mesh/sculpt_pose.hh
   mesh/sculpt_smooth.hh
+  mesh/sculpt_storage_undo.hh
   mesh/sculpt_undo.hh
   mesh/vw_paint_intern.hh
 
@@ -166,6 +174,8 @@ set(SRC
   mesh/brushes/inflate.cc
   mesh/brushes/layer.cc
   mesh/brushes/mask.cc
+  mesh/brushes/morph.cc
+  mesh/brushes/erase_layer.cc
   mesh/brushes/multiplane_scrape.cc
   mesh/brushes/multires_displacement_eraser.cc
   mesh/brushes/multires_displacement_smear.cc
@@ -215,6 +225,8 @@ if(WITH_GTESTS)
     mesh/paint_test.cc
     mesh/sculpt_boundary_tests.cc
     mesh/sculpt_detail_test.cc
+    mesh/sculpt_morph_test.cc
+    mesh/sculpt_multires_test.cc
     mesh/sculpt_undo_test.cc
   )
   set(TEST_INC

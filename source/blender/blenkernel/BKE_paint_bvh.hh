@@ -9,7 +9,13 @@
  * \brief A BVH for high poly meshes.
  */
 
+#include <optional>
 #include <variant>
+
+#include "DNA_multires_types.h"
+#include "DNA_vec_types.h"
+
+#include "BKE_multiresolution.hh"
 
 #include "BLI_array.hh"
 #include "BLI_bit_group_vector.hh"
@@ -18,6 +24,8 @@
 #include "BLI_enum_flags.hh"
 #include "BLI_function_ref.hh"
 #include "BLI_index_mask_fwd.hh"
+#include "BLI_map.hh"
+#include "BLI_math_matrix_types.hh"
 #include "BLI_math_vector.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_offset_indices.hh"
@@ -38,6 +46,7 @@ struct CCGKey;
 struct Depsgraph;
 struct IsectRayPrecalc;
 struct Mesh;
+struct Multiresolution;
 struct SubdivCCG;
 struct SubdivCCGCoord;
 struct Image;
@@ -108,24 +117,24 @@ class Node : NonCopyable {
 
 ENUM_OPERATORS(Node::Flags);
 
-struct MeshNode : public Node {
-  /**
-   * Use a 16 bit integer for the slot index type because there will always be less than
-   * #leaf_limit vertices in a node.
-   */
-  using LocalVertMapIndexT = int16_t;
-  /**
-   * Global vertices are mapped to local indices with a vector set, with a specialized type in
-   * order to use 32 bit integers for slot values. .
-   */
-  using LocalVertMap = VectorSet<int,
-                                 0,
-                                 DefaultProbingStrategy,
-                                 DefaultHash<int>,
-                                 DefaultEquality<int>,
-                                 SimpleVectorSetSlot<int, LocalVertMapIndexT>,
-                                 GuardedAllocator>;
+/**
+ * Use a 16 bit integer for the slot index type because there will always be less than
+ * #leaf_limit vertices in a node.
+ */
+using LocalVertMapIndexT = int16_t;
+/**
+ * Global vertices are mapped to local indices with a vector set, with a specialized type in
+ * order to use 32 bit integers for slot values. .
+ */
+using LocalVertMap = VectorSet<int,
+                               0,
+                               DefaultProbingStrategy,
+                               DefaultHash<int>,
+                               DefaultEquality<int>,
+                               SimpleVectorSetSlot<int, LocalVertMapIndexT>,
+                               GuardedAllocator>;
 
+struct MeshNode : public Node {
   /** Indices into the #Mesh::faces() array. Refers to a subset of Tree::prim_indices_. */
   Span<int> face_indices_;
 
@@ -171,6 +180,37 @@ struct MeshNode : public Node {
   int corners_num() const;
 };
 
+struct MultiresNode : public Node {
+  int offset_;
+  int faces_offset_;
+  Span<int> vert_indices_;
+  Span<int> edge_indices_;
+  Span<int> face_indices_;
+  LocalVertMap shared_verts_;
+  LocalVertMap shared_edges_;
+
+  int corners_num = 0;
+  int offset() const;
+  Span<int> verts() const;
+  Span<int> edges() const;
+  Span<int> faces() const;
+  LocalVertMap shared_verts() const;
+  LocalVertMap shared_edges() const;
+  int owned_verts_num(const int grid_size) const;
+  int all_verts_num(const int grid_size) const;
+  IndexRange range(const int grid_size) const;
+  IndexRange local_verts_range() const;
+  IndexRange local_edges_range(const int grid_size) const;
+  IndexRange local_faces_range(const int grid_size) const;
+  IndexRange verts_range() const;
+  IndexRange edges_range(const int grid_size) const;
+  IndexRange faces_range(const int grid_size) const;
+  int edges_offset() const;
+  int faces_offset(const int grid_size) const;
+
+  template<typename Func> void foreach_coord(const int grid_size, Func &&func) const;
+};
+
 struct GridsNode : public Node {
   /** Multires grid indices for this node. Refers to a subset of Tree::prim_indices_. */
   Span<int> prim_indices_;
@@ -213,11 +253,25 @@ class DrawCache {
 
 enum class Type {
   Mesh,
+  Multires,
   Grids,
   BMesh,
 };
 
 static constexpr int MESH_LEAF_LIMIT = 2500;
+static constexpr int MULTIRES_LEAF_LIMIT = 2500;
+
+/**
+ * Nodes whose vertex data was tagged as changed since the last #Tree::take_dirty_nodes() call.
+ * Indexed by node index. Vectors may be smaller than the number of nodes.
+ */
+struct DirtyNodes {
+  BitVector<> positions;
+  BitVector<> masks;
+  BitVector<> colors;
+  BitVector<> face_sets;
+  BitVector<> visibility;
+};
 
 /**
  * \todo Most data is public but should either be removed or become private in the future.
@@ -226,6 +280,12 @@ static constexpr int MESH_LEAF_LIMIT = 2500;
 class Tree {
   friend Node;
   Type type_;
+
+  /**
+   * Only set once #enable_dirty_tracking() has been called. Mutable because it's a cache
+   * invalidation detail for derived data (the multires coarse view), not part of the tree state.
+   */
+  mutable std::optional<DirtyNodes> dirty_nodes_;
 
   /** Memory backing for #Node::prim_indices. Without an inline buffer to make #Tree movable. */
   Array<int, 0> prim_indices_;
@@ -251,8 +311,17 @@ class Tree {
    */
   BitVector<> visibility_dirty_;
 
+  Map<std::string, Vector<int>> layer_non_zero_nodes_cache_;
+
  public:
-  std::variant<Vector<MeshNode>, Vector<GridsNode>, Vector<BMeshNode>> nodes_;
+  std::variant<Vector<MeshNode>, Vector<MultiresNode>, Vector<GridsNode>, Vector<BMeshNode>>
+      nodes_;
+
+  /* Multires */
+  Array<int, 0> vert_indices;
+  Array<int, 0> edge_indices;
+  Array<int, 0> face_indices;
+  bke::multiresolution::Offsets offsets;
 
   pixels::PixelData *pixels_ = nullptr;
 
@@ -266,10 +335,20 @@ class Tree {
 
   /** Build a BVH tree from base mesh triangles. */
   static Tree from_mesh(const Mesh &mesh);
+  /** Build a BVH tree from multires. */
+  static Tree from_multires(const int lvl,
+                            const bke::multiresolution::BaseTopology &base_topo,
+                            const Span<float3> vert_positions,
+                            const Span<int> material_indices);
   /** Build a BVH tree from grids geometry. */
   static Tree from_grids(const Mesh &base_mesh, const SubdivCCG &subdiv_ccg);
   /** Build a BVH tree from a triangle BMesh. */
   static Tree from_bmesh(BMesh &bm);
+
+  static Tree from_stored_nodes_multires(const int lvl, const Mesh &base_mesh);
+
+  static void store_nodes_multires(const Span<MultiresNode> nodes,
+                                   const MutableSpan<int> face_counts);
 
   int nodes_num() const;
   template<typename NodeT> Span<NodeT> nodes() const;
@@ -282,7 +361,7 @@ class Tree {
    * and GPU data buffers. That data is recomputed later on in functions like #update_bounds.
    * \warning Must not be called from multiple threads in parallel.
    */
-  void tag_positions_changed(const IndexMask &node_mask);
+  void tag_positions_changed(const IndexMask &node_mask, bool keep_layer_cache = false);
 
   /** Tag nodes where face or vertex visibility has changed. */
   void tag_visibility_changed(const IndexMask &node_mask);
@@ -303,6 +382,23 @@ class Tree {
    */
   void tag_attribute_changed(const IndexMask &node_mask, StringRef attribute_name);
 
+  template<typename Fn>
+  Span<int> layer_non_zero_nodes_ensure(const StringRef layer_name, Fn &&calc_fn)
+  {
+    return this->layer_non_zero_nodes_cache_.lookup_or_add_cb_as(layer_name,
+                                                                 std::forward<Fn>(calc_fn));
+  }
+
+  void clear_layer_non_zero_nodes_cache()
+  {
+    this->layer_non_zero_nodes_cache_.clear();
+  }
+
+  void invalidate_layer_non_zero_nodes(const StringRef layer_name)
+  {
+    this->layer_non_zero_nodes_cache_.remove_as(layer_name);
+  }
+
   /**
    * Run the last step of the BVH bounds recalculation process, propagating updated leaf node
    * bounds to their parent/ancestor inner nodes. This is meant to be used after leaf node bounds
@@ -316,12 +412,23 @@ class Tree {
    */
   void update_bounds(const Depsgraph &depsgraph, const Object &object);
   void update_bounds_mesh(Span<float3> vert_positions);
+  void update_bounds_multires(const Span<float3> positions, const int grid_size);
   void update_bounds_grids(Span<float3> positions, int grid_area);
   void update_bounds_bmesh(const BMesh &bm);
 
   void update_normals(Object &object_orig, Object &object_eval);
 
   void update_visibility(const Object &object);
+
+  void finalize_multires(const Mesh &base_mesh);
+
+  /**
+   * Start recording which nodes get tagged as changed by the `tag_*_changed` functions (only
+   * positions, masks and colors for now). Nothing is recorded before this is called.
+   */
+  void enable_dirty_tracking() const;
+  /** Return the nodes tagged since the last call (or since tracking was enabled), and reset. */
+  DirtyNodes take_dirty_nodes() const;
 
  private:
   explicit Tree(Type type);
@@ -382,13 +489,26 @@ bool node_raycast_mesh(const MeshNode &node,
                        int &r_active_face_index,
                        float3 &r_face_normal);
 
+bool node_raycast_multires(const Mesh &base_mesh,
+                           const MultiresNode &node,
+                           const Span<int> vert_offsets,
+                           const Span<int> edge_offsets,
+                           Span<float3> orig_positions,
+                           const float3 &ray_start,
+                           const float3 &ray_normal,
+                           const IsectRayPrecalc *isect_precalc,
+                           float &depth,
+                           int &r_active_vertex,
+                           int &r_active_face,
+                           float3 &r_face_normal);
+
 bool node_raycast_grids(const SubdivCCG &subdiv_ccg,
                         GridsNode &node,
                         Span<float3> node_positions,
                         const float3 &ray_start,
                         const float3 &ray_normal,
                         const IsectRayPrecalc *isect_precalc,
-                        float *depth,
+                        float &depth,
                         SubdivCCGCoord &r_active_vertex,
                         int &r_active_grid_index,
                         float3 &r_face_normal);
@@ -427,6 +547,16 @@ void find_nearest_to_ray(Tree &pbvh,
                          const float3 &ray_normal,
                          bool original);
 
+bool node_nearest_to_ray_multires(const Mesh &base_mesh,
+                                  const MultiresNode &node,
+                                  Span<int> vert_offsets,
+                                  Span<int> edge_offsets,
+                                  Span<float3> orig_positions,
+                                  const float3 &ray_start,
+                                  const float3 &ray_normal,
+                                  float *r_depth,
+                                  float *dist_sq);
+
 bool find_nearest_to_ray_node(Tree &pbvh,
                               Node &node,
                               Span<float3> node_positions,
@@ -437,6 +567,7 @@ bool find_nearest_to_ray_node(Tree &pbvh,
                               Span<int3> corner_tris,
                               Span<bool> hide_poly,
                               const SubdivCCG *subdiv_ccg,
+                              const Mesh &base_mesh,
                               const float ray_start[3],
                               const float ray_normal[3],
                               float *depth,
@@ -458,8 +589,6 @@ bool node_frustum_contain_aabb(const Node &node, Span<float4> frustum_planes);
 bool node_frustum_exclude_aabb(const Node &node, Span<float4> frustum_planes);
 
 }  // namespace bke::pbvh
-
-void BKE_pbvh_sync_visibility_from_verts(Object &object);
 
 namespace bke::pbvh {
 
@@ -550,6 +679,7 @@ void store_bounds_orig(Tree &pbvh);
 
 /** Update node "fully masked" and "fully unmasked" values after mask values have been changed. */
 void update_mask_mesh(const Mesh &mesh, const IndexMask &node_mask, Tree &pbvh);
+void update_mask_multires(const Multiresolution &multires, const IndexMask &node_mask, Tree &pbvh);
 void update_mask_grids(const SubdivCCG &subdiv_ccg, const IndexMask &node_mask, Tree &pbvh);
 void update_mask_bmesh(const BMesh &bm, const IndexMask &node_mask, Tree &pbvh);
 
@@ -608,20 +738,51 @@ namespace bke::pbvh {
 /** Return pointers to all the leaf nodes in the BVH tree. */
 IndexMask all_leaf_nodes(const Tree &pbvh, IndexMaskMemory &memory);
 
+void calc_normals_multires(const bke::multiresolution::BaseTopology &base_topo,
+                           const bke::multiresolution::OffsetsSpan &offsets,
+                           const int virtual_lvl,
+                           const Span<int> corner_verts,
+                           const Span<float3> positions,
+                           const Span<MultiresNode> nodes,
+                           const IndexMask &nodes_to_update,
+                           const MutableSpan<float3> r_normals);
+
+void calc_normals_multires_node(const bke::multiresolution::BaseTopology &base_topo,
+                                const bke::multiresolution::OffsetsSpan &offsets,
+                                const int virtual_lvl,
+                                const Span<int> corner_verts,
+                                const Span<float3> positions,
+                                const MultiresNode &node,
+                                const MutableSpan<float3> r_node_normals);
+
 /** Create a selection of nodes that match the filter function. */
 IndexMask search_nodes(const Tree &pbvh,
                        IndexMaskMemory &memory,
                        FunctionRef<bool(const Node &)> filter_fn);
 
+rctf calc_screen_bounds(const Tree &pbvh, const float4x4 &mvp, const IndexMask &node_mask);
+IndexMask filter_nodes_by_screen_rect(const Tree &pbvh,
+                                      const rctf screen_rect,
+                                      const float4x4 &mvp,
+                                      IndexMaskMemory &memory);
+
 void node_update_mask_mesh(Span<float> mask, MeshNode &node);
+void node_update_mask_multires(const Span<float> masks, const int grid_size, MultiresNode &node);
 void node_update_mask_grids(const CCGKey &key, Span<float> masks, GridsNode &node);
 void node_update_mask_bmesh(int mask_offset, BMeshNode &node);
 
 void node_update_visibility_mesh(Span<bool> hide_vert, MeshNode &node);
+void node_update_visibility_multires(const Span<bool> hidden,
+                                     const int grid_size,
+                                     MultiresNode &node);
 void node_update_visibility_grids(const BitGroupVector<> &grid_hidden, GridsNode &node);
 void node_update_visibility_bmesh(BMeshNode &node);
 
 void update_node_bounds_mesh(Span<float3> positions, MeshNode &node);
+void update_node_bounds_multires(const int grid_size,
+                                 const Span<float3> positions,
+                                 const bke::multiresolution::OffsetsSpan &offsets,
+                                 MultiresNode &node);
 void update_node_bounds_grids(int grid_area, Span<float3> positions, GridsNode &node);
 void update_node_bounds_bmesh(BMeshNode &node);
 
@@ -663,6 +824,118 @@ inline Span<int> MeshNode::all_verts() const
 inline int MeshNode::corners_num() const
 {
   return corners_num_;
+}
+
+inline int MultiresNode::offset() const
+{
+  return offset_;
+}
+
+inline Span<int> MultiresNode::verts() const
+{
+  return vert_indices_;
+}
+inline Span<int> MultiresNode::edges() const
+{
+  return edge_indices_;
+}
+
+inline Span<int> MultiresNode::faces() const
+{
+  return face_indices_;
+}
+
+inline LocalVertMap MultiresNode::shared_verts() const
+{
+  return shared_verts_;
+}
+
+inline LocalVertMap MultiresNode::shared_edges() const
+{
+  return shared_edges_;
+}
+
+inline int MultiresNode::owned_verts_num(const int grid_size) const
+{
+  return this->verts().size() + this->edges().size() * grid_size +
+         this->faces().size() * grid_size * grid_size;
+}
+
+inline int MultiresNode::all_verts_num(const int grid_size) const
+{
+  return this->owned_verts_num(grid_size) + this->shared_verts_.size() +
+         this->shared_edges_.size() * grid_size;
+}
+
+inline IndexRange MultiresNode::range(const int grid_size) const
+{
+  return IndexRange(offset_, owned_verts_num(grid_size));
+}
+
+inline IndexRange MultiresNode::local_verts_range() const
+{
+  return IndexRange(0, vert_indices_.size());
+}
+
+inline IndexRange MultiresNode::local_edges_range(const int grid_size) const
+{
+  return IndexRange(vert_indices_.size(), edge_indices_.size() * grid_size);
+}
+
+inline IndexRange MultiresNode::local_faces_range(const int grid_size) const
+{
+  return IndexRange(vert_indices_.size() + edge_indices_.size() * grid_size,
+                    face_indices_.size() * grid_size * grid_size);
+}
+
+inline IndexRange MultiresNode::verts_range() const
+{
+  return IndexRange(offset_, vert_indices_.size());
+}
+
+inline IndexRange MultiresNode::edges_range(const int grid_size) const
+{
+  return IndexRange(edges_offset(), edge_indices_.size() * grid_size);
+}
+
+inline IndexRange MultiresNode::faces_range(const int grid_size) const
+{
+  return IndexRange(faces_offset(grid_size), face_indices_.size() * grid_size * grid_size);
+}
+
+inline int MultiresNode::edges_offset() const
+{
+  return offset_ + vert_indices_.size();
+}
+
+inline int MultiresNode::faces_offset(const int grid_size) const
+{
+  return edges_offset() + edge_indices_.size() * grid_size;
+}
+
+template<typename Func> void MultiresNode::foreach_coord(const int grid_size, Func &&func) const
+{
+  using MultiresCoord = bke::multiresolution::MultiresCoord;
+  using ElemType = bke::multiresolution::ElemType;
+
+  int offset = 0;
+
+  for (const int vert_idx : this->verts()) {
+    func(offset++, MultiresCoord{ElemType::Vert, vert_idx, 0});
+  }
+
+  for (const int edge_idx : this->edges()) {
+    for (const int j : IndexRange(grid_size)) {
+      func(offset++, MultiresCoord{ElemType::Edge, edge_idx, j});
+    }
+  }
+
+  const int face_grid_size = grid_size * grid_size;
+  for (const int face_idx : this->faces()) {
+    for (const int j : IndexRange(face_grid_size)) {
+      func(offset++, MultiresCoord{ElemType::Face, face_idx, j});
+    }
+  }
 }
 
 inline Span<int> GridsNode::grids() const

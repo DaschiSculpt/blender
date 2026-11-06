@@ -162,6 +162,106 @@ static void do_draw_face_sets_brush_mesh(const Depsgraph &depsgraph,
   face_sets.finish();
 }
 
+struct MultiResLocalData {
+  Vector<int> subfaces;
+  Vector<float3> positions;
+  Vector<float3> normals;
+  Vector<float> factors;
+  Vector<float> distances;
+};
+
+static void calc_multires(const Depsgraph &depsgraph,
+                          Object &object,
+                          const Multiresolution &multires,
+                          const bke::multiresolution::BaseTopology &base_topo,
+                          const Brush &brush,
+                          const float strength,
+                          const int face_set_id,
+                          const bke::pbvh::MultiresNode &node,
+                          MultiResLocalData &tls,
+                          const MutableSpan<int> face_sets)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+  const Span<float3> positions = multires.positions();
+  const Span<int> corner_verts = multires.corner_verts();
+  const Span<int> node_faces = node.faces();
+
+  const int node_subfaces_num = multires.faces_per_corner() * node.corners_num;
+  tls.subfaces.resize(node_subfaces_num);
+  const MutableSpan<int> node_subfaces = tls.subfaces;
+  face_set::gather_subfaces(
+      multires.faces_per_corner(), base_topo.faces, node_faces, node_subfaces);
+
+  tls.positions.resize(node_subfaces_num);
+  const MutableSpan<float3> face_centers = tls.positions;
+  tls.normals.resize(node_subfaces_num);
+  const MutableSpan<float3> face_normals = tls.normals;
+  face_set::calc_face_centers_and_normals(
+      node_subfaces, corner_verts, positions, face_centers, face_normals);
+
+  tls.factors.resize(node_subfaces_num);
+  const MutableSpan<float> factors = tls.factors;
+
+  face_set::fill_factors_from_hide_and_mask(multires, node_subfaces, factors);
+  filter_region_clip_factors(ss, face_centers, factors);
+  if (brush.flag & BRUSH_FRONTFACE) {
+    calc_front_face(cache.view_normal_symm, face_normals, factors);
+  }
+
+  tls.distances.resize(node_subfaces_num);
+  const MutableSpan<float> distances = tls.distances;
+  calc_brush_distances(ss, face_centers, eBrushFalloffShape(brush.falloff_shape), distances);
+  filter_distances_with_radius(cache.radius, distances, factors);
+  apply_hardness_to_distances(cache, distances);
+  calc_brush_strength_factors(cache, brush, distances, factors);
+
+  if (cache.automasking) {
+    auto_mask::calc_face_factors(
+        depsgraph, object, multires, base_topo, *cache.automasking, node_subfaces, factors);
+  }
+
+  calc_brush_texture_factors(PaintMode::Sculpt, ss, brush, face_centers, factors);
+  scale_factors(factors, strength);
+
+  apply_face_set(face_set_id, node_subfaces, factors, face_sets);
+}
+
+static void do_draw_face_sets_brush_multires(const Depsgraph &depsgraph,
+                                             Object &object,
+                                             const Brush &brush,
+                                             const IndexMask &node_mask)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+
+  undo::push_nodes(depsgraph, object, node_mask, undo::Type::FaceSet);
+
+  const MutableSpan<int> face_sets = face_set::ensure_face_sets_multires(base_mesh);
+
+  threading::EnumerableThreadSpecific<MultiResLocalData> all_tls;
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  node_mask.foreach_index(
+      [&](const int i) {
+        MultiResLocalData &tls = all_tls.local();
+        calc_multires(depsgraph,
+                      object,
+                      multires,
+                      base_topo,
+                      brush,
+                      ss.cache->bstrength,
+                      ss.cache->paint_face_set,
+                      nodes[i],
+                      tls,
+                      face_sets);
+      },
+      exec_mode::grain_size(1));
+  pbvh.tag_face_sets_changed(node_mask);
+}
+
 struct GridLocalData {
   Vector<int> face_indices;
   Vector<float3> positions;
@@ -355,6 +455,9 @@ void do_draw_face_sets_brush(const Depsgraph &depsgraph,
   switch (bke::object::pbvh_get(object)->type()) {
     case bke::pbvh::Type::Mesh:
       do_draw_face_sets_brush_mesh(depsgraph, object, brush, node_mask);
+      break;
+    case bke::pbvh::Type::Multires:
+      do_draw_face_sets_brush_multires(depsgraph, object, brush, node_mask);
       break;
     case bke::pbvh::Type::Grids:
       do_draw_face_sets_brush_grids(depsgraph, object, brush, node_mask);

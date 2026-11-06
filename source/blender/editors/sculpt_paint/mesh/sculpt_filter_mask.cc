@@ -37,6 +37,8 @@
 
 namespace blender::ed::sculpt_paint::mask {
 
+using MultiresCoord = bke::multiresolution::MultiresCoord;
+
 enum class FilterType {
   Smooth = 0,
   Sharpen = 1,
@@ -323,6 +325,209 @@ static bool decrease_contrast_mask_mesh(const Depsgraph &depsgraph,
   undo::push_node(depsgraph, object, &node, undo::Type::Mask);
   scatter_data_mesh(new_mask.as_span(), verts, mask);
   bke::pbvh::node_update_mask_mesh(mask, node);
+  return true;
+}
+
+BLI_NOINLINE static void copy_old_hidden_mask_multires(const Span<bool> hidden,
+                                                       const IndexRange node_range,
+                                                       const Span<float> mask,
+                                                       const MutableSpan<float> new_mask)
+{
+  if (hidden.is_empty()) {
+    return;
+  }
+
+  const Span<bool> node_hidden = hidden.slice(node_range);
+
+  for (const int i : new_mask.index_range()) {
+    if (node_hidden[i]) {
+      new_mask[i] = mask[i];
+    }
+  }
+}
+
+static void apply_new_mask_multires(const Depsgraph &depsgraph,
+                                    Object &object,
+                                    Multiresolution &multires,
+                                    const IndexMask &node_mask,
+                                    const OffsetIndices<int> node_verts,
+                                    const Span<float> new_mask)
+{
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+  MutableSpan<float> masks = multires.masks_for_write();
+
+  Array<bool> node_changed(node_mask.min_array_size(), false);
+
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        const IndexRange node_range = nodes[i].range(grid_size);
+        const MutableSpan<float> mask = masks.slice(node_range);
+        const Span<float> new_node_mask = new_mask.slice(node_verts[pos]);
+
+        if (mask == new_node_mask) {
+          return;
+        }
+
+        undo::push_node(depsgraph, object, &nodes[i], undo::Type::Mask);
+        mask.copy_from(new_node_mask);
+        bke::pbvh::node_update_mask_multires(masks, grid_size, nodes[i]);
+        node_changed[i] = true;
+      },
+      exec_mode::grain_size(1));
+
+  IndexMaskMemory memory;
+  pbvh.tag_masks_changed(IndexMask::from_bools(node_changed, memory));
+}
+
+static void smooth_mask_multires(const Object &object,
+                                 const Multiresolution &multires,
+                                 const bke::multiresolution::BaseTopology &base_topo,
+                                 const bke::pbvh::MultiresNode &node,
+                                 FilterLocalData &tls,
+                                 MutableSpan<float> new_mask)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float> mask = multires.masks().slice(node_range);
+  const Span<bool> hidden_verts = multires.hidden_verts();
+
+  tls.node_mask.resize(new_mask.size());
+  const MutableSpan<float> node_mask = tls.node_mask;
+  node_mask.copy_from(mask);
+
+  smooth::neighbor_data_average_node_multires(
+      multires, base_topo, node, pbvh.offsets, multires.masks(), new_mask, hidden_verts);
+  mask::mix_new_masks(new_mask, 0.5f, node_mask);
+  copy_old_hidden_mask_multires(hidden_verts, node_range, mask, node_mask);
+  mask::clamp_mask(node_mask);
+  new_mask.copy_from(node_mask);
+}
+
+static void sharpen_mask_multires(const Object &object,
+                                  const Multiresolution &multires,
+                                  const bke::multiresolution::BaseTopology &base_topo,
+                                  const bke::pbvh::MultiresNode &node,
+                                  FilterLocalData &tls,
+                                  MutableSpan<float> new_mask)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float> mask = multires.masks().slice(node_range);
+  const Span<bool> hidden_verts = multires.hidden_verts();
+  tls.node_mask.resize(new_mask.size());
+  const MutableSpan<float> node_mask = tls.node_mask;
+  node_mask.copy_from(mask);
+
+  smooth::neighbor_data_average_node_multires(
+      multires, base_topo, node, pbvh.offsets, multires.masks(), new_mask, hidden_verts);
+
+  sharpen_masks(node_mask, new_mask);
+  copy_old_hidden_mask_multires(hidden_verts, node_range, mask, new_mask);
+}
+
+static void grow_mask_multires(const Object &object,
+                               const Multiresolution &multires,
+                               const bke::multiresolution::BaseTopology &base_topo,
+                               const bke::pbvh::MultiresNode &node,
+                               const MutableSpan<float> new_mask)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float> masks = multires.masks();
+  const Span<float> local_mask = masks.slice(node_range);
+  const Span<bool> hidden = multires.hidden_verts();
+
+  Vector<MultiresCoord> neighbors;
+  node.foreach_coord(grid_size, [&](const int i, MultiresCoord coord) {
+    Multiresolution::calc_neighbors(coord, base_topo, grid_size, pbvh.offsets, hidden, neighbors);
+    new_mask[i] = local_mask[i];
+    for (const MultiresCoord neighbor : neighbors) {
+      const int neighbor_idx = neighbor.to_index(pbvh.offsets);
+      new_mask[i] = std::max(masks[neighbor_idx], new_mask[i]);
+    }
+  });
+
+  copy_old_hidden_mask_multires(hidden, node_range, local_mask, new_mask);
+}
+
+static void shrink_mask_multires(const Object &object,
+                                 const Multiresolution &multires,
+                                 const bke::multiresolution::BaseTopology &base_topo,
+                                 const bke::pbvh::MultiresNode &node,
+                                 const MutableSpan<float> new_mask)
+{
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float> masks = multires.masks();
+  const Span<float> local_mask = masks.slice(node_range);
+  const Span<bool> hidden = multires.hidden_verts();
+
+  Vector<MultiresCoord> neighbors;
+  node.foreach_coord(grid_size, [&](const int i, MultiresCoord coord) {
+    Multiresolution::calc_neighbors(coord, base_topo, grid_size, pbvh.offsets, hidden, neighbors);
+    new_mask[i] = local_mask[i];
+    for (const MultiresCoord neighbor : neighbors) {
+      const int neighbor_idx = neighbor.to_index(pbvh.offsets);
+      new_mask[i] = std::min(masks[neighbor_idx], new_mask[i]);
+    }
+  });
+
+  copy_old_hidden_mask_multires(hidden, node_range, local_mask, new_mask);
+}
+
+static bool increase_contrast_mask_multires(const Depsgraph &depsgraph,
+                                            const Object &object,
+                                            const Multiresolution &multires,
+                                            const MutableSpan<float> masks,
+                                            bke::pbvh::MultiresNode &node)
+{
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const MutableSpan<float> node_mask = masks.slice(node_range);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> new_mask(node_mask.size());
+  mask_increase_contrast(node_mask, new_mask);
+
+  copy_old_hidden_mask_multires(multires.hidden_verts(), node_range, node_mask, new_mask);
+
+  if (node_mask.as_span() == new_mask.as_span()) {
+    return false;
+  }
+
+  undo::push_node(depsgraph, object, &node, undo::Type::Mask);
+  node_mask.copy_from(new_mask);
+  bke::pbvh::node_update_mask_multires(multires.masks(), grid_size, node);
+  return true;
+}
+
+static bool decrease_contrast_mask_multires(const Depsgraph &depsgraph,
+                                            const Object &object,
+                                            const Multiresolution &multires,
+                                            const MutableSpan<float> masks,
+                                            bke::pbvh::MultiresNode &node)
+{
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const MutableSpan<float> node_mask = masks.slice(node_range);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> new_mask(node_mask.size());
+  mask_decrease_contrast(node_mask, new_mask);
+
+  copy_old_hidden_mask_multires(multires.hidden_verts(), node_range, node_mask, new_mask);
+
+  if (node_mask.as_span() == new_mask.as_span()) {
+    return false;
+  }
+
+  undo::push_node(depsgraph, object, &node, undo::Type::Mask);
+  node_mask.copy_from(new_mask);
+  bke::pbvh::node_update_mask_multires(multires.masks(), grid_size, node);
   return true;
 }
 
@@ -891,6 +1096,104 @@ static wmOperatorStatus sculpt_mask_filter_exec(bContext *C, wmOperator *op)
         }
       }
       mask.finish();
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const MutableSpan<float> masks = multires.ensure_masks();
+
+      Array<int> node_vert_offset_data;
+      OffsetIndices node_offsets = create_node_vert_offsets(
+          multires.grid_size(), nodes, node_mask, node_vert_offset_data);
+      Array<float> new_masks(node_offsets.total_size());
+
+      for ([[maybe_unused]] const int iteration : IndexRange(iterations)) {
+        switch (filter_type) {
+          case FilterType::Smooth: {
+            node_mask.foreach_index(
+                [&](const int i, const int pos) {
+                  FilterLocalData &tls = all_tls.local();
+                  smooth_mask_multires(ob,
+                                       multires,
+                                       base_topo,
+                                       nodes[i],
+                                       tls,
+                                       new_masks.as_mutable_span().slice(node_offsets[pos]));
+                },
+                exec_mode::grain_size(1));
+            apply_new_mask_multires(*depsgraph, ob, multires, node_mask, node_offsets, new_masks);
+            break;
+          }
+          case FilterType::Sharpen: {
+            node_mask.foreach_index(
+                [&](const int i, const int pos) {
+                  FilterLocalData &tls = all_tls.local();
+                  sharpen_mask_multires(ob,
+                                        multires,
+                                        base_topo,
+                                        nodes[i],
+                                        tls,
+                                        new_masks.as_mutable_span().slice(node_offsets[pos]));
+                },
+                exec_mode::grain_size(1));
+            apply_new_mask_multires(*depsgraph, ob, multires, node_mask, node_offsets, new_masks);
+            break;
+          }
+          case FilterType::Grow: {
+            node_mask.foreach_index(
+                [&](const int i, const int pos) {
+                  grow_mask_multires(ob,
+                                     multires,
+                                     base_topo,
+                                     nodes[i],
+                                     new_masks.as_mutable_span().slice(node_offsets[pos]));
+                },
+                exec_mode::grain_size(1));
+            apply_new_mask_multires(*depsgraph, ob, multires, node_mask, node_offsets, new_masks);
+            break;
+          }
+          case FilterType::Shrink: {
+            node_mask.foreach_index(
+                [&](const int i, const int pos) {
+                  shrink_mask_multires(ob,
+                                       multires,
+                                       base_topo,
+                                       nodes[i],
+                                       new_masks.as_mutable_span().slice(node_offsets[pos]));
+                },
+                exec_mode::grain_size(1));
+            apply_new_mask_multires(*depsgraph, ob, multires, node_mask, node_offsets, new_masks);
+            break;
+          }
+          case FilterType::ContrastIncrease: {
+            Array<bool> node_changed(node_mask.min_array_size(), false);
+            node_mask.foreach_index(
+                [&](const int i) {
+                  node_changed[i] = increase_contrast_mask_multires(
+                      *depsgraph, ob, multires, masks, nodes[i]);
+                },
+                exec_mode::grain_size(1));
+            IndexMaskMemory memory;
+            pbvh.tag_masks_changed(IndexMask::from_bools(node_changed, memory));
+            break;
+          }
+          case FilterType::ContrastDecrease: {
+            Array<bool> node_changed(node_mask.min_array_size(), false);
+            node_mask.foreach_index(
+                [&](const int i) {
+                  node_changed[i] = decrease_contrast_mask_multires(
+                      *depsgraph, ob, multires, masks, nodes[i]);
+                },
+                exec_mode::grain_size(1));
+            IndexMaskMemory memory;
+            pbvh.tag_masks_changed(IndexMask::from_bools(node_changed, memory));
+            break;
+          }
+        }
+      }
       break;
     }
     case bke::pbvh::Type::Grids: {

@@ -79,6 +79,39 @@ static void calc_faces(const Depsgraph &depsgraph,
   position_data.deform(translations, verts);
 }
 
+static void calc_multires(const Depsgraph &depsgraph,
+                          const Sculpt &sd,
+                          Multiresolution &multires,
+                          const bke::multiresolution::BaseTopology &base_topo,
+                          const Brush &brush,
+                          const float4 &plane_tilt,
+                          const float strength,
+                          const bke::pbvh::MultiresNode &node,
+                          Object &object,
+                          const MultiresDeformData &deform_data)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = deform_data.positions.slice(node_range);
+  const Span<float3> normals = multires.normals().slice(node_range);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(positions.size());
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> distances(positions.size());
+
+  calc_factors_common_multires(
+      depsgraph, brush, object, multires, base_topo, positions, normals, node, factors, distances);
+
+  scale_factors(factors, strength);
+
+  Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> translations(positions.size());
+  calc_translations_to_plane(positions, plane_tilt, translations);
+  scale_translations(translations, factors);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  deform_data.deform(node_range, translations);
+}
+
 static void calc_grids(const Depsgraph &depsgraph,
                        const Sculpt &sd,
                        const Brush &brush,
@@ -200,10 +233,11 @@ void do_clay_thumb_brush(const Depsgraph &depsgraph,
   plane_from_point_normal_v3(plane_tilt, location, normal_tilt);
 
   const float clay_strength = ss.cache->bstrength * clay_thumb_get_stabilized_pressure(*ss.cache);
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
+
   threading::EnumerableThreadSpecific<LocalData> all_tls;
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
-      const Mesh &mesh = *id_cast<Mesh *>(object.data);
       const MeshAttributeData attribute_data(mesh);
       MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
       const PositionDeformData position_data(depsgraph, object);
@@ -221,6 +255,29 @@ void do_clay_thumb_brush(const Depsgraph &depsgraph,
                        object,
                        position_data);
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDeformData deform_data(mesh);
+      node_mask.foreach_index(
+          [&](const int i) {
+            calc_multires(depsgraph,
+                          sd,
+                          multires,
+                          base_topo,
+                          brush,
+                          plane_tilt,
+                          clay_strength,
+                          nodes[i],
+                          object,
+                          deform_data);
+            bke::pbvh::update_node_bounds_multires(
+                multires.grid_size(), multires.positions(), pbvh.offsets, nodes[i]);
           },
           exec_mode::grain_size(1));
       break;

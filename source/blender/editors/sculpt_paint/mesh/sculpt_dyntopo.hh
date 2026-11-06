@@ -29,6 +29,7 @@ enum WarnFlag {
   OKAY = 0,
   ATTRIBUTES = (1 << 1),
   MODIFIER = (1 << 2),
+  MULTIRES = (1 << 3),
 };
 ENUM_OPERATORS(WarnFlag);
 

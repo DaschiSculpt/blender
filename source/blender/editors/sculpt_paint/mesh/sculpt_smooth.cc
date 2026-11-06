@@ -31,7 +31,7 @@
 #include "bmesh.hh"
 
 #include <cstdlib>
-
+//
 namespace blender::ed::sculpt_paint::smooth {
 
 template<typename T>
@@ -85,6 +85,590 @@ template void neighbor_data_average_mesh<float3>(Span<float3>,
 template void neighbor_data_average_mesh<float4>(Span<float4>,
                                                  GroupedSpan<int>,
                                                  MutableSpan<float4>);
+
+template<typename T, bool UseHidden>
+static void neighbor_data_average_vert_multires_impl(
+    const bke::multiresolution::BaseTopology &base_topo,
+    const int grid_size,
+    const Span<int> verts,
+    const Span<int> vert_offsets,
+    const Span<int> edge_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden)
+{
+  BLI_assert(verts.size() == dst.size());
+  const Span<int2> base_edges = base_topo.edges;
+  const GroupedSpan<int> vert_to_edges = base_topo.vert_to_edge_map;
+
+  for (const int i : verts.index_range()) {
+    const int vert = verts[i];
+    Span<int> edges = vert_to_edges[vert];
+    const int self_idx = vert_offsets[vert];
+    if constexpr (UseHidden) {
+      if (hidden[self_idx]) {
+        dst[i] = attr[self_idx];
+        continue;
+      }
+    }
+    if (edges.is_empty()) {
+      dst[i] = attr[self_idx];
+      continue;
+    }
+    if (!base_topo.boundary_verts.is_empty() && base_topo.boundary_verts[vert]) {
+      if (edges.size() == 2) {
+        dst[i] = attr[self_idx];
+        continue;
+      }
+      T sum = T(0.0f);
+      int count = 0;
+      for (const int edge_idx : edges) {
+        const bool is_boundary_edge = base_topo.boundary_edges.is_empty() ?
+                                          false :
+                                          bool(base_topo.boundary_edges[edge_idx]);
+        if (!is_boundary_edge) {
+          continue;
+        }
+        const int offset = base_edges[edge_idx][0] == vert ? 0 : grid_size - 1;
+        const int neighbor_idx = edge_offsets[edge_idx] + offset;
+        if constexpr (UseHidden) {
+          if (hidden[neighbor_idx]) {
+            continue;
+          }
+        }
+        sum += attr[neighbor_idx];
+        count++;
+      }
+      if (count == 0) {
+        dst[i] = attr[self_idx];
+      }
+      else {
+        dst[i] = sum / count;
+      }
+      continue;
+    }
+    if constexpr (!UseHidden) {
+      T sum = T(0.0f);
+      for (const int edge_idx : edges) {
+        const int offset = base_edges[edge_idx][0] == vert ? 0 : grid_size - 1;
+        sum += attr[edge_offsets[edge_idx] + offset];
+      }
+      dst[i] = sum / edges.size();
+      continue;
+    }
+    T sum = T(0.0f);
+    int count = 0;
+    for (const int edge_idx : edges) {
+      const int offset = base_edges[edge_idx][0] == vert ? 0 : grid_size - 1;
+      const int neighbor_idx = edge_offsets[edge_idx] + offset;
+      if (hidden[neighbor_idx]) {
+        continue;
+      }
+      sum += attr[neighbor_idx];
+      count++;
+    }
+    if (count == 0) {
+      dst[i] = attr[self_idx];
+    }
+    else {
+      dst[i] = sum / count;
+    }
+  }
+}
+
+template<typename T>
+static void neighbor_data_average_vert_multires(
+    const bke::multiresolution::BaseTopology &base_topo,
+    const int grid_size,
+    const Span<int> verts,
+    const Span<int> vert_offsets,
+    const Span<int> edge_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden)
+{
+  if (hidden.is_empty()) {
+    neighbor_data_average_vert_multires_impl<T, false>(
+        base_topo, grid_size, verts, vert_offsets, edge_offsets, attr, dst, {});
+  }
+  else {
+    neighbor_data_average_vert_multires_impl<T, true>(
+        base_topo, grid_size, verts, vert_offsets, edge_offsets, attr, dst, hidden);
+  }
+}
+
+template<typename T, bool UseHidden>
+static void neighbor_data_average_edge_multires_impl(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const Span<int> edges,
+    const int edges_offset,
+    const Span<int> vert_offsets,
+    const Span<int> face_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden)
+{
+  const int grid_size = multires.grid_size();
+  const Span<int2> base_edges = base_topo.edges;
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const Span<int> corner_edges = base_topo.corner_edges;
+  const GroupedSpan<int> edge_to_faces = base_topo.edge_to_face_map;
+  const BitSpan face_edge_reversed = base_topo.face_edge_reversed;
+
+  Array<T> inner_border_a(grid_size);
+  Array<T> inner_border_b(grid_size);
+  int dst_offset = 0;
+  int edge_offset = edges_offset;
+
+  for (const int i : edges.index_range()) {
+    const int edge_idx = edges[i];
+    const int2 edge = base_edges[edge_idx];
+    const int v0_idx = vert_offsets[edge[0]];
+    const int v1_idx = vert_offsets[edge[1]];
+    const T v0 = attr[v0_idx];
+    const T v1 = attr[v1_idx];
+    const Span<int> adj_faces = edge_to_faces[edge_idx];
+    const bool is_boundary = (adj_faces.size() < 2);
+    const Span<T> curr_edge_verts = attr.slice(edge_offset, grid_size);
+    if (is_boundary) {
+      if constexpr (!UseHidden) {
+        for (int k = 0; k < grid_size; k++) {
+          const T prev = (k == 0) ? v0 : curr_edge_verts[k - 1];
+          const T next = (k == grid_size - 1) ? v1 : curr_edge_verts[k + 1];
+          dst[dst_offset++] = (prev + next) * 0.5f;
+        }
+      }
+      else {
+        for (int k = 0; k < grid_size; k++) {
+          if (hidden[edge_offset + k]) {
+            dst[dst_offset++] = curr_edge_verts[k];
+            continue;
+          }
+          const int prev_idx = (k == 0) ? v0_idx : edge_offset + k - 1;
+          const int next_idx = (k == grid_size - 1) ? v1_idx : edge_offset + k + 1;
+          const T prev = (k == 0) ? v0 : curr_edge_verts[k - 1];
+          const T next = (k == grid_size - 1) ? v1 : curr_edge_verts[k + 1];
+          T sum = T(0.0f);
+          int count = 0;
+          if (!hidden[prev_idx]) {
+            sum += prev;
+            count++;
+          }
+          if (!hidden[next_idx]) {
+            sum += next;
+            count++;
+          }
+          if (count == 0) {
+            dst[dst_offset++] = curr_edge_verts[k];
+          }
+          else {
+            dst[dst_offset++] = sum / count;
+          }
+        }
+      }
+      edge_offset += grid_size;
+      continue;
+    }
+
+    int face_idx_a, local_a;
+    bool reversed_a;
+    {
+      face_idx_a = adj_faces[0];
+      const IndexRange face_range = base_faces[face_idx_a];
+      const Span<int> face_edges = corner_edges.slice(face_range);
+
+      local_a = face_edges.first_index(edge_idx);
+      reversed_a = face_edge_reversed[face_range.start() + local_a];
+      multires.grid_inner_border<T>(
+          face_offsets[face_idx_a], local_a, reversed_a, attr, inner_border_a);
+    }
+
+    int face_idx_b, local_b;
+    bool reversed_b;
+    {
+      face_idx_b = adj_faces[1];
+      const IndexRange face_range = base_faces[face_idx_b];
+      const Span<int> face_edges = corner_edges.slice(face_range);
+
+      local_b = face_edges.first_index(edge_idx);
+      reversed_b = face_edge_reversed[face_range.start() + local_b];
+      multires.grid_inner_border<T>(
+          face_offsets[face_idx_b], local_b, reversed_b, attr, inner_border_b);
+    }
+
+    if constexpr (!UseHidden) {
+      for (int k = 0; k < grid_size; k++) {
+        const T prev = (k == 0) ? v0 : curr_edge_verts[k - 1];
+        const T next = (k == grid_size - 1) ? v1 : curr_edge_verts[k + 1];
+        dst[dst_offset++] = (prev + next + inner_border_a[k] + inner_border_b[k]) * 0.25f;
+      }
+      edge_offset += grid_size;
+      continue;
+    }
+
+    const int grid_offset_a = face_offsets[face_idx_a];
+    const int grid_offset_b = face_offsets[face_idx_b];
+    for (int k = 0; k < grid_size; k++) {
+      if (hidden[edge_offset + k]) {
+        dst[dst_offset++] = curr_edge_verts[k];
+        continue;
+      }
+      const int prev_idx = (k == 0) ? v0_idx : edge_offset + k - 1;
+      const int next_idx = (k == grid_size - 1) ? v1_idx : edge_offset + k + 1;
+      const int idx_a = Multiresolution::grid_inner_border_index(
+          grid_offset_a, local_a, reversed_a, grid_size, k);
+      const int idx_b = Multiresolution::grid_inner_border_index(
+          grid_offset_b, local_b, reversed_b, grid_size, k);
+      const T prev = (k == 0) ? v0 : curr_edge_verts[k - 1];
+      const T next = (k == grid_size - 1) ? v1 : curr_edge_verts[k + 1];
+      T sum = T(0.0f);
+      int count = 0;
+      if (!hidden[prev_idx]) {
+        sum += prev;
+        count++;
+      }
+      if (!hidden[next_idx]) {
+        sum += next;
+        count++;
+      }
+      if (!hidden[idx_a]) {
+        sum += inner_border_a[k];
+        count++;
+      }
+      if (!hidden[idx_b]) {
+        sum += inner_border_b[k];
+        count++;
+      }
+      if (count == 0) {
+        dst[dst_offset++] = curr_edge_verts[k];
+      }
+      else {
+        dst[dst_offset++] = sum / count;
+      }
+    }
+
+    edge_offset += grid_size;
+  }
+}
+
+template<typename T>
+static void neighbor_data_average_edge_multires(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const Span<int> edges,
+    const int edges_offset,
+    const Span<int> vert_offsets,
+    const Span<int> face_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden)
+{
+  if (hidden.is_empty()) {
+    neighbor_data_average_edge_multires_impl<T, false>(
+        multires, base_topo, edges, edges_offset, vert_offsets, face_offsets, attr, dst, {});
+  }
+  else {
+    neighbor_data_average_edge_multires_impl<T, true>(
+        multires, base_topo, edges, edges_offset, vert_offsets, face_offsets, attr, dst, hidden);
+  }
+}
+
+template<typename T>
+BLI_INLINE T calc_inner_border_average_multires(
+    const int r, const int c, const int grid_size, const Span<T> attr, const Span<int> sub_faces)
+{
+  const int face_idx_BL = (r * (grid_size + 1) + c) * 4;
+  const int face_idx_TR = ((r + 1) * (grid_size + 1) + (c + 1)) * 4;
+
+  const T pL = attr[sub_faces[face_idx_BL + 3]];
+  const T pU = attr[sub_faces[face_idx_TR + 3]];
+  const T pR = attr[sub_faces[face_idx_TR + 1]];
+  const T pD = attr[sub_faces[face_idx_BL + 1]];
+
+  return (pL + pU + pR + pD) * 0.25f;
+}
+
+template<typename T, bool UseHidden>
+static void neighbor_data_average_face_multires_impl(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const Span<int> node_faces,
+    const Span<int> edge_offsets,
+    const Span<int> face_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden)
+{
+  const Span<int> corner_edges = base_topo.corner_edges;
+  const OffsetIndices<int> base_faces = base_topo.faces;
+  const int grid_size = multires.grid_size();
+
+  if (grid_size == 1) {
+    for (const int i : node_faces.index_range()) {
+      const int face_idx = node_faces[i];
+      const IndexRange face_range = base_faces[face_idx];
+      const int corners_num = face_range.size();
+      const int face_start = face_range.start();
+
+      if constexpr (!UseHidden) {
+        T sum = T(0.0f);
+        for (const int corner : IndexRange(corners_num)) {
+          const int edge_idx = corner_edges[face_start + corner];
+          sum += attr[edge_offsets[edge_idx]];
+        }
+        dst[i] = sum / float(corners_num);
+        continue;
+      }
+      if (hidden[face_offsets[face_idx]]) {
+        dst[i] = attr[face_offsets[face_idx]];
+        continue;
+      }
+      T sum = T(0.0f);
+      int count = 0;
+      for (const int corner : IndexRange(corners_num)) {
+        const int edge_idx = corner_edges[face_start + corner];
+        const int edge_mid_vert = edge_offsets[edge_idx];
+        if (hidden[edge_mid_vert]) {
+          continue;
+        }
+        sum += attr[edge_mid_vert];
+        count++;
+      }
+      if (count == 0) {
+        dst[i] = attr[face_offsets[face_idx]];
+      }
+      else {
+        dst[i] = sum / float(count);
+      }
+    }
+    return;
+  }
+
+  const Span<int> corner_verts = multires.corner_verts();
+  const int faces_per_quad_grid = multires.faces_per_corner() * 4;
+  const int verts_per_quad_grid = grid_size * grid_size;
+  const int faces_offset = face_offsets[node_faces[0]];
+  int dst_offset = 0;
+
+  auto border_average_hidden =
+      [&](const int r, const int c, const Span<int> sub_faces, const T fallback) -> T {
+    const int face_idx_BL = (r * (grid_size + 1) + c) * 4;
+    const int face_idx_TR = ((r + 1) * (grid_size + 1) + (c + 1)) * 4;
+    const int idx_L = sub_faces[face_idx_BL + 3];
+    const int idx_U = sub_faces[face_idx_TR + 3];
+    const int idx_R = sub_faces[face_idx_TR + 1];
+    const int idx_D = sub_faces[face_idx_BL + 1];
+    T sum = T(0.0f);
+    int count = 0;
+    if (!hidden[idx_L]) {
+      sum += attr[idx_L];
+      count++;
+    }
+    if (!hidden[idx_U]) {
+      sum += attr[idx_U];
+      count++;
+    }
+    if (!hidden[idx_R]) {
+      sum += attr[idx_R];
+      count++;
+    }
+    if (!hidden[idx_D]) {
+      sum += attr[idx_D];
+      count++;
+    }
+    if (count == 0) {
+      return fallback;
+    }
+    return sum / count;
+  };
+
+  for (const int i : node_faces.index_range()) {
+    const int face_idx = node_faces[i];
+    const int face_offset = faces_offset + i * verts_per_quad_grid;
+    const Span<T> grid = attr.slice(face_offset, verts_per_quad_grid);
+    const Span<int> sub_faces = corner_verts.slice(face_idx * faces_per_quad_grid * 4,
+                                                   faces_per_quad_grid * 4);
+
+    if constexpr (!UseHidden) {
+      for (const int c : IndexRange(grid_size)) {
+        dst[dst_offset++] = calc_inner_border_average_multires(0, c, grid_size, attr, sub_faces);
+      }
+      for (int r = 1; r < grid_size - 1; r++) {
+        dst[dst_offset++] = calc_inner_border_average_multires(r, 0, grid_size, attr, sub_faces);
+        for (int c = 1; c < grid_size - 1; c++) {
+          const int grid_offset = r * grid_size + c;
+          dst[dst_offset++] = (grid[grid_offset - 1] + grid[grid_offset + 1] +
+                               grid[grid_offset - grid_size] + grid[grid_offset + grid_size]) *
+                              0.25f;
+        }
+        dst[dst_offset++] = calc_inner_border_average_multires(
+            r, grid_size - 1, grid_size, attr, sub_faces);
+      }
+      for (const int c : IndexRange(grid_size)) {
+        dst[dst_offset++] = calc_inner_border_average_multires(
+            grid_size - 1, c, grid_size, attr, sub_faces);
+      }
+      continue;
+    }
+
+    for (const int c : IndexRange(grid_size)) {
+      const int self_idx = face_offset + c;
+      if (hidden[self_idx]) {
+        dst[dst_offset++] = grid[c];
+        continue;
+      }
+      dst[dst_offset++] = border_average_hidden(0, c, sub_faces, grid[c]);
+    }
+    for (int r = 1; r < grid_size - 1; r++) {
+      {
+        const int self_idx = face_offset + r * grid_size;
+        if (hidden[self_idx]) {
+          dst[dst_offset++] = grid[r * grid_size];
+        }
+        else {
+          dst[dst_offset++] = border_average_hidden(r, 0, sub_faces, grid[r * grid_size]);
+        }
+      }
+      for (int c = 1; c < grid_size - 1; c++) {
+        const int grid_offset = r * grid_size + c;
+        const int self_idx = face_offset + grid_offset;
+        if (hidden[self_idx]) {
+          dst[dst_offset++] = grid[grid_offset];
+          continue;
+        }
+        T sum = T(0.0f);
+        int count = 0;
+        if (!hidden[self_idx - 1]) {
+          sum += grid[grid_offset - 1];
+          count++;
+        }
+        if (!hidden[self_idx + 1]) {
+          sum += grid[grid_offset + 1];
+          count++;
+        }
+        if (!hidden[self_idx - grid_size]) {
+          sum += grid[grid_offset - grid_size];
+          count++;
+        }
+        if (!hidden[self_idx + grid_size]) {
+          sum += grid[grid_offset + grid_size];
+          count++;
+        }
+        if (count == 0) {
+          dst[dst_offset++] = grid[grid_offset];
+        }
+        else {
+          dst[dst_offset++] = sum / count;
+        }
+      }
+      {
+        const int self_idx = face_offset + r * grid_size + grid_size - 1;
+        if (hidden[self_idx]) {
+          dst[dst_offset++] = grid[r * grid_size + grid_size - 1];
+        }
+        else {
+          dst[dst_offset++] = border_average_hidden(
+              r, grid_size - 1, sub_faces, grid[r * grid_size + grid_size - 1]);
+        }
+      }
+    }
+    for (const int c : IndexRange(grid_size)) {
+      const int self_idx = face_offset + (grid_size - 1) * grid_size + c;
+      if (hidden[self_idx]) {
+        dst[dst_offset++] = grid[(grid_size - 1) * grid_size + c];
+        continue;
+      }
+      dst[dst_offset++] = border_average_hidden(
+          grid_size - 1, c, sub_faces, grid[(grid_size - 1) * grid_size + c]);
+    }
+  }
+}
+
+template<typename T>
+static void neighbor_data_average_face_multires(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &base_topo,
+    const Span<int> node_faces,
+    const Span<int> edge_offsets,
+    const Span<int> face_offsets,
+    const Span<T> attr,
+    const MutableSpan<T> dst,
+    const Span<bool> hidden = {})
+{
+  if (hidden.is_empty()) {
+    neighbor_data_average_face_multires_impl<T, false>(
+        multires, base_topo, node_faces, edge_offsets, face_offsets, attr, dst, {});
+  }
+  else {
+    neighbor_data_average_face_multires_impl<T, true>(
+        multires, base_topo, node_faces, edge_offsets, face_offsets, attr, dst, hidden);
+  }
+}
+
+template<typename T>
+void neighbor_data_average_node_multires(const Multiresolution &multires,
+                                         const bke::multiresolution::BaseTopology &base_topo,
+                                         const bke::pbvh::MultiresNode &node,
+                                         const bke::multiresolution::OffsetsSpan &offsets,
+                                         const Span<T> attr,
+                                         const MutableSpan<T> dst,
+                                         const Span<bool> hidden)
+{
+  const int grid_size = multires.grid_size();
+  neighbor_data_average_vert_multires(base_topo,
+                                      grid_size,
+                                      node.verts(),
+                                      offsets.verts,
+                                      offsets.edges,
+                                      attr,
+                                      dst.slice(node.local_verts_range()),
+                                      hidden);
+  neighbor_data_average_edge_multires(multires,
+                                      base_topo,
+                                      node.edges(),
+                                      node.edges_offset(),
+                                      offsets.verts,
+                                      offsets.faces,
+                                      attr,
+                                      dst.slice(node.local_edges_range(grid_size)),
+                                      hidden);
+  neighbor_data_average_face_multires(multires,
+                                      base_topo,
+                                      node.faces(),
+                                      offsets.edges,
+                                      offsets.faces,
+                                      attr,
+                                      dst.slice(node.local_faces_range(grid_size)),
+                                      hidden);
+}
+
+template void neighbor_data_average_node_multires<float>(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &,
+    const bke::pbvh::MultiresNode &,
+    const bke::multiresolution::OffsetsSpan &,
+    const Span<float>,
+    const MutableSpan<float>,
+    const Span<bool>);
+
+template void neighbor_data_average_node_multires<float3>(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &,
+    const bke::pbvh::MultiresNode &,
+    const bke::multiresolution::OffsetsSpan &,
+    const Span<float3>,
+    const MutableSpan<float3>,
+    const Span<bool>);
+
+template void neighbor_data_average_node_multires<float4>(
+    const Multiresolution &multires,
+    const bke::multiresolution::BaseTopology &,
+    const bke::pbvh::MultiresNode &,
+    const bke::multiresolution::OffsetsSpan &,
+    const Span<float4>,
+    const MutableSpan<float4>,
+    const Span<bool>);
 
 static float3 average_positions(const CCGKey &key,
                                 const Span<float3> positions,
@@ -581,6 +1165,103 @@ void calc_relaxed_translations_faces(const Span<float3> vert_positions,
   }
 }
 
+void calc_relaxed_translations_multires(const Object &object,
+                                        const Multiresolution &multires,
+                                        const bke::multiresolution::BaseTopology &base_topo,
+                                        const bke::pbvh::MultiresNode &node,
+                                        const Span<int> face_sets,
+                                        const bool filter_boundary_face_sets,
+                                        const Span<float> factors,
+                                        const MutableSpan<float3> translations)
+{
+  using MultiresCoord = bke::multiresolution::MultiresCoord;
+  using ElemType = bke::multiresolution::ElemType;
+
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = multires.positions();
+  const Span<float3> node_positions = positions.slice(node_range);
+  const Span<float3> node_normals = multires.normals().slice(node_range);
+  const Span<bool> hidden = multires.hidden_verts();
+
+  auto average_positions = [&](const Span<MultiresCoord> coords) -> float3 {
+    const float factor = math::rcp(float(coords.size()));
+    float3 result(0);
+    for (const MultiresCoord coord : coords) {
+      const int idx = coord.to_index(pbvh.offsets);
+      result += positions[idx] * factor;
+    }
+    return result;
+  };
+
+  auto calc_boundary_normal_corner = [&](const float3 &current_position,
+                                         const Span<MultiresCoord> neighbors) -> float3 {
+    float3 normal(0);
+    for (const MultiresCoord coord : neighbors) {
+      const int idx = coord.to_index(pbvh.offsets);
+      const float3 to_neighbor = positions[idx] - current_position;
+      normal += math::normalize(to_neighbor);
+    }
+    return math::normalize(normal);
+  };
+
+  node.foreach_coord(grid_size, [&](const int node_vert, const MultiresCoord coord) {
+    if (factors[node_vert] == 0.0f) {
+      translations[node_vert] = float3(0);
+      return;
+    }
+
+    Vector<MultiresCoord> neighbors;
+    Multiresolution::calc_neighbors(coord, base_topo, grid_size, pbvh.offsets, hidden, neighbors);
+
+    if (neighbors.size() <= 2) {
+      translations[node_vert] = float3(0);
+      return;
+    }
+
+    const bool is_boundary = boundary::vert_is_boundary(
+        coord, base_topo.boundary_verts, base_topo.boundary_edges);
+
+    if (is_boundary) {
+      neighbors.remove_if([&](const MultiresCoord neighbor) {
+        return !boundary::vert_is_boundary(
+            neighbor, base_topo.boundary_verts, base_topo.boundary_edges);
+      });
+    }
+
+    if (filter_boundary_face_sets) {
+      neighbors.remove_if([&](const MultiresCoord neighbor) {
+        return face_set::vert_has_unique_face_set(neighbor, base_topo, grid_size, face_sets);
+      });
+    }
+
+    if (neighbors.is_empty()) {
+      translations[node_vert] = float3(0);
+      return;
+    }
+
+    const float3 smoothed_position = average_positions(neighbors);
+
+    float3 normal;
+    if (is_boundary && neighbors.size() == 2) {
+      normal = calc_boundary_normal_corner(node_positions[node_vert], neighbors);
+      if (math::is_zero(normal)) {
+        translations[node_vert] = float3(0);
+        return;
+      }
+    }
+    else {
+      normal = node_normals[node_vert];
+    }
+
+    const float3 translation = translation_to_plane(
+        node_positions[node_vert], normal, smoothed_position);
+
+    translations[node_vert] = translation * factors[node_vert];
+  });
+}
+
 void calc_relaxed_translations_grids(const SubdivCCG &subdiv_ccg,
                                      const OffsetIndices<int> faces,
                                      const Span<int> corner_verts,
@@ -792,6 +1473,43 @@ void blur_geometry_data_array(const Object &object,
                   data.as_span(), neighbors, new_factors.as_mutable_span());
 
               scatter_data_mesh(new_factors.as_span(), verts, data);
+            },
+            exec_mode::grain_size(1));
+      }
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      const int grid_size = multires.grid_size();
+      const Span<bool> hidden = multires.hidden_verts();
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      for ([[maybe_unused]] const int _ : IndexRange(iterations)) {
+        node_mask.foreach_index(
+            [&](const int node_index) {
+              const IndexRange node_range = nodes[node_index].range(grid_size);
+              Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> new_factors(node_range.size());
+
+              smooth::neighbor_data_average_node_multires(multires,
+                                                          base_topo,
+                                                          nodes[node_index],
+                                                          pbvh.offsets,
+                                                          data.as_span(),
+                                                          new_factors.as_mutable_span(),
+                                                          hidden);
+
+              if (hidden.is_empty()) {
+                data.slice(node_range).copy_from(new_factors);
+              }
+              else {
+                const int node_offset = nodes[node_index].offset();
+                for (const int vert : node_range) {
+                  if (!hidden[vert]) {
+                    data[vert] = new_factors[vert - node_offset];
+                  }
+                }
+              }
             },
             exec_mode::grain_size(1));
       }

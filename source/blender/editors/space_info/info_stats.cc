@@ -437,12 +437,17 @@ static void stats_object_mesh_paint(const Object *ob, SceneStats *stats)
   if (ss == nullptr || pbvh == nullptr) {
     return;
   }
-
+  const Mesh &mesh = *id_cast<const Mesh *>(ob->data);
   switch (pbvh->type()) {
     case bke::pbvh::Type::Mesh: {
-      const Mesh &mesh = *id_cast<const Mesh *>(ob->data);
       stats->totvertactive = mesh.verts_num;
       stats->totfaceactive = mesh.faces_num;
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Multiresolution &multires = *mesh.multires;
+      stats->totvertactive = multires.verts_num();
+      stats->totfaceactive = multires.faces_num();
       break;
     }
     case bke::pbvh::Type::BMesh:

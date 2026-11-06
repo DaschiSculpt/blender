@@ -86,6 +86,8 @@ namespace ed::sculpt_paint::expand {
  *   sets, colors...) is updated.
  */
 
+using MultiresCoord = bke::multiresolution::MultiresCoord;
+
 /**
  * Used for defining an invalid vertex state (for example, when the cursor is not over the mesh).
  */
@@ -169,6 +171,12 @@ static bool is_face_in_active_component(const Object &object,
   switch (bke::object::pbvh_get(object)->type()) {
     case bke::pbvh::Type::Mesh:
       return is_vert_in_active_component(ss, expand_cache, corner_verts[faces[f].start()]);
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const Span<int> mr_corner_verts = multires.corner_verts();
+      return is_vert_in_active_component(ss, expand_cache, mr_corner_verts[f * 4]);
+    }
     case bke::pbvh::Type::Grids:
       return is_vert_in_active_component(
           ss,
@@ -358,7 +366,8 @@ static BitVector<> enabled_state_to_bitmap(const Depsgraph &depsgraph,
     }
     return enabled_verts;
   }
-  switch (bke::object::pbvh_get(object)->type()) {
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
       const Mesh &mesh = *id_cast<const Mesh *>(object.data);
       const Span<float3> positions = bke::pbvh::vert_positions_eval(depsgraph, object);
@@ -385,6 +394,41 @@ static BitVector<> enabled_state_to_bitmap(const Depsgraph &depsgraph,
                   vert_falloff_is_enabled(ss, expand_cache, positions[vert], vert));
             }
           });
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const int grid_size = multires.grid_size();
+      const Span<int> face_sets = multires.face_sets();
+      const Span<float3> positions = multires.positions();
+      const Span<bool> hidden = multires.hidden_verts();
+
+      IndexMaskMemory memory;
+      const IndexMask node_mask = bke::pbvh::all_leaf_nodes(pbvh, memory);
+      node_mask.foreach_index(
+          [&](const int i) {
+            nodes[i].foreach_coord(grid_size, [&](const int node_vert, MultiresCoord coord) {
+              const int vert = node_vert + nodes[i].offset();
+              if (!hidden.is_empty() && hidden[vert]) {
+                return;
+              }
+              if (!is_vert_in_active_component(ss, expand_cache, vert)) {
+                return;
+              }
+              if (expand_cache.snap) {
+                const int face_set = face_set::vert_face_set_get(
+                    coord, base_topo, grid_size, face_sets);
+                enabled_verts[vert].set(expand_cache.snap_enabled_face_sets->contains(face_set));
+                return;
+              }
+              enabled_verts[vert].set(
+                  vert_falloff_is_enabled(ss, expand_cache, positions[vert], vert));
+            });
+          },
+          exec_mode::serial);
       break;
     }
     case bke::pbvh::Type::Grids: {
@@ -465,7 +509,7 @@ static IndexMask boundary_from_enabled(Object &object,
                                        IndexMaskMemory &memory)
 {
   SculptSession &ss = *object.runtime->sculpt_session;
-
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const IndexMask enabled_mask = IndexMask::from_bits(enabled_verts, memory);
 
   switch (bke::object::pbvh_get(object)->type()) {
@@ -489,6 +533,37 @@ static IndexMask boundary_from_enabled(Object &object,
         if (use_mesh_boundary &&
             boundary::vert_is_boundary(
                 vert_to_face_map, hide_poly, ss.boundary_info_cache->verts, vert))
+        {
+          return true;
+        }
+
+        return false;
+      });
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const BitSpan boundary_verts = base_topo.boundary_verts;
+      const BitSpan boundary_edges = base_topo.boundary_edges;
+      const int grid_size = multires.grid_size();
+      const Span<bool> hidden = multires.hidden_verts();
+
+      multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+
+      return IndexMask::from_predicate(enabled_mask, memory, [&](const int vert) {
+        const MultiresCoord coord = multires.coord_from_index(vert);
+        Vector<MultiresCoord> neighbors;
+        Multiresolution::calc_neighbors(
+            coord, base_topo, grid_size, pbvh.offsets, hidden, neighbors);
+        for (const MultiresCoord neighbor : neighbors) {
+          const int neighbor_idx = neighbor.to_index(pbvh.offsets);
+          if (!enabled_verts[neighbor_idx]) {
+            return true;
+          }
+        }
+
+        if (use_mesh_boundary && boundary::vert_is_boundary(coord, boundary_verts, boundary_edges))
         {
           return true;
         }
@@ -606,6 +681,38 @@ Vector<int> find_symm_verts_mesh(const Depsgraph &depsgraph,
   return symm_verts;
 }
 
+Vector<int> find_symm_verts_multires(const Object &object,
+                                     const int original_vert,
+                                     const float max_distance)
+{
+  const ePaintSymmetryFlags symm = mesh_symmetry_xyz_get(object);
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bool use_original = false;
+
+  Vector<int> symm_verts;
+  symm_verts.append(original_vert);
+
+  const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+  const Multiresolution &multires = *mesh.multires;
+  const Span<float3> positions = multires.positions();
+  const float3 location = positions[original_vert];
+  for (int symm_it = 1; symm_it <= symm; symm_it++) {
+    if (!is_symmetry_iteration_valid(symm_it, symm)) {
+      continue;
+    }
+    const float3 symm_location = symmetry_flip(location, ePaintSymmetryFlags(symm_it));
+    const std::optional<bke::multiresolution::MultiresCoord> nearest = nearest_vert_calc_multires(
+        pbvh, multires, symm_location, max_distance, use_original);
+    if (!nearest) {
+      continue;
+    }
+    symm_verts.append(nearest->to_index(pbvh.offsets));
+  }
+
+  std::ranges::sort(symm_verts);
+  return symm_verts;
+}
+
 Vector<int> find_symm_verts_grids(const Object &object,
                                   const int original_vert,
                                   const float max_distance)
@@ -680,6 +787,8 @@ Vector<int> find_symm_verts(const Depsgraph &depsgraph,
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       return find_symm_verts_mesh(depsgraph, object, original_vert, max_distance);
+    case bke::pbvh::Type::Multires:
+      return find_symm_verts_multires(object, original_vert, max_distance);
     case bke::pbvh::Type::Grids:
       return find_symm_verts_grids(object, original_vert, max_distance);
     case bke::pbvh::Type::BMesh:
@@ -698,6 +807,8 @@ std::array<int, PAINT_SYMM_AREAS> find_all_symm_verts(const Depsgraph &depsgraph
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       return find_all_symm_verts_mesh(depsgraph, object, original_vert, max_distance);
+    case bke::pbvh::Type::Multires:
+      return find_all_symm_verts_multires(object, original_vert, max_distance);
     case bke::pbvh::Type::Grids:
       return find_all_symm_verts_grids(object, original_vert, max_distance);
     case bke::pbvh::Type::BMesh:
@@ -737,6 +848,38 @@ std::array<int, PAINT_SYMM_AREAS> find_all_symm_verts_mesh(const Depsgraph &deps
       continue;
     }
     symm_verts[symm_it] = *nearest;
+  }
+
+  return symm_verts;
+}
+
+std::array<int, PAINT_SYMM_AREAS> find_all_symm_verts_multires(const Object &object,
+                                                               const int original_vert,
+                                                               const float max_distance)
+{
+  const ePaintSymmetryFlags symm = mesh_symmetry_xyz_get(object);
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const bool use_original = false;
+
+  std::array<int, PAINT_SYMM_AREAS> symm_verts;
+  symm_verts.fill(-1);
+  symm_verts[0] = original_vert;
+
+  const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+  const Multiresolution &multires = *mesh.multires;
+  const Span<float3> positions = multires.positions();
+  const float3 location = positions[original_vert];
+  for (int symm_it = 1; symm_it <= PAINT_SYMM_AREAS; symm_it++) {
+    if (!is_symmetry_iteration_valid(symm_it, symm)) {
+      continue;
+    }
+    const float3 symm_location = symmetry_flip(location, ePaintSymmetryFlags(symm_it));
+    const std::optional<bke::multiresolution::MultiresCoord> nearest = nearest_vert_calc_multires(
+        pbvh, multires, symm_location, max_distance, use_original);
+    if (!nearest) {
+      continue;
+    }
+    symm_verts[symm_it] = nearest->to_index(pbvh.offsets);
   }
 
   return symm_verts;
@@ -887,6 +1030,25 @@ static void calc_topology_falloff_from_verts(Object &ob,
       });
       break;
     }
+    case bke::pbvh::Type::Multires: {
+      const Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+      multires.coord_from_index_map_ensure(base_topo, offsets);
+      flood_fill::FillDataMultires flood(totvert);
+      initial_verts.foreach_index([&](const int vert) {
+        const MultiresCoord orig_coord = multires.coord_from_index(vert);
+        flood.add_and_skip_initial(orig_coord, vert);
+      });
+      flood.execute(
+          ob, multires, base_topo, [&](const MultiresCoord from, const MultiresCoord to) {
+            const int from_vert = from.to_index(offsets);
+            const int to_vert = to.to_index(offsets);
+            distances[to_vert] = distances[from_vert] + 1.0f;
+            return true;
+          });
+      break;
+    }
     case bke::pbvh::Type::Grids: {
       const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
       const CCGKey key = BKE_subdiv_ccg_key_top_level(subdiv_ccg);
@@ -980,6 +1142,31 @@ static Array<float> normals_falloff_create(const Depsgraph &depsgraph,
       });
       break;
     }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const Span<float3> normals = multires.normals();
+      const float3 orig_normal = normals[vert];
+      const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
+      multires.coord_from_index_map_ensure(base_topo, offsets);
+      flood_fill::FillDataMultires flood(totvert);
+      flood.add_initial(multires, find_symm_verts(depsgraph, ob, vert));
+      flood.execute(
+          ob, multires, base_topo, [&](const MultiresCoord from, const MultiresCoord to) {
+            const int from_vert = from.to_index(offsets);
+            const int to_vert = to.to_index(offsets);
+            const float3 &from_normal = normals[from_vert];
+            const float3 &to_normal = normals[to_vert];
+            const float from_edge_factor = edge_factors[from_vert];
+            const float dist = math::dot(orig_normal, to_normal) *
+                               powf(from_edge_factor, edge_sensitivity);
+            edge_factors[to_vert] = math::dot(to_normal, from_normal) * from_edge_factor;
+            dists[to_vert] = std::clamp(dist, 0.0f, 1.0f);
+            return true;
+          });
+      break;
+    }
     case bke::pbvh::Type::Grids: {
       const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
       const CCGKey key = BKE_subdiv_ccg_key_top_level(subdiv_ccg);
@@ -1060,6 +1247,27 @@ static Array<float> spherical_falloff_create(const Depsgraph &depsgraph,
 
       Array<float3> locations(symm_verts.size());
       array_utils::gather(positions, symm_verts.as_span(), locations.as_mutable_span());
+
+      threading::parallel_for(positions.index_range(), 1024, [&](const IndexRange range) {
+        for (const int vert : range) {
+          float dist = std::numeric_limits<float>::max();
+          for (const float3 &location : locations) {
+            dist = std::min(dist, math::distance(positions[vert], location));
+          }
+          dists[vert] = dist;
+        }
+      });
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *mesh.multires;
+      const Span<float3> positions = multires.positions();
+
+      Array<float3> locations(symm_verts.size());
+      for (const int i : symm_verts.index_range()) {
+        locations[i] = positions[symm_verts[i]];
+      }
 
       threading::parallel_for(positions.index_range(), 1024, [&](const IndexRange range) {
         for (const int vert : range) {
@@ -1237,10 +1445,16 @@ static void update_max_vert_falloff_value(const Object &object, Cache &expand_ca
  */
 static void update_max_face_falloff_factor(const Object &object, Mesh &mesh, Cache &expand_cache)
 {
-  const OffsetIndices<int> faces = mesh.faces();
-  const Span<int> corner_verts = mesh.corner_verts();
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const int faces_num = (pbvh.type() == bke::pbvh::Type::Multires) ? mesh.multires->faces_num() :
+                                                                     mesh.faces_num;
+  const OffsetIndices<int> faces = (pbvh.type() == bke::pbvh::Type::Multires) ?
+                                       OffsetIndices<int>() :
+                                       mesh.faces();
+  const Span<int> corner_verts = (pbvh.type() == bke::pbvh::Type::Multires) ? Span<int>() :
+                                                                              mesh.corner_verts();
   expand_cache.max_face_falloff = threading::parallel_reduce(
-      faces.index_range(),
+      IndexRange(faces_num),
       4096,
       std::numeric_limits<float>::lowest(),
       [&](const IndexRange range, float max) {
@@ -1300,6 +1514,24 @@ static void vert_to_face_falloff_mesh(Mesh *mesh, Cache &expand_cache)
   });
 }
 
+static void vert_to_face_falloff_multires(const Mesh &mesh, Cache &expand_cache)
+{
+  const Multiresolution &multires = *mesh.multires;
+  const Span<int> corner_verts = multires.corner_verts();
+  const int faces_num = multires.faces_num();
+
+  threading::parallel_for(IndexRange(faces_num), 4096, [&](const IndexRange range) {
+    for (const int face : range) {
+      float accum = 0.0f;
+      accum += expand_cache.vert_falloff[corner_verts[face * 4 + 0]];
+      accum += expand_cache.vert_falloff[corner_verts[face * 4 + 1]];
+      accum += expand_cache.vert_falloff[corner_verts[face * 4 + 2]];
+      accum += expand_cache.vert_falloff[corner_verts[face * 4 + 3]];
+      expand_cache.face_falloff[face] = accum * 0.25f;
+    }
+  });
+}
+
 /**
  * Main function to update the faces falloff from a already calculated vertex falloff.
  */
@@ -1307,17 +1539,23 @@ static void vert_to_face_falloff(Object &object, Mesh *mesh, Cache &expand_cache
 {
   BLI_assert(!expand_cache.vert_falloff.is_empty());
 
-  expand_cache.face_falloff.reinitialize(mesh->faces_num);
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
 
-  if (pbvh.type() == bke::pbvh::Type::Mesh) {
-    vert_to_face_falloff_mesh(mesh, expand_cache);
-  }
-  else if (pbvh.type() == bke::pbvh::Type::Grids) {
-    vert_to_face_falloff_grids(*object.runtime->sculpt_session, mesh, expand_cache);
+  if (pbvh.type() == bke::pbvh::Type::Multires) {
+    expand_cache.face_falloff.reinitialize(mesh->multires->faces_num());
+    vert_to_face_falloff_multires(*mesh, expand_cache);
   }
   else {
-    BLI_assert(false);
+    expand_cache.face_falloff.reinitialize(mesh->faces_num);
+    if (pbvh.type() == bke::pbvh::Type::Mesh) {
+      vert_to_face_falloff_mesh(mesh, expand_cache);
+    }
+    else if (pbvh.type() == bke::pbvh::Type::Grids) {
+      vert_to_face_falloff_grids(*object.runtime->sculpt_session, mesh, expand_cache);
+    }
+    else {
+      BLI_assert(false);
+    }
   }
 }
 
@@ -1429,6 +1667,26 @@ static void init_from_face_set_boundary(const Depsgraph &depsgraph,
               vert_to_face_map, face_sets, vert, active_face_set);
           vert_has_unique_face_set[vert] = face_set::vert_has_unique_face_set(
               vert_to_face_map, face_sets, vert);
+        }
+      });
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const int grid_size = multires.grid_size();
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      const Span<int> face_sets = multires.face_sets();
+
+      multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+
+      threading::parallel_for(IndexRange(totvert), 1024, [&](const IndexRange range) {
+        for (const int vert : range) {
+          const MultiresCoord coord = multires.coord_from_index(vert);
+          vert_has_face_set[vert] = face_set::vert_has_face_set(
+              coord, base_topo, grid_size, face_sets, active_face_set);
+          vert_has_unique_face_set[vert] = face_set::vert_has_unique_face_set(
+              coord, base_topo, grid_size, face_sets);
         }
       });
       break;
@@ -1641,10 +1899,17 @@ static void expand_cache_free(SculptSession &ss)
 static void restore_face_set_data(Object &object, Cache &expand_cache)
 {
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
-  bke::SpanAttributeWriter<int> face_sets = face_set::ensure_face_sets_mesh(
-      *id_cast<Mesh *>(object.data));
-  face_sets.span.copy_from(expand_cache.original_face_sets);
-  face_sets.finish();
+  if (pbvh.type() == bke::pbvh::Type::Multires) {
+    Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+    const MutableSpan<int> face_sets = face_set::ensure_face_sets_multires(base_mesh);
+    array_utils::copy(expand_cache.original_face_sets.as_span(), face_sets);
+  }
+  else {
+    bke::SpanAttributeWriter<int> face_sets = face_set::ensure_face_sets_mesh(
+        *id_cast<Mesh *>(object.data));
+    face_sets.span.copy_from(expand_cache.original_face_sets);
+    face_sets.finish();
+  }
 
   IndexMaskMemory memory;
   const IndexMask node_mask = bke::pbvh::all_leaf_nodes(pbvh, memory);
@@ -1693,6 +1958,13 @@ static void write_mask_data(Object &object, const Span<float> mask)
                             bke::AttrDomain::Point,
                             bke::AttributeInitVArray(VArray<float>::from_span(mask)));
       bke::pbvh::update_mask_mesh(mesh, node_mask, pbvh);
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+      Multiresolution &multires = *mesh.multires;
+      multires.masks_for_write().copy_from(mask);
+      bke::pbvh::update_mask_multires(multires, node_mask, pbvh);
       break;
     }
     case bke::pbvh::Type::BMesh: {
@@ -1792,6 +2064,55 @@ static void calc_new_mask_mesh(const SculptSession &ss,
   }
 
   mask::clamp_mask(mask);
+}
+
+static bool update_mask_multires(const SculptSession &ss,
+                                 const BitSpan enabled_verts,
+                                 bke::pbvh::MultiresNode &node,
+                                 const Span<float3> positions,
+                                 const MutableSpan<float> masks,
+                                 const int grid_size)
+{
+  const Cache &expand_cache = *ss.expand_cache;
+
+  bool any_changed = false;
+
+  for (const int vert : node.range(grid_size)) {
+    const float initial_mask = masks[vert];
+
+    if (expand_cache.check_islands && !is_vert_in_active_component(ss, expand_cache, vert)) {
+      continue;
+    }
+
+    float new_mask;
+
+    if (enabled_verts[vert]) {
+      new_mask = gradient_value_get(ss, expand_cache, positions[vert], vert);
+    }
+    else {
+      new_mask = 0.0f;
+    }
+
+    if (expand_cache.preserve) {
+      if (expand_cache.invert) {
+        new_mask = math::min(new_mask, expand_cache.original_mask[vert]);
+      }
+      else {
+        new_mask = math::max(new_mask, expand_cache.original_mask[vert]);
+      }
+    }
+
+    if (new_mask == initial_mask) {
+      continue;
+    }
+
+    masks[vert] = math::clamp(new_mask, 0.0f, 1.0f);
+    any_changed = true;
+  }
+  if (any_changed) {
+    bke::pbvh::node_update_mask_multires(masks, grid_size, node);
+  }
+  return any_changed;
 }
 
 static bool update_mask_grids(const SculptSession &ss,
@@ -1912,7 +2233,30 @@ static bool update_mask_bmesh(SculptSession &ss,
  */
 static void face_sets_update(Object &object, Cache &expand_cache)
 {
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   Mesh &mesh = *id_cast<Mesh *>(object.data);
+  if (pbvh.type() == bke::pbvh::Type::Multires) {
+    const MutableSpan<int> face_sets = face_set::ensure_face_sets_multires(mesh);
+    const Multiresolution &multires = *mesh.multires;
+    const Span<bool> hide_poly = multires.hidden_faces();
+    const OffsetIndices<int> dummy_faces;
+    for (const int subface_idx : face_sets.index_range()) {
+      const bool enabled = face_state_get(
+          object, dummy_faces, {}, hide_poly, face_sets, expand_cache, subface_idx);
+      if (!enabled) {
+        continue;
+      }
+      if (expand_cache.preserve) {
+        face_sets[subface_idx] += expand_cache.next_face_set;
+      }
+      else {
+        face_sets[subface_idx] = expand_cache.next_face_set;
+      }
+    }
+    pbvh.tag_face_sets_changed(expand_cache.node_mask);
+    return;
+  }
+
   bke::SpanAttributeWriter<int> face_sets = face_set::ensure_face_sets_mesh(mesh);
   const OffsetIndices<int> faces = mesh.faces();
   const Span<int> corner_verts = mesh.corner_verts();
@@ -1933,8 +2277,6 @@ static void face_sets_update(Object &object, Cache &expand_cache)
   }
 
   face_sets.finish();
-
-  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   pbvh.tag_face_sets_changed(expand_cache.node_mask);
 }
 
@@ -2013,11 +2355,16 @@ static void original_state_store(Object &ob, Cache &expand_cache)
   Mesh &mesh = *id_cast<Mesh *>(ob.data);
   const int totvert = vertex_count_get(ob);
 
-  face_set::create_face_sets_mesh(ob);
+  if (bke::object::pbvh_get(ob)->type() == bke::pbvh::Type::Multires) {
+    face_set::ensure_face_sets_multires(mesh);
+  }
+  else {
+    face_set::create_face_sets_mesh(ob);
+  }
 
   /* Face sets are always stored as they are needed for snapping. */
-  expand_cache.initial_face_sets = face_set::duplicate_face_sets(mesh);
-  expand_cache.original_face_sets = face_set::duplicate_face_sets(mesh);
+  expand_cache.initial_face_sets = face_set::duplicate_face_sets(ob);
+  expand_cache.original_face_sets = face_set::duplicate_face_sets(ob);
 
   if (expand_cache.target == TargetType::Mask) {
     expand_cache.original_mask = mask::duplicate_mask(ob);
@@ -2045,6 +2392,20 @@ static void original_state_store(Object &ob, Cache &expand_cache)
 static void face_sets_restore(Object &object, Cache &expand_cache)
 {
   Mesh &mesh = *id_cast<Mesh *>(object.data);
+  if (bke::object::pbvh_get(object)->type() == bke::pbvh::Type::Multires) {
+    const MutableSpan<int> face_sets = face_set::ensure_face_sets_multires(mesh);
+    const OffsetIndices<int> dummy_faces;
+    for (const int i : face_sets.index_range()) {
+      if (expand_cache.original_face_sets[i] <= 0) {
+        continue;
+      }
+      if (!is_face_in_active_component(object, dummy_faces, {}, expand_cache, i)) {
+        continue;
+      }
+      face_sets[i] = expand_cache.initial_face_sets[i];
+    }
+    return;
+  }
   const OffsetIndices<int> faces = mesh.faces();
   const Span<int> corner_verts = mesh.corner_verts();
   bke::SpanAttributeWriter<int> face_sets = face_set::ensure_face_sets_mesh(mesh);
@@ -2100,6 +2461,26 @@ static void update_for_vert(bContext *C, Object &ob, const std::optional<int> ve
               depsgraph, ob, node_mask, [&](const MutableSpan<float> mask, const Span<int> verts) {
                 calc_new_mask_mesh(ss, positions, enabled_verts, verts, mask);
               });
+          break;
+        }
+        case bke::pbvh::Type::Multires: {
+          const Mesh &mesh = *id_cast<const Mesh *>(ob.data);
+          Multiresolution &multires = *mesh.multires;
+          const Span<float3> positions = multires.positions();
+          const MutableSpan<float> masks = multires.masks_for_write();
+          const int grid_size = multires.grid_size();
+          Array<bool> node_changed(node_mask.min_array_size(), false);
+
+          MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+          node_mask.foreach_index(
+              [&](const int i) {
+                node_changed[i] = update_mask_multires(
+                    ss, enabled_verts, nodes[i], positions, masks, grid_size);
+              },
+              exec_mode::grain_size(1));
+
+          IndexMaskMemory memory;
+          pbvh.tag_masks_changed(IndexMask::from_bools(node_changed, memory));
           break;
         }
         case bke::pbvh::Type::Grids: {
@@ -2246,6 +2627,23 @@ static void reposition_pivot(bContext *C, Object &ob, Cache &expand_cache)
           return;
         }
         const float3 &position = positions[vert];
+        if (!check_vertex_pivot_symmetry(position, expand_init_co, symm)) {
+          return;
+        }
+        average += double3(position);
+        total++;
+      });
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &mesh = *id_cast<const Mesh *>(ob.data);
+      const Span<float3> positions = mesh.multires->positions();
+      const float3 expand_init_co = positions[expand_cache.initial_active_vert];
+      boundary_verts.foreach_index([&](const int vert) {
+        if (!is_vert_in_active_component(ss, expand_cache, vert)) {
+          return;
+        }
+        const float3 position = positions[vert];
         if (!check_vertex_pivot_symmetry(position, expand_init_co, symm)) {
           return;
         }
@@ -2448,6 +2846,12 @@ static int active_face_set_id_get(Object &object, Cache &expand_cache)
         return face_set_none_id;
       }
       return expand_cache.original_face_sets[*ss.active_face_index];
+    case bke::pbvh::Type::Multires: {
+      if (!ss.active_face_index) {
+        return face_set_none_id;
+      }
+      return expand_cache.original_face_sets[*ss.active_face_index];
+    }
     case bke::pbvh::Type::Grids: {
       if (!ss.active_grid_index) {
         return face_set_none_id;
@@ -2732,9 +3136,91 @@ static wmOperatorStatus sculpt_expand_modal(bContext *C, wmOperator *op, const w
  * The faces that were using the `delete_id` face set are filled
  * using the content from their neighbors.
  */
+static void delete_face_set_id_multires(
+    int *r_face_sets, Object &object, Cache &expand_cache, Mesh *mesh, const int delete_id)
+{
+  const Multiresolution &multires = *mesh->multires;
+  const Span<int> corner_verts = multires.corner_verts();
+  const int faces_num = multires.faces_num();
+  const int verts_num = multires.verts_num();
+
+  Array<int> vert_to_corner_offsets;
+  Array<int> vert_to_corner_indices;
+  const GroupedSpan<int> vert_to_corner = bke::mesh::build_vert_to_corner_map(
+      corner_verts, verts_num, vert_to_corner_offsets, vert_to_corner_indices);
+
+  const OffsetIndices<int> dummy_faces;
+  const Span<int> dummy_corners;
+  bool all_same_id = true;
+  for (const int i : IndexRange(faces_num)) {
+    if (!is_face_in_active_component(object, dummy_faces, dummy_corners, expand_cache, i)) {
+      continue;
+    }
+    if (r_face_sets[i] != delete_id) {
+      all_same_id = false;
+      break;
+    }
+  }
+  if (all_same_id) {
+    return;
+  }
+
+  BLI_LINKSTACK_DECLARE(queue, void *);
+  BLI_LINKSTACK_DECLARE(queue_next, void *);
+
+  BLI_LINKSTACK_INIT(queue);
+  BLI_LINKSTACK_INIT(queue_next);
+
+  for (const int i : IndexRange(faces_num)) {
+    if (r_face_sets[i] == delete_id) {
+      BLI_LINKSTACK_PUSH(queue, POINTER_FROM_INT(i));
+    }
+  }
+
+  while (BLI_LINKSTACK_SIZE(queue)) {
+    bool any_updated = false;
+    while (BLI_LINKSTACK_SIZE(queue)) {
+      const int f_index = POINTER_AS_INT(BLI_LINKSTACK_POP(queue));
+      int other_id = delete_id;
+      for (const int k : IndexRange(4)) {
+        const int vert = corner_verts[f_index * 4 + k];
+        for (const int corner : vert_to_corner[vert]) {
+          const int neighbor_face_index = corner / 4;
+          if (expand_cache.original_face_sets[neighbor_face_index] <= 0) {
+            continue;
+          }
+          if (r_face_sets[neighbor_face_index] != delete_id) {
+            other_id = r_face_sets[neighbor_face_index];
+          }
+        }
+      }
+
+      if (other_id != delete_id) {
+        any_updated = true;
+        r_face_sets[f_index] = other_id;
+      }
+      else {
+        BLI_LINKSTACK_PUSH(queue_next, POINTER_FROM_INT(f_index));
+      }
+    }
+    if (!any_updated) {
+      break;
+    }
+
+    BLI_LINKSTACK_SWAP(queue, queue_next);
+  }
+
+  BLI_LINKSTACK_FREE(queue);
+  BLI_LINKSTACK_FREE(queue_next);
+}
+
 static void delete_face_set_id(
     int *r_face_sets, Object &object, Cache &expand_cache, Mesh *mesh, const int delete_id)
 {
+  if (bke::object::pbvh_get(object)->type() == bke::pbvh::Type::Multires) {
+    delete_face_set_id_multires(r_face_sets, object, expand_cache, mesh, delete_id);
+    return;
+  }
   const GroupedSpan<int> vert_to_face_map = mesh->vert_to_face_map();
   const OffsetIndices faces = mesh->faces();
   const Span<int> corner_verts = mesh->corner_verts();
@@ -2878,6 +3364,16 @@ static bool any_nonzero_mask(const Object &object)
       return std::any_of(
           mask.begin(), mask.end(), [&](const float value) { return value > 0.0f; });
     }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &mesh = *id_cast<const Mesh *>(object.data);
+      const Multiresolution &multires = *mesh.multires;
+      const Span<float> mask = multires.masks();
+      if (mask.is_empty()) {
+        return false;
+      }
+      return std::any_of(
+          mask.begin(), mask.end(), [&](const float value) { return value > 0.0f; });
+    }
     case bke::pbvh::Type::Grids: {
       const SubdivCCG &subdiv_ccg = *ss.subdiv_ccg;
       const Span<float> mask = subdiv_ccg.masks;
@@ -3014,6 +3510,20 @@ static wmOperatorStatus sculpt_expand_invoke(bContext *C, wmOperator *op, const 
       const VArraySpan hide_poly = *attributes.lookup<bool>(".hide_poly", bke::AttrDomain::Face);
       if (boundary::vert_is_boundary(
               vert_to_face_map, hide_poly, ss.boundary_info_cache->verts, initial_vert))
+      {
+        falloff_type = FalloffType::BoundaryTopology;
+      }
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      const Mesh &base_mesh = *id_cast<const Mesh *>(ob.data);
+      const Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
+      multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+
+      if (boundary::vert_is_boundary(multires.coord_from_index(initial_vert),
+                                     base_topo.boundary_verts,
+                                     base_topo.boundary_edges))
       {
         falloff_type = FalloffType::BoundaryTopology;
       }

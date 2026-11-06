@@ -151,6 +151,68 @@ static void calc_faces(const Depsgraph &depsgraph,
   position_data.deform(translations, verts);
 }
 
+static void calc_multires(const Depsgraph &depsgraph,
+                          const Sculpt &sd,
+                          Multiresolution &multires,
+                          const bke::multiresolution::BaseTopology &base_topo,
+                          Object &object,
+                          const Brush &brush,
+                          const float4x4 &mat,
+                          const float3 &offset,
+                          const bke::pbvh::MultiresNode &node,
+                          const MultiresDeformData &deform_data)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+  const StrokeCache &cache = *ss.cache;
+  const int grid_size = multires.grid_size();
+  const IndexRange node_range = node.range(grid_size);
+  const Span<float3> positions = deform_data.positions.slice(node_range);
+  const Span<float3> normals = multires.normals().slice(node_range);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> factors(positions.size());
+  fill_factor_from_hide_and_mask(multires.hidden_verts(), multires.masks(), node_range, factors);
+  filter_region_clip_factors(ss, positions, factors);
+  if (brush.flag & BRUSH_FRONTFACE) {
+    calc_front_face(cache.view_normal_symm, normals, factors);
+  }
+
+  Array<float2, bke::pbvh::MULTIRES_LEAF_LIMIT> xy_positions(positions.size());
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> z_positions(positions.size());
+
+  calc_local_positions(positions,
+                       mat,
+                       cache.location_symm,
+                       cache.view_normal_symm,
+                       eBrushFalloffShape(brush.falloff_shape),
+                       xy_positions,
+                       z_positions);
+  if (eBrushFalloffShape(brush.falloff_shape) == PAINT_FALLOFF_SHAPE_TUBE) {
+    z_positions.as_mutable_span().fill(brush.plane_offset);
+  }
+  apply_z_axis_factors(z_positions, factors);
+  apply_plane_trim_factors(brush, z_positions, factors);
+
+  Array<float, bke::pbvh::MULTIRES_LEAF_LIMIT> distances(positions.size());
+  calc_brush_cube_distances<float2>(brush, xy_positions, distances);
+  filter_distances_with_radius(1.0f, distances, factors);
+  apply_hardness_to_distances(1.0f, cache.hardness, distances);
+  BKE_brush_calc_curve_factors(eBrushCurvePreset(brush.curve_distance_falloff_preset),
+                               brush.curve_distance_falloff,
+                               distances,
+                               1.0f,
+                               factors);
+
+  auto_mask::calc_multires_factors(
+      depsgraph, object, multires, base_topo, cache.automasking.get(), node, factors);
+  calc_brush_texture_factors(PaintMode::Sculpt, ss, brush, positions, factors);
+
+  Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> translations(positions.size());
+  translations_from_offset_and_factors(offset, factors, translations);
+
+  clip_and_lock_translations(sd, ss, positions, translations);
+  deform_data.deform(node_range, translations);
+}
+
 static void calc_grids(const Depsgraph &depsgraph,
                        const Sculpt &sd,
                        Object &object,
@@ -307,11 +369,11 @@ void do_clay_strips_brush(const Depsgraph &depsgraph,
       brush, *ss.cache, tip_normal, plane_center, flip);
 
   const float3 offset = plane_normal * ss.cache->bstrength * ss.cache->radius;
+  Mesh &mesh = *id_cast<Mesh *>(object.data);
 
   threading::EnumerableThreadSpecific<LocalData> all_tls;
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh: {
-      Mesh &mesh = *id_cast<Mesh *>(object.data);
       MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
       const PositionDeformData position_data(depsgraph, object);
       const MeshAttributeData attribute_data(mesh);
@@ -329,6 +391,29 @@ void do_clay_strips_brush(const Depsgraph &depsgraph,
                        object,
                        position_data);
             bke::pbvh::update_node_bounds_mesh(position_data.eval, nodes[i]);
+          },
+          exec_mode::grain_size(1));
+      break;
+    }
+    case bke::pbvh::Type::Multires: {
+      Multiresolution &multires = *mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+      MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+      const MultiresDeformData deform_data(mesh);
+      node_mask.foreach_index(
+          [&](const int i) {
+            calc_multires(depsgraph,
+                          sd,
+                          multires,
+                          base_topo,
+                          object,
+                          brush,
+                          mat,
+                          offset,
+                          nodes[i],
+                          deform_data);
+            bke::pbvh::update_node_bounds_multires(
+                multires.grid_size(), multires.positions(), pbvh.offsets, nodes[i]);
           },
           exec_mode::grain_size(1));
       break;

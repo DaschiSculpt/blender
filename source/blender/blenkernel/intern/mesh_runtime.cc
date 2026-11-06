@@ -186,6 +186,91 @@ const IndexMask &Mesh::verts_no_face() const
   return this->runtime->verts_no_face_cache.data().mask;
 }
 
+OffsetIndices<int> Mesh::edge_to_face_map_offsets() const
+{
+  this->runtime->edge_to_face_offset_cache.ensure([&](Array<int> &r_data) {
+    r_data = Array<int>(this->edges_num + 1, 0);
+    offset_indices::build_reverse_offsets(this->corner_edges(), r_data);
+  });
+  return OffsetIndices<int>(this->runtime->edge_to_face_offset_cache.data());
+}
+
+GroupedSpan<int> Mesh::edge_to_face_map() const
+{
+  const OffsetIndices offsets = this->edge_to_face_map_offsets();
+  this->runtime->edge_to_face_map_cache.ensure([&](Array<int> &r_data) {
+    r_data = bke::mesh::build_edge_to_face_indices(this->faces(), this->corner_edges(), offsets);
+  });
+  return {offsets, this->runtime->edge_to_face_map_cache.data()};
+}
+
+OffsetIndices<int> Mesh::vert_to_edge_map_offsets() const
+{
+  this->runtime->vert_to_edge_offset_cache.ensure([&](Array<int> &r_data) {
+    r_data = Array<int>(this->verts_num + 1, 0);
+    offset_indices::build_reverse_offsets(this->edges().cast<int>(), r_data);
+  });
+  return OffsetIndices<int>(this->runtime->vert_to_edge_offset_cache.data());
+}
+
+GroupedSpan<int> Mesh::vert_to_edge_map() const
+{
+  const OffsetIndices offsets = this->vert_to_edge_map_offsets();
+  this->runtime->vert_to_edge_map_cache.ensure([&](Array<int> &r_data) {
+    r_data = bke::mesh::build_vert_to_edge_indices(this->edges(), offsets);
+  });
+  return {offsets, this->runtime->vert_to_edge_map_cache.data()};
+}
+
+BitSpan Mesh::face_edge_reversed() const
+{
+  this->runtime->face_edge_reversed_cache.ensure([&](BitVector<> &r_data) {
+    const Span<int> c_verts = this->corner_verts();
+    const Span<int> c_edges = this->corner_edges();
+    const Span<int2> edges = this->edges();
+    const OffsetIndices<int> faces = this->faces();
+
+    r_data.resize(this->corners_num, false);
+    for (const int face_i : faces.index_range()) {
+      for (const int corner : faces[face_i]) {
+        r_data[corner].set_branchless(c_verts[corner] != edges[c_edges[corner]][0]);
+      }
+    }
+  });
+  return this->runtime->face_edge_reversed_cache.data();
+}
+
+BitSpan Mesh::boundary_edges() const
+{
+  this->runtime->boundary_edge_cache.ensure([&](BitVector<> &r_data) {
+    const GroupedSpan<int> edge_faces = this->edge_to_face_map();
+    r_data.resize(this->edges_num, false);
+    for (const int edge_i : IndexRange(this->edges_num)) {
+      /* An edge is a boundary edge when exactly one face uses it. */
+      r_data[edge_i].set_branchless(edge_faces[edge_i].size() == 1);
+    }
+  });
+  return this->runtime->boundary_edge_cache.data();
+}
+
+BitSpan Mesh::boundary_verts() const
+{
+  this->runtime->boundary_vert_cache.ensure([&](BitVector<> &r_data) {
+    const BitSpan b_edges = this->boundary_edges();
+    const GroupedSpan<int> vert_edges = this->vert_to_edge_map();
+    r_data.resize(this->verts_num, false);
+    for (const int vert_i : IndexRange(this->verts_num)) {
+      for (const int edge_i : vert_edges[vert_i]) {
+        if (b_edges[edge_i]) {
+          r_data[vert_i].set();
+          break;
+        }
+      }
+    }
+  });
+  return this->runtime->boundary_vert_cache.data();
+}
+
 bool Mesh::no_overlapping_topology() const
 {
   return this->flag & ME_NO_OVERLAPPING_TOPOLOGY;
@@ -326,6 +411,13 @@ void BKE_mesh_runtime_clear_geometry(Mesh *mesh)
   mesh->runtime->corner_to_face_map_cache.tag_dirty();
   mesh->runtime->edge_to_corner_offset_cache.tag_dirty();
   mesh->runtime->edge_to_corner_map_cache.tag_dirty();
+  mesh->runtime->edge_to_face_offset_cache.tag_dirty();
+  mesh->runtime->edge_to_face_map_cache.tag_dirty();
+  mesh->runtime->vert_to_edge_offset_cache.tag_dirty();
+  mesh->runtime->vert_to_edge_map_cache.tag_dirty();
+  mesh->runtime->face_edge_reversed_cache.tag_dirty();
+  mesh->runtime->boundary_edge_cache.tag_dirty();
+  mesh->runtime->boundary_vert_cache.tag_dirty();
   mesh->runtime->vert_normals_cache.tag_dirty();
   mesh->runtime->vert_normals_true_cache.tag_dirty();
   mesh->runtime->face_normals_cache.tag_dirty();
@@ -366,6 +458,15 @@ void Mesh::tag_edges_split()
   {
     this->runtime->loose_verts_cache.tag_dirty();
   }
+
+  this->runtime->edge_to_face_offset_cache.tag_dirty();
+  this->runtime->edge_to_face_map_cache.tag_dirty();
+  this->runtime->vert_to_edge_offset_cache.tag_dirty();
+  this->runtime->vert_to_edge_map_cache.tag_dirty();
+  this->runtime->face_edge_reversed_cache.tag_dirty();
+  this->runtime->boundary_edge_cache.tag_dirty();
+  this->runtime->boundary_vert_cache.tag_dirty();
+
   if (this->runtime->verts_no_face_cache.is_cached() &&
       !this->runtime->verts_no_face_cache.data().mask.is_empty())
   {

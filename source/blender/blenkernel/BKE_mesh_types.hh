@@ -272,6 +272,14 @@ struct MeshRuntime {
   /** Cache of data about vertices not used by faces. See #Mesh::verts_no_face(). */
   SharedCache<LooseGeomCache> verts_no_face_cache;
 
+  SharedCache<Array<int>> edge_to_face_offset_cache;
+  SharedCache<Array<int>> edge_to_face_map_cache;
+  SharedCache<Array<int>> vert_to_edge_offset_cache;
+  SharedCache<Array<int>> vert_to_edge_map_cache;
+  SharedCache<BitVector<>> face_edge_reversed_cache;
+  SharedCache<BitVector<>> boundary_edge_cache;
+  SharedCache<BitVector<>> boundary_vert_cache;
+
   /** Cache of non-manifold boundary data for shrinkwrap target Project. */
   SharedCache<ShrinkwrapBoundaryData> shrinkwrap_boundary_cache;
 

@@ -53,6 +53,15 @@ enum eMFace_EdgeCode : char {
 };
 ENUM_OPERATORS(eMFace_EdgeCode)
 
+struct SculptLayer {
+  char name[64];
+  float opacity;
+  char is_visible;
+  char _pad[3];
+  float slider_min;
+  float slider_max;
+};
+
 /**
  * Optionally store the order of selected elements.
  * This won't always be set since only some selection operations have an order.

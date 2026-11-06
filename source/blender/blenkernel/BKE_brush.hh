@@ -268,7 +268,6 @@ bool supports_jitter(const Brush &brush);
 bool supports_normal_weight(const Brush &brush);
 bool supports_rake(const Brush &brush);
 bool supports_rake_factor(const Brush &brush);
-bool supports_persistence(const Brush &brush);
 bool supports_pinch_factor(const Brush &brush);
 bool supports_plane_offset(const Brush &brush);
 bool supports_random_texture_angle(const Brush &brush);

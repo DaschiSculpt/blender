@@ -367,7 +367,7 @@ enum eBrushFlags : uint32_t {
   BRUSH_DIR_IN = (1 << 9),
   BRUSH_UNUSED_3 = (1 << 10),
   BRUSH_SMOOTH_STROKE = (1 << 11),
-  BRUSH_PERSISTENT = (1 << 12),
+  BRUSH_USE_MORPH_AS_BASE = (1 << 12),
   BRUSH_ACCUMULATE = (1 << 13),
   BRUSH_LOCK_ALPHA = (1 << 14),
   BRUSH_ORIGINAL_NORMAL = (1 << 15),
@@ -486,6 +486,8 @@ enum eBrushSculptType : char {
   SCULPT_BRUSH_TYPE_PLANE = 33,
   SCULPT_BRUSH_TYPE_BLUR = 34,
   SCULPT_BRUSH_TYPE_SCENE_PROJECT = 35,
+  SCULPT_BRUSH_TYPE_MORPH = 36,
+  SCULPT_BRUSH_TYPE_ERASE_LAYER = 37,
 };
 
 /* Brush.curves_sculpt_brush_type. */

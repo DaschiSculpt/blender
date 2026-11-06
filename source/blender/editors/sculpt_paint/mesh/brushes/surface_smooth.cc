@@ -178,6 +178,129 @@ BLI_NOINLINE static void do_surface_smooth_brush_mesh(const Depsgraph &depsgraph
   }
 }
 
+BLI_NOINLINE static void do_surface_smooth_brush_multires(
+    const Depsgraph &depsgraph,
+    const Sculpt &sd,
+    const Brush &brush,
+    const IndexMask &node_mask,
+    Object &object,
+    const MutableSpan<float3> all_laplacian_disp)
+{
+  const SculptSession &ss = *object.runtime->sculpt_session;
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  const StrokeCache &cache = *ss.cache;
+  const float alpha = brush.surface_smooth_shape_preservation;
+  const float beta = brush.surface_smooth_current_vertex;
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+  const MultiresDeformData deform_data(base_mesh);
+  const int grid_size = multires.grid_size();
+  const Span<bool> hidden_verts = multires.hidden_verts();
+
+  Array<int> node_offset_data;
+  const OffsetIndices node_offsets = create_node_vert_offsets(
+      grid_size, nodes, node_mask, node_offset_data);
+  Array<float> all_factors(node_offsets.total_size());
+
+  threading::EnumerableThreadSpecific<LocalData> all_tls;
+  node_mask.foreach_index(
+      [&](const int i, const int pos) {
+        LocalData &tls = all_tls.local();
+
+        const IndexRange node_range = nodes[i].range(grid_size);
+        const Span<float3> positions = multires.positions().slice(node_range);
+        const Span<float3> normals = multires.normals().slice(node_range);
+
+        const MutableSpan<float> factors = all_factors.as_mutable_span().slice(node_offsets[pos]);
+        tls.distances.resize(positions.size());
+        calc_factors_common_multires(depsgraph,
+                                     brush,
+                                     object,
+                                     multires,
+                                     base_topo,
+                                     positions,
+                                     normals,
+                                     nodes[i],
+                                     factors,
+                                     tls.distances);
+
+        scale_factors(factors, cache.bstrength);
+        clamp_factors(factors);
+      },
+      exec_mode::grain_size(1));
+
+  for ([[maybe_unused]] const int iteration : IndexRange(brush.surface_smooth_iterations)) {
+    node_mask.foreach_index(
+        [&](const int i, const int pos) {
+          LocalData &tls = all_tls.local();
+          const IndexRange node_range = nodes[i].range(grid_size);
+          const MutableSpan<float3> positions = deform_data.positions.slice(node_range);
+          const OrigPositionData orig_data = orig_position_data_get_multires(object, nodes[i]);
+          const Span<float> factors = all_factors.as_span().slice(node_offsets[pos]);
+
+          tls.average_positions.resize(positions.size());
+          const MutableSpan<float3> average_positions = tls.average_positions;
+
+          smooth::neighbor_data_average_node_multires(multires,
+                                                      base_topo,
+                                                      nodes[i],
+                                                      pbvh.offsets,
+                                                      multires.positions(),
+                                                      average_positions,
+                                                      hidden_verts);
+
+          const MutableSpan<float3> laplacian_disp = all_laplacian_disp.slice(node_range);
+          tls.translations.resize(positions.size());
+          const MutableSpan<float3> translations = tls.translations;
+          smooth::surface_smooth_laplacian_step(positions,
+                                                orig_data.positions,
+                                                average_positions,
+                                                alpha,
+                                                laplacian_disp,
+                                                translations);
+          scale_translations(translations, factors);
+
+          clip_and_lock_translations(sd, ss, positions, translations);
+          deform_data.deform(node_range, translations);
+        },
+        exec_mode::grain_size(1));
+
+    node_mask.foreach_index(
+        [&](const int i, const int pos) {
+          LocalData &tls = all_tls.local();
+          const IndexRange node_range = nodes[i].range(grid_size);
+          const Span<float3> positions = deform_data.positions.slice(node_range);
+          const Span<float> factors = all_factors.as_span().slice(node_offsets[pos]);
+
+          const MutableSpan<float3> laplacian_disp = all_laplacian_disp.slice(node_range);
+
+          tls.average_positions.resize(positions.size());
+          const MutableSpan<float3> average_laplacian_disps = tls.average_positions;
+
+          smooth::neighbor_data_average_node_multires(multires,
+                                                      base_topo,
+                                                      nodes[i],
+                                                      pbvh.offsets,
+                                                      all_laplacian_disp.as_span(),
+                                                      average_laplacian_disps,
+                                                      hidden_verts);
+
+          tls.translations.resize(positions.size());
+          const MutableSpan<float3> translations = tls.translations;
+          smooth::surface_smooth_displace_step(
+              laplacian_disp, average_laplacian_disps, beta, translations);
+          scale_translations(translations, factors);
+
+          clip_and_lock_translations(sd, ss, positions, translations);
+          deform_data.deform(node_range, translations);
+        },
+        exec_mode::grain_size(1));
+  }
+}
+
 BLI_NOINLINE static void do_surface_smooth_brush_grids(
     const Depsgraph &depsgraph,
     const Sculpt &sd,
@@ -395,6 +518,11 @@ void do_surface_smooth_brush(const Depsgraph &depsgraph,
       do_surface_smooth_brush_mesh(
           depsgraph, sd, brush, node_mask, object, ss.cache->surface_smooth_laplacian_disp);
       break;
+    case bke::pbvh::Type::Multires: {
+      do_surface_smooth_brush_multires(
+          depsgraph, sd, brush, node_mask, object, ss.cache->surface_smooth_laplacian_disp);
+      break;
+    }
     case bke::pbvh::Type::Grids: {
       do_surface_smooth_brush_grids(
           depsgraph, sd, brush, node_mask, object, ss.cache->surface_smooth_laplacian_disp);

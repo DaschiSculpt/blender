@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import bpy
+from bpy.props import IntProperty
 from bpy.types import Menu, Panel, UIList, WindowManager
 from bpy.app.translations import (
     pgettext_iface as iface_,
@@ -34,6 +35,7 @@ from bl_ui.properties_paint_common import (
     show_experimental_texture_paint,
 )
 from bl_ui.utils import PresetPanel
+from bl_ui.properties_data_mesh import draw_multires, draw_sculpt_layers, draw_multires_bake
 
 
 class VIEW3D_MT_brush_context_menu(Menu):
@@ -937,6 +939,11 @@ class VIEW3D_PT_sculpt_dyntopo(Panel, View3DPaintPanel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
+        if not context.sculpt_object.use_dynamic_topology_sculpting and context.sculpt_object.data.has_multires:
+            box = layout.box()
+            box.label(text="Mesh has multiresolution data.", icon='INFO')
+            box.label(text="Dyntopo will invalidate it.")
+
         tool_settings = context.tool_settings
         sculpt = tool_settings.sculpt
         settings = self.paint_settings_from_active_tool(context)
@@ -961,6 +968,105 @@ class VIEW3D_PT_sculpt_dyntopo(Panel, View3DPaintPanel):
 
         if sculpt.detail_type_method in {'CONSTANT', 'MANUAL'}:
             col.operator("sculpt.detail_flood_fill")
+
+
+class VIEW3D_PT_sculpt_multires(Panel, View3DPaintPanel):
+    bl_context = ".sculpt_mode"
+    bl_label = "Multiresolution"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_ui_units_x = 12
+
+    @classmethod
+    def poll(cls, context):
+        return (context.sculpt_object and context.tool_settings.sculpt)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        draw_multires(layout, context.sculpt_object.data, ob=context.sculpt_object)
+
+
+class VIEW3D_PT_sculpt_multires_bake(Panel, View3DPaintPanel):
+    bl_context = ".sculpt_mode"
+    bl_label = "Bake"
+    bl_parent_id = "VIEW3D_PT_sculpt_multires"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_ui_units_x = 12
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.sculpt_object
+        return (obj and obj.type == 'MESH' and context.tool_settings.sculpt and
+                obj.data.has_multires)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        draw_multires_bake(layout, context.tool_settings.sculpt, context.sculpt_object.data, ob=context.sculpt_object)
+
+
+class VIEW3D_PT_sculpt_layers(Panel, View3DPaintPanel):
+    bl_context = ".sculpt_mode"
+    bl_label = "Layers"
+    bl_ui_units_x = 12
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.sculpt_object and
+            context.tool_settings.sculpt and
+            context.region.type != 'TOOL_HEADER'
+        )
+
+    def draw(self, context):
+        draw_sculpt_layers(self.layout, context.sculpt_object.data)
+
+
+class VIEW3D_PT_sculpt_morph(Panel, View3DPaintPanel):
+    bl_context = ".sculpt_mode"
+    bl_label = "Morph"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_ui_units_x = 12
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.sculpt_object and
+            context.tool_settings.sculpt and
+            context.region.type != 'TOOL_HEADER'
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        sculpt = context.tool_settings.sculpt
+
+        col = layout.column(align=True)
+        props = col.operator("sculpt.morph_store", text="Store")
+        props.store_mode = sculpt.morph_store_mode
+        props.use_undo = not sculpt.morph_skip_undo
+
+        col = layout.column()
+        row = col.row(align=True)
+        props = row.operator("sculpt.morph_swap", text="Swap")
+        props.use_undo = not sculpt.morph_skip_undo
+        props.use_mask = sculpt.morph_use_mask
+        props.use_hide = sculpt.morph_use_hide
+        props = row.operator("sculpt.morph_delete", text="Delete")
+        props.use_undo = not sculpt.morph_skip_undo
+
+        layout.separator()
+
+        layout.prop(sculpt, "morph_store_mode", text="Store Mode")
+        col = layout.column(heading="Options", align=True)
+        col.prop(sculpt, "morph_skip_undo", text="Record Undo Steps")
+        col.prop(sculpt, "morph_use_mask", text="Respect Mask")
+        col.prop(sculpt, "morph_use_hide", text="Respect Visibility")
 
 
 class VIEW3D_PT_sculpt_voxel_remesh(Panel, View3DPaintPanel):
@@ -2459,6 +2565,10 @@ classes = (
     VIEW3D_PT_tools_weight_gradient,
 
     VIEW3D_PT_sculpt_dyntopo,
+    VIEW3D_PT_sculpt_multires,
+    VIEW3D_PT_sculpt_multires_bake,
+    VIEW3D_PT_sculpt_layers,
+    VIEW3D_PT_sculpt_morph,
     VIEW3D_PT_sculpt_voxel_remesh,
     VIEW3D_PT_sculpt_symmetry,
     VIEW3D_PT_sculpt_symmetry_for_topbar,

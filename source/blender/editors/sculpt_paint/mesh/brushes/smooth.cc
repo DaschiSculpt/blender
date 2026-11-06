@@ -86,6 +86,25 @@ BLI_NOINLINE static void apply_positions_faces(const Sculpt &sd,
   position_data.deform(translations, verts);
 }
 
+BLI_NOINLINE static void apply_positions_multires(const Sculpt &sd,
+                                                  Object &object,
+                                                  LocalData &tls,
+                                                  const Span<float> factors,
+                                                  const Span<float3> new_positions,
+                                                  const MutableSpan<float3> positions,
+                                                  const MultiresDeformData &deform_data,
+                                                  const IndexRange node_range)
+{
+  SculptSession &ss = *object.runtime->sculpt_session;
+
+  tls.translations.resize(factors.size());
+  const MutableSpan<float3> translations = tls.translations;
+  translations_from_new_positions(new_positions, positions, translations);
+  scale_translations(translations, factors);
+  clip_and_lock_translations(sd, ss, positions, translations);
+  deform_data.deform(node_range, translations);
+}
+
 BLI_NOINLINE static void do_smooth_brush_mesh(const Depsgraph &depsgraph,
                                               const Sculpt &sd,
                                               const Brush &brush,
@@ -183,6 +202,95 @@ BLI_NOINLINE static void do_smooth_brush_mesh(const Depsgraph &depsgraph,
                                 all_factors.as_mutable_span().slice(node_vert_offsets[pos]),
                                 new_positions.as_span().slice(node_vert_offsets[pos]),
                                 position_data);
+        },
+        exec_mode::grain_size(1));
+  }
+}
+
+BLI_NOINLINE static void do_smooth_brush_multires(const Depsgraph &depsgraph,
+                                                  const Sculpt &sd,
+                                                  const Brush &brush,
+                                                  const float4x4 &mat,
+                                                  Object &object,
+                                                  const IndexMask &node_mask,
+                                                  const float brush_strength)
+{
+  Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  Multiresolution &multires = *base_mesh.multires;
+  const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
+  const int grid_size = multires.grid_size();
+  const MultiresDeformData deform_data(base_mesh);
+  const Span<float3> normals = multires.normals();
+  const Span<bool> hidden = multires.hidden_verts();
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
+  MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+  const Span<float3> positions = multires.positions();
+  Array<float3> new_positions(positions.size());
+  Array<float> all_factors(positions.size());
+  Array<float> all_distances(positions.size());
+
+  threading::EnumerableThreadSpecific<LocalData> all_tls;
+
+  for (const float strength : iteration_strengths(brush_strength)) {
+    node_mask.foreach_index(
+        [&](const int i) {
+          const IndexRange node_range = nodes[i].range(grid_size);
+          const MutableSpan<float> node_factors = all_factors.as_mutable_span().slice(node_range);
+          MutableSpan<float> node_distances = all_distances.as_mutable_span().slice(node_range);
+
+          if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+            Array<float3, bke::pbvh::MULTIRES_LEAF_LIMIT> local_positions(node_range.size());
+            calc_cube_tip_factors_common_multires(depsgraph,
+                                                  brush,
+                                                  object,
+                                                  mat,
+                                                  multires,
+                                                  base_topo,
+                                                  positions.slice(node_range),
+                                                  normals.slice(node_range),
+                                                  local_positions,
+                                                  nodes[i],
+                                                  node_factors,
+                                                  node_distances);
+          }
+          else {
+            calc_factors_common_multires(depsgraph,
+                                         brush,
+                                         object,
+                                         multires,
+                                         base_topo,
+                                         positions.slice(node_range),
+                                         normals.slice(node_range),
+                                         nodes[i],
+                                         node_factors,
+                                         node_distances);
+          }
+          scale_factors(node_factors, strength);
+
+          smooth::neighbor_data_average_node_multires<float3>(
+              multires,
+              base_topo,
+              nodes[i],
+              pbvh.offsets,
+              positions,
+              new_positions.as_mutable_span().slice(node_range),
+              hidden);
+        },
+        exec_mode::grain_size(1));
+
+    node_mask.foreach_index(
+        [&](const int i) {
+          LocalData &tls = all_tls.local();
+          const IndexRange node_range = nodes[i].range(grid_size);
+          apply_positions_multires(sd,
+                                   object,
+                                   tls,
+                                   all_factors.as_mutable_span().slice(node_range),
+                                   new_positions.as_span().slice(node_range),
+                                   deform_data.positions.slice(node_range),
+                                   deform_data,
+                                   node_range);
         },
         exec_mode::grain_size(1));
   }
@@ -317,6 +425,9 @@ void do_smooth_brush(const Depsgraph &depsgraph,
   switch (pbvh.type()) {
     case bke::pbvh::Type::Mesh:
       do_smooth_brush_mesh(depsgraph, sd, brush, mat, object, node_mask, brush_strength);
+      break;
+    case bke::pbvh::Type::Multires:
+      do_smooth_brush_multires(depsgraph, sd, brush, mat, object, node_mask, brush_strength);
       break;
     case bke::pbvh::Type::Grids: {
       const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
