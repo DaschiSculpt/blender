@@ -1705,6 +1705,7 @@ template<typename T> Span<T> Multiresolution::attribute(const StringRef name) co
 template Span<float> Multiresolution::attribute(const StringRef) const;
 template Span<float3> Multiresolution::attribute(const StringRef) const;
 template Span<float4> Multiresolution::attribute(const StringRef) const;
+template Span<ColorGeometry4f> Multiresolution::attribute(const StringRef) const;
 
 template<typename T> MutableSpan<T> Multiresolution::attribute_for_write(const StringRef name)
 {
@@ -1723,6 +1724,7 @@ template<typename T> MutableSpan<T> Multiresolution::attribute_for_write(const S
 template MutableSpan<float> Multiresolution::attribute_for_write(const StringRef name);
 template MutableSpan<float3> Multiresolution::attribute_for_write(const StringRef name);
 template MutableSpan<float4> Multiresolution::attribute_for_write(const StringRef name);
+template MutableSpan<ColorGeometry4f> Multiresolution::attribute_for_write(const StringRef name);
 
 template<typename T> Span<T> Multiresolution::top_attribute(const StringRef name) const
 {
@@ -1736,6 +1738,7 @@ template<typename T> Span<T> Multiresolution::top_attribute(const StringRef name
 template Span<float> Multiresolution::top_attribute(const StringRef) const;
 template Span<float3> Multiresolution::top_attribute(const StringRef) const;
 template Span<float4> Multiresolution::top_attribute(const StringRef) const;
+template Span<ColorGeometry4f> Multiresolution::top_attribute(const StringRef) const;
 
 template<typename T> MutableSpan<T> Multiresolution::top_attribute_for_write(const StringRef name)
 {
@@ -1746,6 +1749,8 @@ template<typename T> MutableSpan<T> Multiresolution::top_attribute_for_write(con
 template MutableSpan<float> Multiresolution::top_attribute_for_write(const StringRef name);
 template MutableSpan<float3> Multiresolution::top_attribute_for_write(const StringRef name);
 template MutableSpan<float4> Multiresolution::top_attribute_for_write(const StringRef name);
+template MutableSpan<ColorGeometry4f> Multiresolution::top_attribute_for_write(
+    const StringRef name);
 
 template<typename T> Span<T> Multiresolution::face_attribute(const StringRef name) const
 {
