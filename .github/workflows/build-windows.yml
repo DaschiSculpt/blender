@@ -70,9 +70,10 @@ jobs:
       - name: Compile Official Release (make ninja clang release)
         shell: cmd
         run: |
-          :: Executes Blender's official release build command using Buildbot's toolchain (VS2022 + Clang-CL)
-          :: Places the ~15 GB build directory on C:\ where disk space was freed in Step 1
-          make.bat ninja clang release 2022 builddir C:\build_blender
+          call make.bat ninja clang release 2022 builddir C:\build_blender nobuild
+          if errorlevel 1 exit /b 1
+          cd /d C:\build_blender
+          call rebuild.cmd
 
       - name: Inject Precompiled Cycles GPU Kernels
         shell: pwsh
