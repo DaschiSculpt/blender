@@ -219,7 +219,7 @@ class PROJECT_PT_color_management(Panel, CenterAlignMixIn):
             row.prop(project, "ocio_config_path", text="Path")
 
         if overridden:
-            row = layout.split(factor=0.4)
+            row = layout.split(factor=layout.property_split_factor)
             row.label()
             row.label(
                 text=rpt_("Overridden by the {} environment variable").format(config_source),
@@ -335,8 +335,19 @@ class PROJECT_PT_variables(Panel):
             col.prop(var, "description")
 
 
+class PROJECT_PT_asset_libraries(Panel):
+    bl_label = "Asset Libraries"
+    bl_space_type = 'PROJECT'
+    bl_region_type = 'WINDOW'
+    bl_category = "Asset Libraries"
+    bl_translation_context = i18n_contexts.default
+    bl_context = "assets"
+
+    def draw(self, context):
+        self.layout.template_project_asset_libraries_tree()
 # -------------------------------------------------------------
 # Register
+
 
 classes = (
     PROJECT_HT_header,
@@ -352,4 +363,5 @@ classes = (
     PROJECT_PT_color_management,
     PROJECT_PT_variables,
     PROJECT_UL_variables,
+    PROJECT_PT_asset_libraries,
 )

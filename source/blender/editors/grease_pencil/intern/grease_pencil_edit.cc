@@ -514,7 +514,7 @@ static bool remove_stroke_or_fill_based_on_mode(Object &object,
     return false;
   }
   if (mode == DeleteMode::OnlyStrokes) {
-    bke::SpanAttributeWriter<bool> hide_strokes = attributes.lookup_or_add_for_write_span<bool>(
+    bke::SpanAttributeWriter<bool> hide_strokes = attributes.ensure_for_write_span<bool>(
         "hide_stroke", bke::AttrDomain::Curve, bke::AttributeInitValue(false));
     index_mask::masked_fill(hide_strokes.span, true, fills_with_stroke);
     hide_strokes.finish();
@@ -885,7 +885,7 @@ static wmOperatorStatus grease_pencil_stroke_material_set_exec(bContext *C, wmOp
 
     bke::CurvesGeometry &curves = info.drawing.strokes_for_write();
     bke::MutableAttributeAccessor attributes = curves.attributes_for_write();
-    bke::SpanAttributeWriter<int> materials = attributes.lookup_or_add_for_write_span<int>(
+    bke::SpanAttributeWriter<int> materials = attributes.ensure_for_write_span<int>(
         "material_index", bke::AttrDomain::Curve);
 
     const IndexMask fill_strokes = bke::greasepencil::selected_mask_to_fills(
@@ -1193,7 +1193,7 @@ static wmOperatorStatus grease_pencil_set_uniform_opacity_exec(bContext *C, wmOp
     MutableSpan<float> opacities = info.drawing.opacities_for_write();
     bke::curves::fill_points<float>(points_by_curve, strokes, opacity_stroke, opacities);
 
-    if (SpanAttributeWriter<float> fill_opacities = attributes.lookup_or_add_for_write_span<float>(
+    if (SpanAttributeWriter<float> fill_opacities = attributes.ensure_for_write_span<float>(
             "fill_opacity", AttrDomain::Curve, bke::AttributeInitValue(1.0f)))
     {
       index_mask::masked_fill(fill_opacities.span, opacity_fill, strokes);
@@ -1449,39 +1449,29 @@ static wmOperatorStatus grease_pencil_caps_set_exec(bContext *C, wmOperator *op)
     if (ELEM(mode, CapsMode::ROUND, CapsMode::FLAT)) {
       const int8_t flag_set = (mode == CapsMode::ROUND) ? int8_t(GP_STROKE_CAP_TYPE_ROUND) :
                                                           int8_t(GP_STROKE_CAP_TYPE_FLAT);
-      if (bke::SpanAttributeWriter<int8_t> start_caps =
-              attributes.lookup_or_add_for_write_span<int8_t>("start_cap", bke::AttrDomain::Curve))
-      {
-        index_mask::masked_fill(start_caps.span, flag_set, strokes);
-        start_caps.finish();
-      }
-      if (bke::SpanAttributeWriter<int8_t> end_caps =
-              attributes.lookup_or_add_for_write_span<int8_t>("end_cap", bke::AttrDomain::Curve))
-      {
-        index_mask::masked_fill(end_caps.span, flag_set, strokes);
-        end_caps.finish();
-      }
+      bke::SpanAttributeWriter<int8_t> start_caps = attributes.ensure_for_write_span<int8_t>(
+          "start_cap", bke::AttrDomain::Curve);
+      index_mask::masked_fill(start_caps.span, flag_set, strokes);
+      start_caps.finish();
+      bke::SpanAttributeWriter<int8_t> end_caps = attributes.ensure_for_write_span<int8_t>(
+          "end_cap", bke::AttrDomain::Curve);
+      index_mask::masked_fill(end_caps.span, flag_set, strokes);
+      end_caps.finish();
     }
     else {
       switch (mode) {
         case CapsMode::START: {
-          if (bke::SpanAttributeWriter<int8_t> caps =
-                  attributes.lookup_or_add_for_write_span<int8_t>("start_cap",
-                                                                  bke::AttrDomain::Curve))
-          {
-            toggle_caps(caps.span, strokes);
-            caps.finish();
-          }
+          bke::SpanAttributeWriter<int8_t> caps = attributes.ensure_for_write_span<int8_t>(
+              "start_cap", bke::AttrDomain::Curve);
+          toggle_caps(caps.span, strokes);
+          caps.finish();
           break;
         }
         case CapsMode::END: {
-          if (bke::SpanAttributeWriter<int8_t> caps =
-                  attributes.lookup_or_add_for_write_span<int8_t>("end_cap",
-                                                                  bke::AttrDomain::Curve))
-          {
-            toggle_caps(caps.span, strokes);
-            caps.finish();
-          }
+          bke::SpanAttributeWriter<int8_t> caps = attributes.ensure_for_write_span<int8_t>(
+              "end_cap", bke::AttrDomain::Curve);
+          toggle_caps(caps.span, strokes);
+          caps.finish();
           break;
         }
         case CapsMode::ROUND:
@@ -2823,14 +2813,12 @@ static IndexRange clipboard_paste_strokes_ex(Main &bmain,
   if (!clipboard_material_remap.is_empty()) {
     /* Remap the material indices of the pasted curves to the target object material indices. */
     bke::MutableAttributeAccessor attributes = drawing.strokes_for_write().attributes_for_write();
-    bke::SpanAttributeWriter<int> material_indices = attributes.lookup_or_add_for_write_span<int>(
+    bke::SpanAttributeWriter<int> material_indices = attributes.ensure_for_write_span<int>(
         "material_index", bke::AttrDomain::Curve);
-    if (material_indices) {
-      for (const int i : pasted_curves_range) {
-        material_indices.span[i] = clipboard_material_remap[material_indices.span[i]];
-      }
-      material_indices.finish();
+    for (const int i : pasted_curves_range) {
+      material_indices.span[i] = clipboard_material_remap[material_indices.span[i]];
     }
+    material_indices.finish();
   }
 
   drawing.tag_topology_changed();
@@ -5011,16 +4999,13 @@ static wmOperatorStatus grease_pencil_set_corner_type_exec(bContext *C, wmOperat
       return;
     }
 
-    if (bke::SpanAttributeWriter<float> miter_angles =
-            attributes.lookup_or_add_for_write_span<float>(
-                "miter_angle",
-                bke::AttrDomain::Point,
-                bke::AttributeInitValue(GP_STROKE_MITER_ANGLE_ROUND)))
-    {
-      index_mask::masked_fill(miter_angles.span, miter_angle, selection);
-      miter_angles.finish();
-      changed.store(true, std::memory_order_relaxed);
-    }
+    bke::SpanAttributeWriter<float> miter_angles = attributes.ensure_for_write_span<float>(
+        "miter_angle",
+        bke::AttrDomain::Point,
+        bke::AttributeInitValue(GP_STROKE_MITER_ANGLE_ROUND));
+    index_mask::masked_fill(miter_angles.span, miter_angle, selection);
+    miter_angles.finish();
+    changed.store(true, std::memory_order_relaxed);
   });
 
   if (changed) {
@@ -5087,17 +5072,14 @@ static void GREASE_PENCIL_OT_set_corner_type(wmOperatorType *ot)
 /** \name Set Stroke Mode Operator
  * \{ */
 
-namespace {
-enum class StrokeType : int8_t { Stroke = 0, Fill = 1, Both = 2 };
-}
-
 static wmOperatorStatus grease_pencil_set_stroke_type_exec(bContext *C, wmOperator *op)
 {
   const Scene *scene = CTX_data_scene(C);
   Object *object = CTX_data_active_object(C);
   GreasePencil &grease_pencil = *id_cast<GreasePencil *>(object->data);
 
-  const StrokeType type = StrokeType(RNA_enum_get(op->ptr, "type"));
+  const bke::greasepencil::StrokeType type = bke::greasepencil::StrokeType(
+      RNA_enum_get(op->ptr, "type"));
   std::atomic<bool> changed = false;
   const Vector<MutableDrawingInfo> drawings = retrieve_editable_drawings(*scene, grease_pencil);
   threading::parallel_for_each(drawings, [&](const MutableDrawingInfo &info) {
@@ -5111,60 +5093,7 @@ static wmOperatorStatus grease_pencil_set_stroke_type_exec(bContext *C, wmOperat
     bke::CurvesGeometry &curves = info.drawing.strokes_for_write();
     bke::MutableAttributeAccessor attributes = curves.attributes_for_write();
 
-    bke::SpanAttributeWriter<bool> hide_stroke = attributes.lookup_or_add_for_write_span<bool>(
-        "hide_stroke", bke::AttrDomain::Curve);
-    bke::SpanAttributeWriter<int> fill_ids = attributes.lookup_or_add_for_write_span<int>(
-        "fill_id", bke::AttrDomain::Curve);
-
-    switch (type) {
-      case StrokeType::Stroke: {
-        index_mask::masked_fill(hide_stroke.span, false, strokes);
-        index_mask::masked_fill(fill_ids.span, 0, strokes);
-        break;
-      }
-      case StrokeType::Fill: {
-        index_mask::masked_fill(hide_stroke.span, true, strokes);
-        break;
-      }
-      case StrokeType::Both: {
-        index_mask::masked_fill(hide_stroke.span, false, strokes);
-        break;
-      }
-    }
-
-    if (ELEM(type, StrokeType::Fill, StrokeType::Both)) {
-      const IndexMask selected_non_fill_strokes = IndexMask::from_predicate(
-          strokes, memory, [&](const int64_t index) { return fill_ids.span[index] == 0; });
-      bke::greasepencil::gather_next_available_fill_ids(
-          fill_ids.span.varray(), selected_non_fill_strokes, fill_ids.span);
-    }
-
-    hide_stroke.finish();
-    fill_ids.finish();
-
-    if (type == StrokeType::Stroke) {
-      if (std::all_of(fill_ids.span.begin(),
-                      fill_ids.span.end(),
-                      [&](const int64_t fill_id) { return fill_id == 0; }))
-      {
-        /* Remove #fill_id attribute if there are no fills left. */
-        attributes.remove("fill_id");
-      }
-    }
-
-    if (ELEM(type, StrokeType::Stroke, StrokeType::Both)) {
-      const array_utils::BooleanMix hide_strokes_mix = array_utils::booleans_mix_calc(
-          hide_stroke.span.varray());
-      if (hide_strokes_mix == array_utils::BooleanMix::AllFalse) {
-        /* Remove #hide_stroke attribute if all strokes are visible. */
-        attributes.remove("hide_stroke");
-      }
-      else {
-        /* If some strokes got unhidden, make sure that we create the radius attribute if it
-         * doesn't exist already. */
-        attributes.add<float>("radius", bke::AttrDomain::Point, bke::AttributeInitValue(0.005f));
-      }
-    }
+    bke::greasepencil::set_stroke_type(attributes, strokes, type);
 
     info.drawing.tag_topology_changed();
     changed.store(true, std::memory_order_relaxed);
@@ -5181,9 +5110,9 @@ static wmOperatorStatus grease_pencil_set_stroke_type_exec(bContext *C, wmOperat
 static void GREASE_PENCIL_OT_set_stroke_type(wmOperatorType *ot)
 {
   static const EnumPropertyItem prop_stroke_type_types[] = {
-      {int(StrokeType::Stroke), "STROKE", ICON_GP_DRAW_STROKE, "Stroke", ""},
-      {int(StrokeType::Fill), "FILL", ICON_GP_DRAW_FILL, "Fill", ""},
-      {int(StrokeType::Both), "BOTH", ICON_GP_DRAW_BOTH, "Both", ""},
+      {int(bke::greasepencil::StrokeType::Stroke), "STROKE", ICON_GP_DRAW_STROKE, "Stroke", ""},
+      {int(bke::greasepencil::StrokeType::Fill), "FILL", ICON_GP_DRAW_FILL, "Fill", ""},
+      {int(bke::greasepencil::StrokeType::Both), "BOTH", ICON_GP_DRAW_BOTH, "Both", ""},
       {0, nullptr, 0, nullptr, nullptr},
   };
 
@@ -5198,8 +5127,12 @@ static void GREASE_PENCIL_OT_set_stroke_type(wmOperatorType *ot)
 
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
 
-  ot->prop = RNA_def_enum(
-      ot->srna, "type", prop_stroke_type_types, int(StrokeType::Stroke), "Type", "");
+  ot->prop = RNA_def_enum(ot->srna,
+                          "type",
+                          prop_stroke_type_types,
+                          int(bke::greasepencil::StrokeType::Stroke),
+                          "Type",
+                          "");
   RNA_def_property_translation_context(ot->prop, BLT_I18NCONTEXT_ID_GPENCIL);
 }
 
@@ -5367,7 +5300,7 @@ static wmOperatorStatus grease_pencil_join_fills_exec(bContext *C, wmOperator *o
   }
   bke::CurvesGeometry &curves = drawing_dst->strokes_for_write();
   bke::MutableAttributeAccessor attributes = curves.attributes_for_write();
-  bke::SpanAttributeWriter<int> fill_ids = attributes.lookup_or_add_for_write_span<int>(
+  bke::SpanAttributeWriter<int> fill_ids = attributes.ensure_for_write_span<int>(
       "fill_id", bke::AttrDomain::Curve);
 
   const IndexMask selected_strokes = bke::greasepencil::selected_mask_to_fills(
@@ -5644,7 +5577,7 @@ static void remap_material_indices(bke::greasepencil::Drawing &drawing,
   bke::CurvesGeometry &curves = drawing.strokes_for_write();
   bke::MutableAttributeAccessor attributes = curves.attributes_for_write();
   /* Validate material indices and add missing materials. */
-  bke::SpanAttributeWriter<int> material_writer = attributes.lookup_or_add_for_write_span<int>(
+  bke::SpanAttributeWriter<int> material_writer = attributes.ensure_for_write_span<int>(
       "material_index", bke::AttrDomain::Curve);
   threading::parallel_for(curves.curves_range(), 1024, [&](const IndexRange range) {
     for (const int curve_i : range) {

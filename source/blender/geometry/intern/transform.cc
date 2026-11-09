@@ -45,7 +45,7 @@ static void translate_pointcloud(PointCloud &pointcloud, const float3 translatio
   }
 
   bke::MutableAttributeAccessor attributes = pointcloud.attributes_for_write();
-  bke::SpanAttributeWriter position = attributes.lookup_or_add_for_write_span<float3>(
+  bke::SpanAttributeWriter position = attributes.ensure_for_write_span<float3>(
       "position", bke::AttrDomain::Point);
   math::translate_points(position.span, translation);
   position.finish();
@@ -60,13 +60,13 @@ static void translate_pointcloud(PointCloud &pointcloud, const float3 translatio
 static void transform_pointcloud(PointCloud &pointcloud, const float4x4 &transform)
 {
   bke::MutableAttributeAccessor attributes = pointcloud.attributes_for_write();
-  bke::SpanAttributeWriter position = attributes.lookup_or_add_for_write_span<float3>(
+  bke::SpanAttributeWriter position = attributes.ensure_for_write_span<float3>(
       "position", bke::AttrDomain::Point);
   math::transform_points(transform, position.span);
   position.finish();
 }
 
-static void translate_greasepencil(GreasePencil &grease_pencil, const float3 translation)
+static void translate_greasepencil_layers(GreasePencil &grease_pencil, const float3 translation)
 {
   using namespace blender::bke::greasepencil;
   for (const int layer_index : grease_pencil.layers().index_range()) {
@@ -74,6 +74,19 @@ static void translate_greasepencil(GreasePencil &grease_pencil, const float3 tra
     float4x4 local_transform = layer.local_transform();
     local_transform.location() += translation;
     layer.set_local_transform(local_transform);
+  }
+}
+
+static void translate_greasepencil_points(GreasePencil &grease_pencil, const float3 translation)
+{
+  using namespace blender::bke::greasepencil;
+  for (const int layer_index : grease_pencil.layers().index_range()) {
+    Drawing *drawing = grease_pencil.get_eval_drawing(grease_pencil.layer(layer_index));
+    if (drawing == nullptr || drawing->strokes().is_empty()) {
+      continue;
+    }
+    drawing->strokes_for_write().translate(translation);
+    drawing->tag_positions_changed();
   }
 }
 
@@ -228,7 +241,9 @@ static void translate_gizmos_edit_hints(bke::GizmoEditHints &edit_hints, const f
   }
 }
 
-void translate_geometry(bke::GeometrySet &geometry, const float3 translation)
+void translate_geometry(bke::GeometrySet &geometry,
+                        const float3 translation,
+                        const bool translate_grease_pencil_layers)
 {
   if (math::is_zero(translation)) {
     return;
@@ -243,7 +258,12 @@ void translate_geometry(bke::GeometrySet &geometry, const float3 translation)
     translate_pointcloud(*pointcloud, translation);
   }
   if (GreasePencil *grease_pencil = geometry.get_grease_pencil_for_write()) {
-    translate_greasepencil(*grease_pencil, translation);
+    if (translate_grease_pencil_layers) {
+      translate_greasepencil_layers(*grease_pencil, translation);
+    }
+    else {
+      translate_greasepencil_points(*grease_pencil, translation);
+    }
   }
   if (Volume *volume = geometry.get_volume_for_write()) {
     translate_volume(*volume, translation);

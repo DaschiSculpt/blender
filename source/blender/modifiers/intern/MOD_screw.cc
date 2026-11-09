@@ -408,7 +408,7 @@ static Mesh *modify_mesh(ModifierData *md, const ModifierEvalContext *ctx, Mesh 
   MutableSpan<int> corner_verts_new = result->corner_verts_for_write();
   MutableSpan<int> corner_edges_new = result->corner_edges_for_write();
   bke::MutableAttributeAccessor attributes = result->attributes_for_write();
-  bke::SpanAttributeWriter<bool> sharp_faces = attributes.lookup_or_add_for_write_span<bool>(
+  bke::SpanAttributeWriter<bool> sharp_faces = attributes.ensure_for_write_span<bool>(
       "sharp_face", bke::AttrDomain::Face);
 
   if (!CustomData_has_layer(&result->face_data, CD_ORIGINDEX)) {
@@ -804,6 +804,13 @@ static Mesh *modify_mesh(ModifierData *md, const ModifierEvalContext *ctx, Mesh 
       edge_new++;
     }
   }
+  for (const StringRef name : {"skin_modifier_root", "skin_modifier_loose"}) {
+    bke::SpanAttributeWriter<bool> attr = attributes.lookup_for_write_span<bool>(name);
+    if (attr && attr.domain == bke::AttrDomain::Point) {
+      attr.span.drop_front(totvert).fill(false);
+      attr.finish();
+    }
+  }
 
   /* we can avoid if using vert alloc trick */
   if (vert_connect) {
@@ -833,7 +840,7 @@ static Mesh *modify_mesh(ModifierData *md, const ModifierEvalContext *ctx, Mesh 
                                                                     bke::AttrDomain::Face);
 
   bke::MutableAttributeAccessor dst_attributes = result->attributes_for_write();
-  bke::SpanAttributeWriter dst_material_index = dst_attributes.lookup_or_add_for_write_span<int>(
+  bke::SpanAttributeWriter dst_material_index = dst_attributes.ensure_for_write_span<int>(
       "material_index", bke::AttrDomain::Face);
 
   for (uint i = 0; i < totedge; i++, med_new_firstloop++) {

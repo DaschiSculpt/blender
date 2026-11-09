@@ -135,6 +135,8 @@ struct OperatorTypeData : public wmOperatorType::TypeData {
   StringRefNull custom_idname;
   std::string description;
   GeometryNodeAssetTraitFlag flag;
+  /** Path of the asset's catalog, empty for local node groups and unassigned assets. */
+  std::string catalog_path;
 
   std::unique_ptr<IDProperty, bke::idprop::IDPropertyDeleter> asset_meta_data_properties;
   Vector<StructRNA *> generated_structs;
@@ -148,6 +150,7 @@ struct OperatorTypeData : public wmOperatorType::TypeData {
   UniqueHash hash;
 
   static std::optional<OperatorTypeData> from_asset(const AssetRepresentation &asset,
+                                                    const asset_system::AssetLibrary &all_library,
                                                     RegistrationData::Errors &errors);
   static std::optional<OperatorTypeData> from_group(const bNodeTree &group,
                                                     RegistrationData::Errors &errors);
@@ -165,6 +168,7 @@ void OperatorTypeData::ensure_hash()
   XXH3_128bits_update(hash_state, this->name.data(), this->name.size());
   XXH3_128bits_update(hash_state, this->description.data(), this->description.size());
   XXH3_128bits_update(hash_state, &this->flag, sizeof(this->flag));
+  XXH3_128bits_update(hash_state, this->catalog_path.data(), this->catalog_path.size());
   std::visit(
       [&](const auto &value) {
         using T = std::decay_t<decltype(value)>;
@@ -227,7 +231,9 @@ static std::optional<StringRefNull> custom_idname_for_asset(const AssetRepresent
 }
 
 std::optional<OperatorTypeData> OperatorTypeData::from_asset(
-    const asset_system::AssetRepresentation &asset, RegistrationData::Errors &errors)
+    const asset_system::AssetRepresentation &asset,
+    const asset_system::AssetLibrary &all_library,
+    RegistrationData::Errors &errors)
 {
   const std::optional<StringRefNull> custom_idname = custom_idname_for_asset(asset);
   if (!custom_idname) {
@@ -253,6 +259,11 @@ std::optional<OperatorTypeData> OperatorTypeData::from_asset(
   }
   type_data.flag = GeometryNodeAssetTraitFlag(IDP_int_get(traits_flag));
   type_data.group_ref = asset.make_weak_reference();
+  if (const asset_system::AssetCatalog *catalog = all_library.catalog_service().find_catalog(
+          metadata.catalog_id))
+  {
+    type_data.catalog_path = catalog->path.str();
+  }
 
   const IDProperty *properties = BKE_asset_metadata_idprop_find(&metadata, "properties");
   if (!properties || properties->type != IDP_GROUP) {
@@ -385,6 +396,11 @@ static GeoOperatorLog &get_static_eval_log()
 const GeoOperatorLog &node_group_operator_static_eval_log()
 {
   return get_static_eval_log();
+}
+
+void node_group_operator_static_eval_log_free()
+{
+  get_static_eval_log().log.reset();
 }
 
 /** Find all the visible node editors to log values for. */
@@ -548,10 +564,10 @@ static bke::GeometrySet get_original_geometry_eval_copy(ViewContext &vc,
         operator_data.active_face_index = BM_mesh_active_face_index_get(bm, false, true);
         EDBM_mesh_load_ex(DEG_get_bmain(&depsgraph), &object, true);
         EDBM_mesh_free_data(mesh->runtime->edit_mesh.get());
-        /* Clear the edit-mesh entirely rather than just freeing its #BMesh. Leaving a #BMEditMesh
-         * with a null `bm` behind is a non-standard state that other code (e.g. the active
-         * attribute lookup when the tool result is stored back) doesn't expect. The edit-mesh is
-         * rebuilt from the tool result in #EDBM_mesh_make_from_mesh. */
+        /* Clear the edit-mesh entirely rather than just freeing its #BMesh. Leaving a
+         * #EditMesh with a null `bm` behind is a non-standard state that other code (e.g. the
+         * active attribute lookup when the tool result is stored back) doesn't expect. The
+         * edit-mesh is rebuilt from the tool result in #EDBM_mesh_make_from_mesh. */
         mesh->runtime->edit_mesh.reset();
       }
 
@@ -783,6 +799,7 @@ static std::optional<ID_Type> socket_type_to_id_type(const eNodeSocketDatatype s
     case SOCK_MATRIX:
     case SOCK_BUNDLE:
     case SOCK_CLOSURE:
+    case SOCK_DYNAMIC:
       return std::nullopt;
     case SOCK_OBJECT:
       return ID_OB;
@@ -1623,7 +1640,10 @@ static OperatorsToRegister get_node_tools_type_data(const bContext &C,
 
   const AssetLibraryReference library_ref = asset_system::all_library_reference();
   ed::asset::list::storage_fetch(&library_ref, &C);
-  if (ed::asset::list::library_get_once_available(library_ref)) {
+  asset_system::all_library_reload_catalogs_if_dirty();
+  if (const asset_system::AssetLibrary *all_library = ed::asset::list::library_get_once_available(
+          library_ref))
+  {
     ed::asset::list::iterate(library_ref, [&](AssetRepresentation &asset) {
       if (asset.get_id_type() != ID_NT) {
         return true;
@@ -1647,7 +1667,8 @@ static OperatorsToRegister get_node_tools_type_data(const bContext &C,
       if ((IDP_int_get(traits_flag) & GEO_NODE_ASSET_TOOL) == 0) {
         return true;
       }
-      std::optional<OperatorTypeData> type_data = OperatorTypeData::from_asset(asset, errors);
+      std::optional<OperatorTypeData> type_data = OperatorTypeData::from_asset(
+          asset, *all_library, errors);
       if (!type_data) {
         return true;
       }
@@ -1799,29 +1820,20 @@ void register_node_group_operators(const bContext &C)
   registration_data.local_types.clear();
   registration_data.unassigned_types.clear();
   registration_data.menu_path_tree_roots.clear();
-  const asset_system::AssetLibrary *all_library = asset::list::library_get_once_available(
-      asset_system::all_library_reference());
   for (wmOperatorType *ot : WM_operatortypes_registered_get()) {
     if ((ot->flag & OPTYPE_NODE_TOOL) == 0) {
       continue;
     }
     const auto &type_data = static_cast<OperatorTypeData &>(*ot->custom_data);
-    const auto *asset_ref = std::get_if<AssetWeakReference>(&type_data.group_ref);
-    if (!asset_ref) {
+    if (std::holds_alternative<OperatorTypeData::LocalRef>(type_data.group_ref)) {
       registration_data.local_types.append(ot);
       continue;
     }
-    const asset_system::AssetRepresentation *asset = ed::asset::find_asset_from_weak_ref(
-        C, *asset_ref, nullptr);
-    BLI_assert(asset != nullptr);
-    const bUUID catalog_id = asset->get_metadata().catalog_id;
-    const asset_system::AssetCatalog *catalog = all_library->catalog_service().find_catalog(
-        catalog_id);
-    if (!catalog) {
+    if (type_data.catalog_path.empty()) {
       registration_data.unassigned_types.append(ot);
       continue;
     }
-    tree_add_type(registration_data.menu_path_tree_roots, catalog->path.str(), ot);
+    tree_add_type(registration_data.menu_path_tree_roots, type_data.catalog_path, ot);
   }
 }
 

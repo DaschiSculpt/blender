@@ -196,10 +196,8 @@ static void rna_Material_active_paint_texture_index_update(bContext *C, PointerR
       Object *ob = CTX_data_active_object(C);
       if (ob != nullptr && ob->type == OB_MESH) {
         Mesh *mesh = id_cast<Mesh *>(ob->data);
-        if (mesh->runtime->edit_mesh) {
-          if (const BMDataLayerLookup attr = BM_data_layer_lookup(*mesh->runtime->edit_mesh->bm,
-                                                                  name))
-          {
+        if (const BMesh *bm = BKE_editmesh_bmesh_get(mesh)) {
+          if (const BMDataLayerLookup attr = BM_data_layer_lookup(*bm, name)) {
             BKE_id_attributes_active_color_set(&mesh->id, name);
           }
         }
@@ -467,6 +465,7 @@ static void rna_GpencilColorData_stroke_image_set(PointerRNA *ptr,
   MaterialGPencilStyle *pcolor = static_cast<MaterialGPencilStyle *>(ptr->data);
   ID *id = static_cast<ID *>(value.data);
 
+  id_us_min(id_cast<ID *>(pcolor->sima));
   id_us_plus(id);
   pcolor->sima = id_cast<Image *>(id);
 }
@@ -478,6 +477,7 @@ static void rna_GpencilColorData_fill_image_set(PointerRNA *ptr,
   MaterialGPencilStyle *pcolor = static_cast<MaterialGPencilStyle *>(ptr->data);
   ID *id = static_cast<ID *>(value.data);
 
+  id_us_min(id_cast<ID *>(pcolor->ima));
   id_us_plus(id);
   pcolor->ima = id_cast<Image *>(id);
 }

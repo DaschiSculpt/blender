@@ -1654,13 +1654,11 @@ static void mesh_set_custom_normals(Mesh &mesh,
                                     const bool use_vertices)
 {
   MutableAttributeAccessor attributes = mesh.attributes_for_write();
-  SpanAttributeWriter custom_normals = attributes.lookup_or_add_for_write_span<short2>(
+  SpanAttributeWriter custom_normals = attributes.ensure_for_write_span<short2>(
       "custom_normal", AttrDomain::Corner);
-  if (!custom_normals) {
-    return;
-  }
-  SpanAttributeWriter<bool> sharp_edges = attributes.lookup_or_add_for_write_span<bool>(
-      "sharp_edge", AttrDomain::Edge);
+  SpanAttributeWriter<bool> sharp_edges = attributes.ensure_for_write_span<bool>("sharp_edge",
+                                                                                 AttrDomain::Edge);
+
   const VArraySpan sharp_faces = *attributes.lookup<bool>("sharp_face", AttrDomain::Face);
 
   mesh_normals_corner_custom_set(mesh.vert_positions(),
@@ -1711,6 +1709,31 @@ void mesh_set_custom_normals_from_verts(Mesh &mesh, MutableSpan<float3> vert_nor
 void mesh_set_custom_normals_from_verts_normalized(Mesh &mesh, MutableSpan<float3> vert_normals)
 {
   mesh::mesh_set_custom_normals(mesh, vert_normals, true);
+}
+
+void mesh_custom_normals_to_free(Mesh &mesh)
+{
+  MutableAttributeAccessor attributes = mesh.attributes_for_write();
+  if (!attributes.contains("custom_normal")) {
+    return;
+  }
+  auto *normals = new ImplicitSharedValue<Array<float3>>(mesh.corner_normals());
+  attributes.add_override("custom_normal",
+                          AttrDomain::Corner,
+                          AttrType::Float3,
+                          AttributeInitShared(normals->data.data(), *normals));
+  normals->remove_user_and_delete_if_last();
+}
+
+void mesh_custom_normals_to_tangent_space(Mesh &mesh)
+{
+  MutableAttributeAccessor attributes = mesh.attributes_for_write();
+  if (!attributes.contains("custom_normal")) {
+    return;
+  }
+  Array<float3> corner_normals(mesh.corner_normals());
+  attributes.remove("custom_normal");
+  mesh_set_custom_normals_normalized(mesh, corner_normals);
 }
 
 namespace mesh {

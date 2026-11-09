@@ -1111,8 +1111,8 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
               deleted != nullptr)
           {
             bke::SpanAttributeWriter<T> writer =
-                base_mesh.attributes_for_write().lookup_or_add_for_write_span<T>(
-                    attr_name, bke::AttrDomain::Face);
+                base_mesh.attributes_for_write().ensure_for_write_span<T>(attr_name,
+                                                                          bke::AttrDomain::Face);
             writer.span.copy_from(deleted->values.as_span().cast<T>());
             writer.finish();
           }

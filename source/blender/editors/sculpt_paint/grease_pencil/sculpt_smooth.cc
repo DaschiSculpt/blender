@@ -58,7 +58,12 @@ void SmoothOperation::toggle_smooth_brush_on(const bContext &C)
   Brush *current_brush = BKE_paint_brush(paint);
 
   /* Switch to the smooth brush if possible. */
-  BKE_paint_brush_set_essentials(bmain, paint, "Smooth");
+  if (!BKE_paint_brush_set_essentials(bmain, paint, "Smooth")) {
+    BKE_paint_brush_set(paint, current_brush);
+    init_brush(*current_brush);
+    saved_active_brush_ = nullptr;
+    return;
+  }
   Brush *smooth_brush = BKE_paint_brush(paint);
   BLI_assert(smooth_brush != nullptr);
 
@@ -102,11 +107,12 @@ void SmoothOperation::on_stroke_extended(const bContext &C, const InputSample &e
 {
   Paint &paint = *BKE_paint_get_active_from_context(&C);
   const Brush &brush = [&]() -> const Brush & {
-    if (temp_smooth_) {
+    if (temp_smooth_ && saved_active_brush_) {
       const Brush *brush = BKE_paint_brush_from_essentials(
           CTX_data_main(&C), bke::paint::AssetCategory::GPencilSculpt, "Smooth");
-      BLI_assert(brush != nullptr);
-      return *brush;
+      if (brush != nullptr) {
+        return *brush;
+      }
     }
     return *BKE_paint_brush(&paint);
   }();
@@ -176,22 +182,19 @@ void SmoothOperation::on_stroke_extended(const bContext &C, const InputSample &e
           changed = true;
         }
         if (sculpt_mode_flag & GP_SCULPT_FLAGMODE_APPLY_UV) {
-          if (bke::SpanAttributeWriter<float> rotations =
-                  attributes.lookup_or_add_for_write_span<float>("rotation",
-                                                                 bke::AttrDomain::Point))
-          {
-            geometry::smooth_curve_attribute(curves.curves_range(),
-                                             points_by_curve,
-                                             selection_varray,
-                                             cyclic,
-                                             iterations,
-                                             influences,
-                                             true,
-                                             false,
-                                             rotations.span);
-            rotations.finish();
-            changed = true;
-          }
+          bke::SpanAttributeWriter<float> rotations = attributes.ensure_for_write_span<float>(
+              "rotation", bke::AttrDomain::Point);
+          geometry::smooth_curve_attribute(curves.curves_range(),
+                                           points_by_curve,
+                                           selection_varray,
+                                           cyclic,
+                                           iterations,
+                                           influences,
+                                           true,
+                                           false,
+                                           rotations.span);
+          rotations.finish();
+          changed = true;
         }
         return changed;
       });

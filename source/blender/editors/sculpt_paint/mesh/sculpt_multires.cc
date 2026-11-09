@@ -361,7 +361,7 @@ void downsample_to_base(Mesh &base_mesh, const Span<int> vert_offsets)
 
   const Span<float> top_masks = multires.top_masks();
   if (!top_masks.is_empty()) {
-    bke::SpanAttributeWriter<float> base_masks = attributes.lookup_or_add_for_write_span<float>(
+    bke::SpanAttributeWriter<float> base_masks = attributes.ensure_for_write_span<float>(
         ".sculpt_mask", bke::AttrDomain::Point);
     Multiresolution::downsample_to_base<float>(vert_offsets, top_masks, base_masks.span);
     base_masks.finish();
@@ -553,8 +553,8 @@ static void switch_face_attribute(Mesh &base_mesh,
   if (target_lvl == 0) {
     backup_base_face_attribute<T>(base_mesh, attr_name, attr_type);
     bke::MutableAttributeAccessor attributes = base_mesh.attributes_for_write();
-    bke::SpanAttributeWriter<T> dst = attributes.lookup_or_add_for_write_span<T>(
-        attr_name, bke::AttrDomain::Face);
+    bke::SpanAttributeWriter<T> dst = attributes.ensure_for_write_span<T>(attr_name,
+                                                                          bke::AttrDomain::Face);
     downsample_with_undo(dst.span);
     dst.finish();
     return;

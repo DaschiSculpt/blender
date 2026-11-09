@@ -57,10 +57,6 @@ using Alembic::AbcGeom::OV2fGeomParam;
 using Alembic::AbcGeom::OV3fGeomParam;
 namespace io::alembic {
 
-/* ORCO, Generated Coordinates, and Reference Points ("Pref") are all terms for the same thing.
- * Other applications (Maya, Houdini) write these to a property called "Pref". */
-static const std::string propNameOriginalCoordinates("Pref");
-
 static void get_uvs(const CDStreamConfig &config,
                     std::vector<Imath::V2f> &uvs,
                     std::vector<uint32_t> &uvidx,
@@ -338,7 +334,7 @@ static void read_custom_data_mcols(const std::string &iobject_full_name,
 
   /* Read the vertex colors */
   bke::MutableAttributeAccessor attributes = config.mesh->attributes_for_write();
-  bke::SpanAttributeWriter attr = attributes.lookup_or_add_for_write_span<ColorGeometry4b>(
+  bke::SpanAttributeWriter attr = attributes.ensure_for_write_span<ColorGeometry4b>(
       prop_header.getName(), bke::AttrDomain::Corner);
   const OffsetIndices faces = config.mesh->faces();
   const int *corner_verts = config.corner_verts;
@@ -427,7 +423,7 @@ static void read_custom_data_uvs(const ICompoundProperty &prop,
   }
 
   bke::MutableAttributeAccessor attributes = config.mesh->attributes_for_write();
-  bke::SpanAttributeWriter uv_map = attributes.lookup_or_add_for_write_span<float2>(
+  bke::SpanAttributeWriter uv_map = attributes.ensure_for_write_span<float2>(
       prop_header.getName(), bke::AttrDomain::Corner);
 
   read_uvs(config, uv_map.span, uv_scope, sample.getVals(), uvs_indices);
@@ -447,8 +443,8 @@ void read_velocity(const V3fArraySamplePtr &velocities,
   const int64_t num_velocity_vectors = config.mesh->verts_num;
 
   bke::MutableAttributeAccessor attributes = config.mesh->attributes_for_write();
-  bke::SpanAttributeWriter attr = attributes.lookup_or_add_for_write_span<float3>(
-      "velocity", bke::AttrDomain::Point);
+  bke::SpanAttributeWriter attr = attributes.ensure_for_write_span<float3>("velocity",
+                                                                           bke::AttrDomain::Point);
   MutableSpan<float3> velocity = attr.span;
   for (int64_t i = 0; i < num_velocity_vectors; i++) {
     const Imath::V3f &vel_in = (*velocities)[i];

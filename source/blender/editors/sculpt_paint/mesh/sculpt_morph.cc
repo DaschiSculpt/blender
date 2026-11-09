@@ -228,9 +228,8 @@ void store_apply(Object &ob, const Depsgraph &depsgraph, const MorphStoreMode st
       const Span<float3> eval_positions = position_data.eval;
 
       bke::MutableAttributeAccessor attributes = mesh.attributes_for_write();
-      bke::SpanAttributeWriter<float3> morph_positions =
-          attributes.lookup_or_add_for_write_span<float3>(position_attr_name,
-                                                          bke::AttrDomain::Point);
+      bke::SpanAttributeWriter<float3> morph_positions = attributes.ensure_for_write_span<float3>(
+          position_attr_name, bke::AttrDomain::Point);
 
       morph_positions.span.copy_from(eval_positions);
       morph_positions.finish();
@@ -383,9 +382,8 @@ void swap_apply(Object &ob, const Depsgraph &depsgraph, const bool use_mask, con
       const Span<float3> eval_positions = position_data.eval;
 
       bke::MutableAttributeAccessor attributes = mesh.attributes_for_write();
-      bke::SpanAttributeWriter<float3> morph_positions =
-          attributes.lookup_or_add_for_write_span<float3>(position_attr_name,
-                                                          bke::AttrDomain::Point);
+      bke::SpanAttributeWriter<float3> morph_positions = attributes.ensure_for_write_span<float3>(
+          position_attr_name, bke::AttrDomain::Point);
 
       const MeshAttributeData attribute_data(mesh);
       const Span<bool> hide_span = use_hide ? Span<bool>(attribute_data.hide_vert) : Span<bool>();

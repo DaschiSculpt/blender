@@ -370,7 +370,7 @@ static bke::CurvesGeometry create_test_curves(const Span<int> offsets,
 
   bke::MutableAttributeAccessor attributes = curves.attributes_for_write();
 
-  bke::SpanAttributeWriter<int> fill_id_writer = attributes.lookup_or_add_for_write_span<int>(
+  bke::SpanAttributeWriter<int> fill_id_writer = attributes.ensure_for_write_span<int>(
       "fill_id", bke::AttrDomain::Curve);
   fill_id_writer.span.copy_from(fill_ids);
   fill_id_writer.finish();
@@ -445,8 +445,9 @@ static bke::CurvesGeometry test_curve_boolean(const Operation opt,
                                                      src_curves.curves_num());
   const GroupedSpan<int> shapes = shapes_data.shapes();
 
-  return curve_boolean(
+  CurveBooleanResult result = curve_boolean(
       op_params, src_curves, project_fn, shapes, shapes.index_range(), clipping_shapes);
+  return result.curves;
 }
 
 class GreasePencilBooleanTest : public bke::BlenderGTestBase {};

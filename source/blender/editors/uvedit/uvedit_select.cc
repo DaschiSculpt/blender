@@ -1900,7 +1900,7 @@ std::unique_ptr<UVSyncSelectFromMesh> UVSyncSelectFromMesh::create_if_needed(
   if (bm.uv_select_sync_valid == false) {
     return nullptr;
   }
-  const int cd_loop_uv_offset = CustomData_get_active_layer(&bm.ldata, CD_PROP_FLOAT2);
+  const int cd_loop_uv_offset = CustomData_get_offset(&bm.ldata, CD_PROP_FLOAT2);
   if (cd_loop_uv_offset == -1) {
     return nullptr;
   }
@@ -1909,7 +1909,7 @@ std::unique_ptr<UVSyncSelectFromMesh> UVSyncSelectFromMesh::create_if_needed(
 
 void UVSyncSelectFromMesh::apply()
 {
-  const int cd_loop_uv_offset = CustomData_get_active_layer(&bm_.ldata, CD_PROP_FLOAT2);
+  const int cd_loop_uv_offset = CustomData_get_offset(&bm_.ldata, CD_PROP_FLOAT2);
   BLI_assert(cd_loop_uv_offset != -1);
 
   const bool shared = uv_sticky_ == UV_STICKY_LOCATION;
@@ -3186,7 +3186,7 @@ static wmOperatorStatus uv_select_more_less(bContext *C, const bool select)
     const BMUVOffsets offsets = BM_uv_map_offsets_get(bm);
 
     if ((ts->uv_flag & UV_FLAG_SELECT_SYNC) && (bm->uv_select_sync_valid == false)) {
-      BMEditMesh *em = BKE_editmesh_from_object(obedit);
+      EditMesh *em = BKE_editmesh_from_object(obedit);
       if (select) {
         EDBM_select_more(bm, em->selectmode, true);
       }
@@ -3434,7 +3434,7 @@ static void uv_select_toggle_all(const Scene *scene, BMesh *bm)
   uv_select_all(scene, bm, !select_any);
 }
 
-static void uv_select_invert(const Scene *scene, BMEditMesh *em, BMesh *bm)
+static void uv_select_invert(const Scene *scene, EditMesh *em, BMesh *bm)
 {
   const ToolSettings *ts = scene->toolsettings;
 
@@ -3575,7 +3575,7 @@ static void uv_select_invert(const Scene *scene, BMEditMesh *em, BMesh *bm)
 void ED_uvedit_deselect_all(const Scene *scene, Object *obedit, int action)
 {
   const ToolSettings *ts = scene->toolsettings;
-  BMEditMesh *em = BKE_editmesh_from_object(obedit);
+  EditMesh *em = BKE_editmesh_from_object(obedit);
   BMesh *bm = BKE_editmesh_bmesh_get_for_write(obedit);
 
   /* In the case of where the selection is all or none, there is no need to hold
@@ -4667,7 +4667,9 @@ static void uv_select_flush_from_tag_face(const Scene *scene, Object *obedit, co
         uvedit_loop_edge_select_set(ts, bm, l, select);
 
         if (select) {
-          uvedit_edge_select_shared_vert(scene, bm, l, select, UV_STICKY_LOCATION, offsets);
+          /* Only flush UV vertices. Flushing UV edges would flag the edges of unselected
+           * neighboring faces, making a face enclosed by the selection look fully selected. */
+          uvedit_uv_select_shared_vert(scene, bm, l, select, UV_STICKY_LOCATION, offsets);
         }
         else {
           /* Match selecting logic, except UV's still used by other selected faces must be kept.

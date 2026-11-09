@@ -1020,10 +1020,6 @@ void do_paint_brush(const Depsgraph &depsgraph,
     ss.cache->paint_brush.density_seed = BLI_hash_int_01(ss.cache->location_symm[0] * 1000);
   }
 
-  if (stroke_is_first_brush_step_of_symmetry_pass(*ss.cache)) {
-    return;
-  }
-
   BKE_curvemapping_init(brush.curve_distance_falloff);
   float4x4 mat;
 
@@ -1489,10 +1485,6 @@ void do_blur_brush(const Depsgraph &depsgraph,
 
   if (!ss.cache->paint_brush.density_seed) {
     ss.cache->paint_brush.density_seed = BLI_hash_int_01(ss.cache->location_symm[0] * 1000);
-  }
-
-  if (stroke_is_first_brush_step_of_symmetry_pass(*ss.cache)) {
-    return;
   }
 
   Mesh &mesh = *id_cast<Mesh *>(ob.data);

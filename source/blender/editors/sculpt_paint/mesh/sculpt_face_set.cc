@@ -208,7 +208,7 @@ bke::SpanAttributeWriter<int> ensure_face_sets_mesh(Mesh &mesh)
     attributes.add<int>(".sculpt_face_set", bke::AttrDomain::Face, bke::AttributeInitValue(1));
     mesh.face_sets_color_default = 1;
   }
-  return attributes.lookup_or_add_for_write_span<int>(".sculpt_face_set", bke::AttrDomain::Face);
+  return attributes.ensure_for_write_span<int>(".sculpt_face_set", bke::AttrDomain::Face);
 }
 
 MutableSpan<int> ensure_face_sets_multires(Mesh &base_mesh)
@@ -1436,7 +1436,7 @@ static void face_hide_update(const Depsgraph &depsgraph,
   threading::EnumerableThreadSpecific<TLS> all_tls;
   if (pbvh.type() == bke::pbvh::Type::Mesh) {
     bke::MutableAttributeAccessor attributes = mesh.attributes_for_write();
-    bke::SpanAttributeWriter<bool> hide_poly = attributes.lookup_or_add_for_write_span<bool>(
+    bke::SpanAttributeWriter<bool> hide_poly = attributes.ensure_for_write_span<bool>(
         ".hide_poly", bke::AttrDomain::Face);
     MutableSpan<bke::pbvh::MeshNode> nodes = pbvh.nodes<bke::pbvh::MeshNode>();
     node_mask.foreach_index(
@@ -1490,7 +1490,7 @@ static void face_hide_update(const Depsgraph &depsgraph,
   }
   else if (pbvh.type() == bke::pbvh::Type::Grids) {
     bke::MutableAttributeAccessor attributes = mesh.attributes_for_write();
-    bke::SpanAttributeWriter<bool> hide_poly = attributes.lookup_or_add_for_write_span<bool>(
+    bke::SpanAttributeWriter<bool> hide_poly = attributes.ensure_for_write_span<bool>(
         ".hide_poly", bke::AttrDomain::Face);
     MutableSpan<bke::pbvh::GridsNode> nodes = pbvh.nodes<bke::pbvh::GridsNode>();
     node_mask.foreach_index(
