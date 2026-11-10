@@ -382,6 +382,8 @@ void object_sculpt_mode_exit(Main &bmain, Depsgraph &depsgraph, Scene &scene, Ob
     mesh->flag |= ME_SCULPT_DYNAMIC_TOPOLOGY;
   }
 
+  mesh->tag_positions_changed();
+  DEG_id_tag_update(&mesh->id, ID_RECALC_GEOMETRY);
   DEG_id_tag_update(&ob.id, ID_RECALC_GEOMETRY);
   ed::sculpt_paint::mode_exit_generic(scene, ob, OB_MODE_SCULPT);
 }

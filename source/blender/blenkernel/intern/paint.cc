@@ -2379,7 +2379,8 @@ bool BKE_eval_layers_only(const Depsgraph &depsgraph, Object *ob_orig)
 static void sculptsession_update(Depsgraph *depsgraph,
                                  Object *ob,
                                  Object *ob_eval,
-                                 bool is_paint_tool)
+                                 bool is_paint_tool,
+                                 bool is_stroke_update = false)
 {
   using namespace blender::bke;
   Scene *scene = DEG_get_input_scene(depsgraph);
@@ -2407,27 +2408,29 @@ static void sculptsession_update(Depsgraph *depsgraph,
   ss.shapekey_active = (!has_multires && ss.bm == nullptr) ? BKE_keyblock_from_object(ob) :
                                                              nullptr;
 
-  /* Layers live on the original mesh, which is the source of truth. The evaluated mesh may be
-   * a stale cached copy from before the layer was added (layer operators only tag shading to
-   * stay fast), so reading the active layer from it can yield a null/stale pointer. */
   ss.sculpt_layer_active = bke::sculpt_layer::active_layer(*mesh_orig);
 
   ss.multires_modifier = mmd;
 
   ss.subdiv_ccg = mesh_eval->runtime->subdiv_ccg.get();
 
+  const bool had_pbvh = object::pbvh_get(*ob) != nullptr;
   pbvh::Tree &pbvh = object::pbvh_ensure(*depsgraph, *ob);
 
   const bool layers_only = BKE_eval_layers_only(*depsgraph, ob);
   if (layers_only) {
-    if (ss.layers_cos.size() != mesh_orig->verts_num) {
-      ss.layers_cos.reinitialize(mesh_orig->verts_num);
-      ss.vert_normals_deform = {};
-      ss.face_normals_deform = {};
+    const bool cache_valid = is_stroke_update && had_pbvh && ss.layers_only_eval &&
+                             ss.layers_cos.size() == mesh_orig->verts_num;
+    if (!cache_valid) {
+      if (ss.layers_cos.size() != mesh_orig->verts_num) {
+        ss.layers_cos.reinitialize(mesh_orig->verts_num);
+        ss.vert_normals_deform = {};
+        ss.face_normals_deform = {};
+      }
+      bke::sculpt_layer::calc_eval_positions(*mesh_orig, ss.layers_cos.as_mutable_span());
+      ss.layers_only_eval = true;
+      BKE_pbvh_vert_coords_apply(pbvh, ss.layers_cos);
     }
-    bke::sculpt_layer::calc_eval_positions(*mesh_orig, ss.layers_cos.as_mutable_span());
-    ss.layers_only_eval = true;
-    BKE_pbvh_vert_coords_apply(pbvh, ss.layers_cos);
   }
   else if (ss.layers_only_eval) {
     ss.layers_cos = {};
@@ -2600,7 +2603,7 @@ void BKE_sculptsession_update_for_edit(Depsgraph *depsgraph, Object *ob_orig, bo
 
   Object *ob_eval = DEG_get_evaluated(depsgraph, ob_orig);
 
-  sculptsession_update(depsgraph, ob_orig, ob_eval, is_paint_tool);
+  sculptsession_update(depsgraph, ob_orig, ob_eval, is_paint_tool, true);
 }
 
 void BKE_sculpt_mask_layers_ensure(Depsgraph *depsgraph,

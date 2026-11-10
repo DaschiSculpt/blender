@@ -1529,9 +1529,10 @@ static void restore_face_set_from_undo_step(Object &object)
     case bke::pbvh::Type::Multires: {
       Mesh &base_mesh = *id_cast<Mesh *>(object.data);
       Multiresolution &multires = *base_mesh.multires;
+      const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
       const MutableSpan<int> face_sets = face_set::ensure_face_sets_multires(base_mesh);
       const int faces_per_corner = multires.faces_per_corner();
-      const OffsetIndices<int> base_faces = base_mesh.faces();
+      const OffsetIndices<int> base_faces = base_topo.faces;
       const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
 
       node_mask.foreach_index(

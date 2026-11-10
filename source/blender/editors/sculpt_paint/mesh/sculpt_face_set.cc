@@ -791,8 +791,17 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
     }
     case CreateMode::Selection: {
       const bke::AttributeAccessor attributes = mesh.attributes();
-      const VArraySpan<bool> select_poly = *attributes.lookup_or_default<bool>(
+      const VArray<bool> select_poly = *attributes.lookup_or_default<bool>(
           ".select_poly", bke::AttrDomain::Face, false);
+
+      if (ELEM(array_utils::booleans_mix_calc(select_poly),
+               array_utils::BooleanMix::None,
+               array_utils::BooleanMix::AllFalse))
+      {
+        break;
+      }
+
+      const VArraySpan<bool> select_poly_span(select_poly);
 
       if (pbvh.type() != bke::pbvh::Type::Multires) {
         const VArraySpan<bool> hide_poly = *attributes.lookup<bool>(".hide_poly",
@@ -804,7 +813,7 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
             node_mask,
             [&](const int /*node_idx*/, const Span<int> indices, MutableSpan<int> face_sets) {
               for (const int i : indices.index_range()) {
-                if (select_poly[indices[i]]) {
+                if (select_poly_span[indices[i]]) {
                   if (!hide_poly.is_empty() && hide_poly[indices[i]]) {
                     continue;
                   }
@@ -815,10 +824,24 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
       }
       else {
         const Multiresolution &multires = *mesh.multires;
-        const OffsetIndices<int> base_faces = mesh.faces();
+        const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+        const OffsetIndices<int> base_faces = base_topo.faces;
         const int faces_per_corner = multires.faces_per_corner();
         const Span<bool> hidden_faces = multires.hidden_faces();
         const Span<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
+
+        const int base_level = multires.base_level(multires.curr_level);
+        Array<bool> base_select_storage;
+        Span<bool> base_select_poly;
+        if (base_level == 0) {
+          base_select_poly = select_poly_span;
+        }
+        else {
+          base_select_storage.reinitialize(base_topo.faces_num);
+          multires.subdivide_hidden_faces(
+              mesh, 0, select_poly_span, base_level, base_select_storage.as_mutable_span());
+          base_select_poly = base_select_storage.as_span();
+        }
 
         face_sets_update(
             depsgraph,
@@ -829,7 +852,7 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
               for (const int face_idx : nodes[node_idx].faces()) {
                 const int count = base_faces[face_idx].size() * faces_per_corner;
 
-                if (select_poly[face_idx]) {
+                if (base_select_poly[face_idx]) {
                   MutableSpan<int> face_slice = face_sets.slice(offset, count);
                   Span<int> subface_slice = subfaces.slice(offset, count);
 

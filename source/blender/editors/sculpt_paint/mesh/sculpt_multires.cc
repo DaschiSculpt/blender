@@ -389,6 +389,8 @@ void downsample_to_base(Mesh &base_mesh, const Span<int> vert_offsets)
       displacements.finish();
     }
   }
+
+  base_mesh.tag_positions_changed();
 }
 
 void downsample_to_level(Mesh &base_mesh,

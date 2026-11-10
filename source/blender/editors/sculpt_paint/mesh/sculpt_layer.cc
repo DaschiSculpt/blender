@@ -73,7 +73,7 @@ bool sync_after_layer_change(Object &object,
     if (mesh.multires->runtime != nullptr) {
       mesh.multires->runtime->layers_active = mesh.sculpt_layers_len > 0;
       if (mesh.multires->runtime->layers_active) {
-        if (positions_changed) {
+        if (positions_changed || mesh.multires->runtime->eval_positions().is_empty()) {
           mesh.multires->runtime->calc_eval_positions(mesh, mesh.multires->base_positions());
         }
       }
@@ -110,22 +110,25 @@ static void finish(bContext *C,
                    Object &ob,
                    const Depsgraph &depsgraph,
                    const bool in_sculpt,
-                   const bool need_geometry)
+                   const bool need_geometry,
+                   const bool positions_changed = true)
 {
   if (bke::pbvh::Tree *pbvh = bke::object::pbvh_get(ob)) {
     pbvh->clear_layer_non_zero_nodes_cache();
-    if (!need_geometry) {
+    if (positions_changed && !need_geometry) {
       IndexMaskMemory memory;
       pbvh->tag_positions_changed(bke::pbvh::all_leaf_nodes(*pbvh, memory));
       pbvh->update_bounds(depsgraph, ob);
       bke::pbvh::store_bounds_orig(*pbvh);
     }
   }
-  if (!in_sculpt || need_geometry) {
-    DEG_id_tag_update(&ob.id, ID_RECALC_GEOMETRY);
-  }
-  if (in_sculpt) {
-    DEG_id_tag_update(&ob.id, ID_RECALC_SHADING);
+  if (positions_changed) {
+    if (!in_sculpt || need_geometry) {
+      DEG_id_tag_update(&ob.id, ID_RECALC_GEOMETRY);
+    }
+    if (in_sculpt) {
+      DEG_id_tag_update(&ob.id, ID_RECALC_SHADING);
+    }
   }
   WM_event_add_notifier(C, NC_OBJECT | ND_DRAW, &ob);
   WM_event_add_notifier(C, NC_GEOM | ND_DATA, ob.data);
@@ -145,16 +148,16 @@ static wmOperatorStatus layer_add_exec(bContext *C, wmOperator *op)
 
   bke::sculpt_layer::add_layer(mesh, "Layer");
 
-  bool need_geometry = true;
+  bool need_geometry = false;
   if (in_sculpt) {
-    need_geometry = sync_after_layer_change(ob, depsgraph, true);
+    need_geometry = sync_after_layer_change(ob, depsgraph, false);
     storage_undo::push_end(ob);
   }
   else {
     ED_undo_push(C, op->type->name);
   }
 
-  finish(C, ob, depsgraph, in_sculpt, need_geometry);
+  finish(C, ob, depsgraph, in_sculpt, need_geometry, false);
   return OPERATOR_FINISHED;
 }
 

@@ -811,7 +811,16 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
     restore_layers(mesh, us.layers_before);
 
     switch (us.op_type) {
-      case StorageUndoOpType::AddLayer:
+      case StorageUndoOpType::AddLayer: {
+        if (!us.layers_after.layers.is_empty() && us.state_after.active_layer_index >= 0 &&
+            us.state_after.active_layer_index < int(us.layers_after.layers.size()))
+        {
+          const SculptLayer &added = us.layers_after.layers[us.state_after.active_layer_index];
+          remove_layer_attributes(mesh, bke::sculpt_layer::attr_name_from_layer_name(added.name));
+        }
+        update_after_restore(object, *depsgraph, false);
+        break;
+      }
       case StorageUndoOpType::DuplicateLayer: {
         if (!us.layers_after.layers.is_empty() && us.state_after.active_layer_index >= 0 &&
             us.state_after.active_layer_index < int(us.layers_after.layers.size()))
@@ -1142,7 +1151,7 @@ void redo_step_impl(Object &object, StorageUndoStep &us_ref, Depsgraph *depsgrap
     switch (us->op_type) {
       case StorageUndoOpType::AddLayer: {
         restore_layers(mesh, us->layers_after);
-        update_after_restore(object, *depsgraph, true);
+        update_after_restore(object, *depsgraph, false);
         break;
       }
       case StorageUndoOpType::DeleteLayer: {
