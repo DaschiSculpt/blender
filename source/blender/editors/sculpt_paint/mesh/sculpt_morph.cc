@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include "BLI_array.hh"
-#include "BLI_array_utils.hh"
 #include "BLI_enumerable_thread_specific.hh"
+#include "BLI_math_vector.hh"
 #include "BLI_task.hh"
 
 #include "BKE_attribute_storage.hh"
@@ -73,11 +73,16 @@ static bool is_sculpt(const Object &ob)
   return (ob.mode & OB_MODE_SCULPT) && ob.runtime->sculpt_session;
 }
 
-static void morph_finish(bContext *C, Object &ob, const Depsgraph &depsgraph)
+static void morph_swap_finish(bContext *C,
+                              Object &ob,
+                              const Depsgraph &depsgraph,
+                              const IndexMask &changed_nodes)
 {
+  if (changed_nodes.is_empty()) {
+    return;
+  }
   if (bke::pbvh::Tree *pbvh = bke::object::pbvh_get(ob)) {
-    IndexMaskMemory memory;
-    pbvh->tag_positions_changed(bke::pbvh::all_leaf_nodes(*pbvh, memory));
+    pbvh->tag_positions_changed(changed_nodes);
     pbvh->update_bounds(depsgraph, ob);
     bke::pbvh::store_bounds_orig(*pbvh);
   }
@@ -305,7 +310,7 @@ static wmOperatorStatus morph_store_exec(bContext *C, wmOperator *op)
   else {
     WM_file_tag_modified();
   }
-  morph_finish(C, ob, depsgraph);
+  WM_event_add_notifier(C, NC_GEOM | ND_DATA, ob.data);
 
   return OPERATOR_FINISHED;
 }
@@ -359,22 +364,27 @@ static void push_swap_span(const storage_undo::StorageTarget target,
   storage_undo::push_attribute_modified(target, attr_name, bke::AttrType::Float3, before, after);
 }
 
-void swap_apply(Object &ob, const Depsgraph &depsgraph, const bool use_mask, const bool use_hide)
+static IndexMask swap_apply_impl(Object &ob,
+                                 const Depsgraph &depsgraph,
+                                 const bool use_mask,
+                                 const bool use_hide,
+                                 IndexMaskMemory &memory)
 {
   Mesh &mesh = *id_cast<Mesh *>(ob.data);
 
   const bke::pbvh::Tree *pbvh = bke::object::pbvh_get(ob);
   if (pbvh == nullptr) {
-    return;
+    return {};
   }
 
   const bool use_factors = use_mask || use_hide;
 
   struct LocalData {
-    Vector<int> verts;
     Vector<float3> translations;
     Vector<float> factors;
   };
+
+  const IndexMask all_nodes = bke::pbvh::all_leaf_nodes(*pbvh, memory);
 
   switch (pbvh->type()) {
     case bke::pbvh::Type::Mesh: {
@@ -389,48 +399,66 @@ void swap_apply(Object &ob, const Depsgraph &depsgraph, const bool use_mask, con
       const Span<bool> hide_span = use_hide ? Span<bool>(attribute_data.hide_vert) : Span<bool>();
       const Span<float> mask_span = use_mask ? Span<float>(attribute_data.mask) : Span<float>();
 
+      const Span<bke::pbvh::MeshNode> nodes = pbvh->nodes<bke::pbvh::MeshNode>();
       threading::EnumerableThreadSpecific<LocalData> all_tls;
 
-      threading::parallel_for(IndexRange(mesh.verts_num), 4096, [&](const IndexRange range) {
-        LocalData &tls = all_tls.local();
+      const IndexMask changed_nodes = IndexMask::from_predicate(
+          all_nodes,
+          memory,
+          [&](const int node_i) {
+            LocalData &tls = all_tls.local();
+            const Span<int> verts = nodes[node_i].verts();
+            const int size = verts.size();
 
-        const Span<float3> local_eval_positions = eval_positions.slice(range);
-        const MutableSpan<float3> local_morph_positions = morph_positions.span.slice(range);
+            tls.translations.resize(size);
+            bool any_non_zero = false;
+            for (const int i : IndexRange(size)) {
+              const int vert = verts[i];
+              const float3 diff = morph_positions.span[vert] - eval_positions[vert];
+              tls.translations[i] = diff;
+              any_non_zero |= !math::is_zero(diff);
+            }
+            if (!any_non_zero) {
+              return false;
+            }
 
-        const int size = range.size();
-        tls.verts.resize(size);
-        const MutableSpan<int> verts = tls.verts;
-        array_utils::fill_index_range(verts, int(range.first()));
-
-        tls.translations.resize(size);
-        for (const int i : tls.translations.index_range()) {
-          tls.translations[i] = local_morph_positions[i] - local_eval_positions[i];
-        }
-        if (use_factors) {
-          tls.factors.resize(size);
-          fill_factor_from_hide_and_mask(
-              hide_span, mask_span, verts, tls.factors.as_mutable_span());
-          scale_translations(tls.translations.as_mutable_span(), tls.factors.as_span());
-          for (const int i : tls.translations.index_range()) {
-            local_morph_positions[i] -= tls.translations[i];
-          }
-        }
-        else {
-          local_morph_positions.copy_from(local_eval_positions);
-        }
-        position_data.deform(tls.translations, verts);
-      });
+            if (use_factors) {
+              tls.factors.resize(size);
+              fill_factor_from_hide_and_mask(
+                  hide_span, mask_span, verts, tls.factors.as_mutable_span());
+              scale_translations(tls.translations.as_mutable_span(), tls.factors.as_span());
+              any_non_zero = false;
+              for (const int i : IndexRange(size)) {
+                any_non_zero |= !math::is_zero(tls.translations[i]);
+              }
+              if (!any_non_zero) {
+                return false;
+              }
+              for (const int i : IndexRange(size)) {
+                morph_positions.span[verts[i]] -= tls.translations[i];
+              }
+            }
+            else {
+              for (const int i : IndexRange(size)) {
+                const int vert = verts[i];
+                morph_positions.span[vert] = eval_positions[vert];
+              }
+            }
+            position_data.deform(tls.translations, verts);
+            return true;
+          },
+          exec_mode::grain_size(1));
 
       morph_positions.finish();
 
-      return;
+      return changed_nodes;
     }
     case bke::pbvh::Type::Multires: {
       if (mesh.multires == nullptr) {
-        return;
+        return {};
       }
       if (!bke::multiresolution::base_topology_matches(mesh)) {
-        return;
+        return {};
       }
       Multiresolution &multires = *mesh.multires;
       const MultiresDeformData deform_data(mesh);
@@ -441,49 +469,75 @@ void swap_apply(Object &ob, const Depsgraph &depsgraph, const bool use_mask, con
       const Span<bool> hidden_span = use_hide ? multires.hidden_verts() : Span<bool>();
       const Span<float> mask_span = use_mask ? multires.masks() : Span<float>();
 
+      const int grid_size = multires.grid_size();
+      const Span<bke::pbvh::MultiresNode> nodes = pbvh->nodes<bke::pbvh::MultiresNode>();
       threading::EnumerableThreadSpecific<LocalData> all_tls;
 
-      threading::parallel_for(eval_positions.index_range(), 4096, [&](const IndexRange range) {
-        LocalData &tls = all_tls.local();
+      return IndexMask::from_predicate(
+          all_nodes,
+          memory,
+          [&](const int node_i) {
+            LocalData &tls = all_tls.local();
+            const IndexRange range = nodes[node_i].range(grid_size);
+            const MutableSpan<float3> local_eval_positions = eval_positions.slice(range);
+            const MutableSpan<float3> local_morph_positions = morph_positions.slice(range);
 
-        const MutableSpan<float3> local_eval_positions = eval_positions.slice(range);
-        const MutableSpan<float3> local_morph_positions = morph_positions.slice(range);
+            const int size = range.size();
+            tls.translations.resize(size);
+            bool any_non_zero = false;
+            for (const int i : IndexRange(size)) {
+              const float3 diff = local_morph_positions[i] - local_eval_positions[i];
+              tls.translations[i] = diff;
+              any_non_zero |= !math::is_zero(diff);
+            }
+            if (!any_non_zero) {
+              return false;
+            }
 
-        const int size = range.size();
-        tls.translations.resize(size);
-        for (const int i : tls.translations.index_range()) {
-          tls.translations[i] = local_morph_positions[i] - local_eval_positions[i];
-        }
-
-        if (use_factors) {
-          tls.factors.resize(size);
-          fill_factor_from_hide_and_mask(
-              hidden_span, mask_span, range, tls.factors.as_mutable_span());
-          scale_translations(tls.translations.as_mutable_span(), tls.factors.as_span());
-          for (const int i : tls.translations.index_range()) {
-            local_morph_positions[i] -= tls.translations[i];
-          }
-        }
-        else {
-          local_morph_positions.copy_from(local_eval_positions);
-        }
-        deform_data.deform(range, tls.translations.as_span());
-      });
-
-      return;
+            if (use_factors) {
+              tls.factors.resize(size);
+              fill_factor_from_hide_and_mask(
+                  hidden_span, mask_span, range, tls.factors.as_mutable_span());
+              scale_translations(tls.translations.as_mutable_span(), tls.factors.as_span());
+              any_non_zero = false;
+              for (const int i : IndexRange(size)) {
+                any_non_zero |= !math::is_zero(tls.translations[i]);
+              }
+              if (!any_non_zero) {
+                return false;
+              }
+              for (const int i : IndexRange(size)) {
+                local_morph_positions[i] -= tls.translations[i];
+              }
+            }
+            else {
+              local_morph_positions.copy_from(local_eval_positions);
+            }
+            deform_data.deform(range, tls.translations.as_span());
+            return true;
+          },
+          exec_mode::grain_size(1));
     }
     case bke::pbvh::Type::Grids:
     case bke::pbvh::Type::BMesh: {
       BLI_assert_unreachable();
-      return;
+      return {};
     }
   }
+  return {};
 }
 
-static void swap_apply_with_undo_capture(Object &ob,
-                                         const Depsgraph &depsgraph,
-                                         const bool use_mask,
-                                         const bool use_hide)
+void swap_apply(Object &ob, const Depsgraph &depsgraph, const bool use_mask, const bool use_hide)
+{
+  IndexMaskMemory memory;
+  swap_apply_impl(ob, depsgraph, use_mask, use_hide, memory);
+}
+
+static IndexMask swap_apply_with_undo_capture(Object &ob,
+                                              const Depsgraph &depsgraph,
+                                              const bool use_mask,
+                                              const bool use_hide,
+                                              IndexMaskMemory &memory)
 {
   Mesh &mesh = *id_cast<Mesh *>(ob.data);
   const bke::pbvh::Tree *pbvh = bke::object::pbvh_get(ob);
@@ -538,7 +592,10 @@ static void swap_apply_with_undo_capture(Object &ob,
     }
   }
 
-  swap_apply(ob, depsgraph, use_mask, use_hide);
+  const IndexMask changed_nodes = swap_apply_impl(ob, depsgraph, use_mask, use_hide, memory);
+  if (changed_nodes.is_empty()) {
+    return changed_nodes;
+  }
 
   push_swap_span(target, position_attr_name, morph_pos_before, current_morph_positions());
   if (use_layer) {
@@ -559,6 +616,8 @@ static void swap_apply_with_undo_capture(Object &ob,
                      shape_after->active_key_data);
     }
   }
+
+  return changed_nodes;
 }
 
 static wmOperatorStatus morph_swap_exec(bContext *C, wmOperator *op)
@@ -578,17 +637,18 @@ static wmOperatorStatus morph_swap_exec(bContext *C, wmOperator *op)
   const bool use_mask = RNA_boolean_get(op->ptr, "use_mask");
   const bool use_hide = RNA_boolean_get(op->ptr, "use_hide");
 
+  IndexMaskMemory memory;
+  IndexMask changed_nodes;
   if (use_undo) {
     storage_undo::push_begin(ob, op, storage_undo::StorageUndoOpType::MorphSwap);
-  }
-  swap_apply_with_undo_capture(ob, depsgraph, use_mask, use_hide);
-  if (use_undo) {
+    changed_nodes = swap_apply_with_undo_capture(ob, depsgraph, use_mask, use_hide, memory);
     storage_undo::push_end(ob);
   }
   else {
+    changed_nodes = swap_apply_impl(ob, depsgraph, use_mask, use_hide, memory);
     WM_file_tag_modified();
   }
-  morph_finish(C, ob, depsgraph);
+  morph_swap_finish(C, ob, depsgraph, changed_nodes);
 
   return OPERATOR_FINISHED;
 }
@@ -644,7 +704,6 @@ static bool delete_can_run(const Object &ob)
 
 static wmOperatorStatus morph_delete_exec(bContext *C, wmOperator *op)
 {
-  Depsgraph &depsgraph = *CTX_data_depsgraph_pointer(C);
   Object &ob = *CTX_data_active_object(C);
 
   if (!is_sculpt(ob) || !delete_can_run(ob)) {
@@ -663,7 +722,7 @@ static wmOperatorStatus morph_delete_exec(bContext *C, wmOperator *op)
   else {
     WM_file_tag_modified();
   }
-  morph_finish(C, ob, depsgraph);
+  WM_event_add_notifier(C, NC_GEOM | ND_DATA, ob.data);
 
   return OPERATOR_FINISHED;
 }

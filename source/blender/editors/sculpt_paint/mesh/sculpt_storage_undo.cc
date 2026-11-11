@@ -880,7 +880,6 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
             remove_morph_attr_curr(mesh, us.state_before.curr_level, diff.name);
           }
         }
-        update_after_restore(object, *depsgraph, false);
         break;
       }
       case StorageUndoOpType::MorphSwap: {
@@ -894,7 +893,6 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
       case StorageUndoOpType::MorphDelete: {
         restore_morph_deleted(mesh, us.curr_diffs);
         restore_morph_deleted(mesh, us.top_diffs);
-        update_after_restore(object, *depsgraph, false);
         break;
       }
       default:
@@ -1200,12 +1198,10 @@ void redo_step_impl(Object &object, StorageUndoStep &us_ref, Depsgraph *depsgrap
     switch (us->op_type) {
       case StorageUndoOpType::MorphStore: {
         morph::store_apply(object, *depsgraph, morph::MorphStoreMode::CurrentPositions);
-        update_after_restore(object, *depsgraph, false);
         break;
       }
       case StorageUndoOpType::MorphStoreFromSubdividedBase: {
         morph::store_apply(object, *depsgraph, morph::MorphStoreMode::SubdividedBase);
-        update_after_restore(object, *depsgraph, false);
         break;
       }
       case StorageUndoOpType::MorphSwap: {
@@ -1218,7 +1214,6 @@ void redo_step_impl(Object &object, StorageUndoStep &us_ref, Depsgraph *depsgrap
       }
       case StorageUndoOpType::MorphDelete: {
         morph::delete_apply(object);
-        update_after_restore(object, *depsgraph, false);
         break;
       }
       default:
