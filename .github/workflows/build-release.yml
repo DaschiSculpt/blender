@@ -1,0 +1,599 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Blender version'
+        required: false
+        type: string
+        default: ''
+      build_windows:
+        description: 'Build Windows'
+        type: boolean
+        default: true
+      build_linux:
+        description: 'Build Linux'
+        type: boolean
+        default: true
+      build_macos:
+        description: 'Build macOS'
+        type: boolean
+        default: true
+      create_release:
+        description: 'Publish as a GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Prepare Release Names
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.names.outputs.tag_name }}
+      base_name: ${{ steps.names.outputs.base_name }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            source/blender/blenkernel/BKE_blender_version.h
+          sparse-checkout-cone-mode: false
+
+      - name: Compute Tag & Archive Base Name
+        id: names
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            HEADER="source/blender/blenkernel/BKE_blender_version.h"
+            if [ -f "$HEADER" ]; then
+              VER=$(grep -E '^#define[[:space:]]+BLENDER_VERSION[[:space:]]+' "$HEADER" | awk '{print $3}')
+              PATCH=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_PATCH[[:space:]]+' "$HEADER" | awk '{print $3}')
+              CYCLE=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_CYCLE[[:space:]]+' "$HEADER" | awk '{print $3}')
+
+              MAJOR=$(( VER / 100 ))
+              MINOR=$(( VER % 100 ))
+
+              if [ -n "$CYCLE" ] && [ "$CYCLE" != "release" ]; then
+                VERSION="${MAJOR}.${MINOR}.${PATCH}-${CYCLE}"
+              else
+                VERSION="${MAJOR}.${MINOR}.${PATCH}"
+              fi
+            else
+              VERSION="5.4.0-alpha"
+            fi
+          fi
+
+          COMMIT_ID="${GITHUB_SHA::8}"
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="blender-${VERSION}+custom.${COMMIT_ID}"
+          fi
+          BASE_NAME="${TAG_NAME}"
+
+          echo "Using version: $VERSION"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    name: Build Windows
+    needs: prepare
+    if: inputs.build_windows
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Free Up Disk Space
+        shell: pwsh
+        run: |
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:ANDROID_HOME" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\Java" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\go" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\Ruby" -ErrorAction SilentlyContinue
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: false
+
+      - name: Fetch Upstream LFS Assets from Blender
+        shell: pwsh
+        run: |
+          git config lfs.url "https://projects.blender.org/blender/blender.git/info/lfs"
+          git lfs pull --include="assets/**,release/**,scripts/**"
+          git config --unset lfs.url
+
+      - name: Initialize Windows Precompiled Libraries
+        shell: pwsh
+        run: |
+          git config --local "submodule.lib/windows_x64.update" "checkout"
+          $env:GIT_LFS_SKIP_SMUDGE = "1"
+          git submodule update --init --depth 1 lib/windows_x64
+          Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
+          git -C lib/windows_x64 lfs pull
+
+          Remove-Item -Recurse -Force ".git/modules/lib/windows_x64/lfs/objects" -ErrorAction SilentlyContinue
+          Get-PSDrive C, D -ErrorAction SilentlyContinue
+
+      - name: Set up OptiX 8.0 Headers & LLVM (Clang-CL) PATH
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch v8.0.0 https://github.com/NVIDIA/optix-dev.git C:\optix-dev
+          echo "OPTIX_ROOT_DIR=C:\optix-dev" >> $env:GITHUB_ENV
+
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          }
+
+      - name: Compile Official Release (make ninja clang release)
+        shell: cmd
+        run: |
+          call make.bat ninja clang release 2022 builddir C:\build_blender nobuild
+          if errorlevel 1 exit /b 1
+          cd /d C:\build_blender
+          call rebuild.cmd
+
+      - name: Inject Precompiled Cycles GPU Kernels
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          if (-not $BUILD_BIN) {
+            Write-Error "Build output directory C:\build_blender\bin not found!"
+            exit 1
+          }
+
+          $VER_DIR = Get-ChildItem -Path $BUILD_BIN.FullName -Directory | Where-Object { $_.Name -match '^\d+\.\d+$' } | Select-Object -First 1
+          $BLENDER_VER = if ($VER_DIR) { $VER_DIR.Name } else { "5.4" }
+          $ESCAPED_VER = [regex]::Escape($BLENDER_VER)
+          $PARENT_SHA = (git rev-parse --short=12 HEAD~1 2>$null)
+
+          Write-Host "Finding official Blender $BLENDER_VER daily build on builder.blender.org (parent SHA: $PARENT_SHA)..."
+          $page = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/" -UseBasicParsing
+          $match = $null
+          if ($PARENT_SHA) {
+            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
+          }
+          if (-not $match -or -not $match.Success) {
+            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
+          }
+          if (-not $match.Success) {
+            Write-Warning "Could not find a $BLENDER_VER build on /download/daily/; checking /download/daily/archive/..."
+            $archivePage = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/archive/" -UseBasicParsing
+            if ($PARENT_SHA) {
+              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
+            }
+            if (-not $match -or -not $match.Success) {
+              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
+            }
+          }
+          if (-not $match.Success) {
+            Write-Error "Could not locate a Windows x64 build for Blender $BLENDER_VER on builder.blender.org!"
+            exit 1
+          }
+
+          $url = $match.Value
+          Write-Host "Downloading upstream archive from: $url"
+          Invoke-WebRequest -Uri $url -OutFile "C:\blender-upstream.zip"
+
+          Write-Host "Extracting Cycles GPU kernels (CUDA / OptiX / HIP)..."
+          $DEST = Join-Path $BUILD_BIN.FullName "$BLENDER_VER\scripts\addons_core\cycles\lib"
+          [System.IO.Directory]::CreateDirectory($DEST) | Out-Null
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("C:\blender-upstream.zip")
+          $count = 0
+          $oneapiEntry = $null
+          foreach ($entry in $zip.Entries) {
+            # Skip directory entries (they have an empty file name).
+            if ($entry.Name -eq "") {
+              continue
+            }
+            if ($entry.FullName -match "addons_core/cycles/lib/(.+)$") {
+              $destFile = Join-Path $DEST $matches[1]
+              [System.IO.Directory]::CreateDirectory((Split-Path $destFile)) | Out-Null
+              [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destFile, $true)
+              $count++
+            }
+            elseif ($entry.FullName -match '^[^/]+/cycles_kernel_oneapi_aot\.dll$') {
+              $oneapiEntry = $entry
+            }
+          }
+          Write-Host "Successfully injected $count Cycles GPU kernel binaries into $DEST."
+
+          $localJit = Join-Path $BUILD_BIN.FullName "cycles_kernel_oneapi_jit.dll"
+          $localAot = Join-Path $BUILD_BIN.FullName "cycles_kernel_oneapi_aot.dll"
+          if (-not $oneapiEntry) {
+            Write-Warning "Upstream archive has no cycles_kernel_oneapi_aot.dll. Keeping the locally built oneAPI library."
+          }
+          elseif (Test-Path $localAot) {
+            Write-Host "Local build already contains AOT oneAPI kernels. Nothing to inject."
+          }
+          elseif (Test-Path $localJit) {
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($oneapiEntry, $localJit, $true)
+            Write-Host "Replaced $localJit with the upstream AOT oneAPI kernel library."
+          }
+          else {
+            Write-Warning "No local oneAPI kernel library found. Skipping oneAPI injection."
+          }
+
+          $zip.Dispose()
+          Remove-Item -Force "C:\blender-upstream.zip"
+
+      - name: Package Release Archive
+        shell: pwsh
+        env:
+          BASE_NAME: ${{ needs.prepare.outputs.base_name }}
+        run: |
+          $RELEASE_NAME = "$env:BASE_NAME-windows-x64"
+          $ARCHIVE_NAME = "$RELEASE_NAME.zip"
+
+          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          if (-not $BUILD_BIN) {
+            Write-Error "Build output directory C:\build_blender\bin not found!"
+            exit 1
+          }
+
+          Write-Host "Packaging build output from $($BUILD_BIN.FullName) into $ARCHIVE_NAME..."
+          7z a -tzip $ARCHIVE_NAME "$($BUILD_BIN.FullName)\*"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "7z packaging failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          echo "RELEASE_NAME=$RELEASE_NAME" >> $env:GITHUB_ENV
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $env:GITHUB_ENV
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+          compression-level: 0
+          retention-days: 14
+
+  build-linux:
+    name: Build Linux
+    needs: prepare
+    if: inputs.build_linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container:
+      image: rockylinux:8
+      volumes:
+        - /usr/share/dotnet:/host/usr/share/dotnet
+        - /usr/local/lib/android:/host/usr/local/lib/android
+        - /opt/ghc:/host/opt/ghc
+        - /usr/local/share/boost:/host/usr/local/share/boost
+        - /opt/hostedtoolcache:/host/opt/hostedtoolcache
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Free Up Disk Space
+        run: |
+          df -h /
+          for DIR in /host/usr/share/dotnet /host/usr/local/lib/android /host/opt/ghc \
+                     /host/usr/local/share/boost /host/opt/hostedtoolcache; do
+            find "$DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+          done
+          df -h /
+
+      - name: Install Rocky Linux 8 Build Dependencies
+        run: |
+          dnf -y install 'dnf-command(config-manager)'
+          dnf config-manager --set-enabled powertools
+          dnf -y install epel-release
+          dnf -y install scl-utils scl-utils-build
+          dnf -y install gcc-toolset-14
+
+          dnf -y install \
+            git git-lfs tar xz bzip2 findutils which make ninja-build python3 \
+            mesa-libEGL-devel mesa-libGL-devel mesa-libGLU-devel \
+            libxkbcommon-devel libX11-devel libXcursor-devel libXi-devel libXinerama-devel \
+            libXrandr-devel libXt-devel libXxf86vm-devel \
+            alsa-lib-devel pulseaudio-libs-devel jack-audio-connection-kit-devel
+
+          curl -fsSL -o /tmp/cmake.sh https://github.com/Kitware/CMake/releases/download/v3.31.12/cmake-3.31.12-linux-x86_64.sh
+          sh /tmp/cmake.sh --prefix=/usr --skip-license
+          rm -f /tmp/cmake.sh
+
+          git lfs install --skip-repo
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: false
+
+      - name: Fetch Upstream LFS Assets from Blender
+        run: |
+          # The workspace is owned by a different user than the container's root user.
+          git config --global --add safe.directory '*'
+
+          git config lfs.url "https://projects.blender.org/blender/blender.git/info/lfs"
+          git lfs pull --include="assets/**,release/**,scripts/**"
+          git config --unset lfs.url
+
+      - name: Initialize Linux Precompiled Libraries
+        run: |
+          git config --local "submodule.lib/linux_x64.update" "checkout"
+          GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 lib/linux_x64
+          git -C lib/linux_x64 lfs pull
+          rm -rf .git/modules/lib/linux_x64/lfs/objects
+          df -h /
+
+      - name: Set up OptiX 8.0 Headers
+        run: |
+          git clone --depth 1 --branch v8.0.0 https://github.com/NVIDIA/optix-dev.git /tmp/optix-dev
+
+      - name: Compile Official Release (make release ninja)
+        run: |
+          source /opt/rh/gcc-toolset-14/enable
+          gcc --version
+          make release ninja \
+            BUILD_DIR=/tmp/build_blender \
+            BUILD_CMAKE_ARGS="-DOPTIX_ROOT_DIR=/tmp/optix-dev -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF"
+
+      - name: Inject Precompiled Cycles GPU Kernels
+        run: |
+          BUILD_BIN="/tmp/build_blender/bin"
+          if [ ! -d "$BUILD_BIN" ]; then
+            echo "Build output directory $BUILD_BIN not found!"
+            exit 1
+          fi
+
+          BLENDER_VER=$(find "$BUILD_BIN" -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+\.[0-9]+' -printf '%f\n' | head -n 1)
+          BLENDER_VER=${BLENDER_VER:-5.4}
+          ESCAPED_VER=$(echo "$BLENDER_VER" | sed 's/\./\\./g')
+          PARENT_SHA=$(git rev-parse --short=12 HEAD~1 2>/dev/null || true)
+
+          echo "Finding official Blender $BLENDER_VER daily build on builder.blender.org (parent SHA: $PARENT_SHA)..."
+          PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/")
+          URL=""
+          if [ -n "$PARENT_SHA" ]; then
+            URL=$(echo "$PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/blender-${ESCAPED_VER}[^\"[:space:]]*${PARENT_SHA}[^\"[:space:]]*linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
+          fi
+          if [ -z "$URL" ]; then
+            URL=$(echo "$PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/blender-${ESCAPED_VER}[^\"[:space:]]+linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
+          fi
+          if [ -z "$URL" ]; then
+            echo "Could not find a $BLENDER_VER build on /download/daily/; checking /download/daily/archive/..."
+            ARCHIVE_PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/archive/")
+            if [ -n "$PARENT_SHA" ]; then
+              URL=$(echo "$ARCHIVE_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/archive/blender-${ESCAPED_VER}[^\"[:space:]]*${PARENT_SHA}[^\"[:space:]]*linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
+            fi
+            if [ -z "$URL" ]; then
+              URL=$(echo "$ARCHIVE_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/archive/blender-${ESCAPED_VER}[^\"[:space:]]+linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
+            fi
+          fi
+
+          if [ -z "$URL" ]; then
+            echo "Could not locate a Linux x64 build for Blender $BLENDER_VER on builder.blender.org!"
+            exit 1
+          fi
+
+          echo "Downloading upstream archive from: $URL"
+          curl -fsSL "$URL" -o /tmp/blender-upstream.tar.xz
+
+          UPSTREAM_DIR=/tmp/blender-upstream
+          rm -rf "$UPSTREAM_DIR"
+          mkdir -p "$UPSTREAM_DIR"
+
+          echo "Extracting Cycles GPU kernels and the oneAPI kernel library..."
+          tar -xf /tmp/blender-upstream.tar.xz -C "$UPSTREAM_DIR" --wildcards \
+            "*/$BLENDER_VER/scripts/addons_core/cycles/lib/*" \
+            "*/lib/libcycles_kernel_oneapi_aot.so" \
+            || echo "Warning: some members were not found in the upstream archive."
+          rm -f /tmp/blender-upstream.tar.xz
+
+          UPSTREAM_ROOT=$(find "$UPSTREAM_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          KERNELS_SRC="$UPSTREAM_ROOT/$BLENDER_VER/scripts/addons_core/cycles/lib"
+          if [ ! -d "$KERNELS_SRC" ] || [ -z "$(ls -A "$KERNELS_SRC")" ]; then
+            echo "No Cycles GPU kernels found in the upstream archive!"
+            exit 1
+          fi
+
+          DEST="$BUILD_BIN/$BLENDER_VER/scripts/addons_core/cycles/lib"
+          mkdir -p "$DEST"
+          cp -a "$KERNELS_SRC/." "$DEST/"
+          echo "Successfully injected Cycles GPU kernel binaries into $DEST:"
+          ls -la "$DEST"
+
+          UPSTREAM_ONEAPI="$UPSTREAM_ROOT/lib/libcycles_kernel_oneapi_aot.so"
+          LOCAL_JIT="$BUILD_BIN/lib/libcycles_kernel_oneapi_jit.so"
+          LOCAL_AOT="$BUILD_BIN/lib/libcycles_kernel_oneapi_aot.so"
+          if [ ! -f "$UPSTREAM_ONEAPI" ]; then
+            echo "Warning: upstream archive has no libcycles_kernel_oneapi_aot.so; keeping the locally built oneAPI library."
+          elif [ -f "$LOCAL_AOT" ]; then
+            echo "Local build already contains AOT oneAPI kernels; nothing to inject."
+          elif [ -f "$LOCAL_JIT" ]; then
+            cp -f "$UPSTREAM_ONEAPI" "$LOCAL_JIT"
+            echo "Replaced $LOCAL_JIT with the upstream AOT oneAPI kernel library."
+          else
+            echo "Warning: no local oneAPI kernel library found (oneAPI device disabled?); skipping oneAPI injection."
+          fi
+
+          rm -rf "$UPSTREAM_DIR"
+
+      - name: Package Release Archive
+        env:
+          BASE_NAME: ${{ needs.prepare.outputs.base_name }}
+        run: |
+          RELEASE_NAME="${BASE_NAME}-linux-x64"
+          ARCHIVE_NAME="${RELEASE_NAME}.tar.xz"
+          BUILD_BIN="/tmp/build_blender/bin"
+
+          if [ ! -d "$BUILD_BIN" ]; then
+            echo "Build output directory $BUILD_BIN not found!"
+            exit 1
+          fi
+
+          echo "Packaging build output from $BUILD_BIN into $ARCHIVE_NAME..."
+          mv "$BUILD_BIN" "/tmp/$RELEASE_NAME"
+          tar -C /tmp -I "xz -T0" -cf "$ARCHIVE_NAME" "$RELEASE_NAME"
+
+          echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+          compression-level: 0
+          retention-days: 14
+
+  build-macos:
+    name: Build macOS
+    needs: prepare
+    if: inputs.build_macos
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Free Up Disk Space
+        run: |
+          df -h /
+
+          ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer$||')
+          ACTIVE_XCODE_REAL=$(cd "$ACTIVE_XCODE" && pwd -P)
+          echo "Active Xcode: $ACTIVE_XCODE_REAL"
+          for XCODE in /Applications/Xcode*.app; do
+            [ -L "$XCODE" ] && continue
+            XCODE_REAL=$(cd "$XCODE" && pwd -P)
+            if [ "$XCODE_REAL" != "$ACTIVE_XCODE_REAL" ]; then
+              echo "Removing $XCODE"
+              sudo rm -rf "$XCODE"
+            fi
+          done
+
+          xcrun simctl delete all || true
+          xcrun simctl runtime delete all || true
+          rm -rf "$HOME/Library/Developer/CoreSimulator" || true
+
+          if [ -n "$ANDROID_HOME" ]; then sudo rm -rf "$ANDROID_HOME" || true; fi
+          sudo rm -rf "$HOME/Library/Android" || true
+          sudo rm -rf "$HOME/.dotnet" /usr/local/share/dotnet || true
+          sudo rm -rf "$HOME/.ghcup" || true
+          if [ -n "$AGENT_TOOLSDIRECTORY" ]; then sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true; fi
+
+          df -h /
+
+      - name: Install Build Tools
+        run: |
+          brew install cmake ninja git-lfs
+          git lfs install --skip-repo
+
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          lfs: false
+
+      - name: Fetch Upstream LFS Assets from Blender
+        run: |
+          git config lfs.url "https://projects.blender.org/blender/blender.git/info/lfs"
+          git lfs pull --include="assets/**,release/**,scripts/**"
+          git config --unset lfs.url
+
+      - name: Initialize macOS Precompiled Libraries
+        run: |
+          git config --local "submodule.lib/macos_arm64.update" "checkout"
+          GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 lib/macos_arm64
+          git -C lib/macos_arm64 lfs pull
+          rm -rf .git/modules/lib/macos_arm64/lfs/objects
+          df -h /
+
+      - name: Compile Official Release (make release ninja)
+        run: |
+          make release ninja BUILD_DIR=/tmp/build_blender
+
+      - name: Ad-Hoc Sign & Package DMG
+        env:
+          BASE_NAME: ${{ needs.prepare.outputs.base_name }}
+        run: |
+          RELEASE_NAME="${BASE_NAME}-macos-arm64"
+          ARCHIVE_NAME="${RELEASE_NAME}.dmg"
+          APP_PATH="/tmp/build_blender/bin/Blender.app"
+          APP_NAME="Blender.app"
+          STAGING="/tmp/dmg_staging"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Build output directory $APP_PATH not found!"
+            exit 1
+          fi
+
+          # Same layout as the official DMG: the app plus a link to /Applications, so users can
+          # install it by drag & drop.
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          mv "$APP_PATH" "$STAGING/$APP_NAME"
+          ln -s /Applications "$STAGING/Applications"
+
+          echo "Ad-hoc signing $APP_NAME for Apple Silicon..."
+          codesign --force --deep --sign - "$STAGING/$APP_NAME"
+          codesign --verify --deep --strict --verbose=2 "$STAGING/$APP_NAME"
+
+          echo "Packaging $STAGING into $ARCHIVE_NAME..."
+          for ATTEMPT in 1 2 3; do
+            if hdiutil create -volname "Blender" -srcfolder "$STAGING" -ov -format UDZO "$ARCHIVE_NAME"; then
+              break
+            fi
+            if [ "$ATTEMPT" -eq 3 ]; then
+              echo "hdiutil failed after $ATTEMPT attempts!"
+              exit 1
+            fi
+            echo "hdiutil failed, retrying in 15 seconds..."
+            sleep 15
+          done
+
+          echo "RELEASE_NAME=$RELEASE_NAME" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+          compression-level: 0
+          retention-days: 14
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [prepare, build-windows, build-linux, build-macos]
+    if: ${{ !cancelled() && inputs.create_release && needs.prepare.result == 'success' && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List Release Files
+        run: ls -la dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.prepare.outputs.tag_name }}
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
