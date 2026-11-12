@@ -2537,7 +2537,7 @@ void BKE_sculptsession_update_before_eval(Object *ob_eval)
     /* Avoid performing the following normal update for Multires, as it causes race conditions
      * and other intermittent crashes with shared meshes.
      * See !125268 and #125157 for more information. */
-    if (pbvh && pbvh->type() != bke::pbvh::Type::Grids) {
+    if (pbvh && !ELEM(pbvh->type(), bke::pbvh::Type::Grids, bke::pbvh::Type::Multires)) {
       /* pbvh::Tree nodes may contain dirty normal tags. To avoid losing that information when
        * the pbvh::Tree is deleted, make sure all tagged geometry normals are up to date.
        * See #122947 for more information. */

@@ -1950,6 +1950,9 @@ void Tree::update_normals(Object &object_orig, Object &object_eval)
     }
     case Type::Multires: {
       const Mesh &base_mesh = *id_cast<Mesh *>(object_orig.data);
+      if (!base_mesh.multires || base_mesh.multires->curr_level == 0) {
+        return;
+      }
       const Multiresolution &multires = *base_mesh.multires;
       const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
       const int virtual_lvl = multires.curr_level - multires.base_level(multires.curr_level);
@@ -2173,6 +2176,9 @@ void Tree::update_bounds(const Depsgraph &depsgraph, const Object &object)
     }
     case Type::Multires: {
       const Mesh &mesh = *id_cast<Mesh *>(object.data);
+      if (!mesh.multires || mesh.multires->curr_level == 0) {
+        break;
+      }
       const Multiresolution &multires = *mesh.multires;
       this->update_bounds_multires(multires.positions(), multires.grid_size());
       break;
@@ -2436,6 +2442,9 @@ void Tree::update_visibility(const Object &object)
       break;
     }
     case Type::Multires: {
+      if (!mesh.multires || mesh.multires->curr_level == 0) {
+        break;
+      }
       update_visibility_multires(*mesh.multires, this->nodes<MultiresNode>(), node_mask);
       break;
     }

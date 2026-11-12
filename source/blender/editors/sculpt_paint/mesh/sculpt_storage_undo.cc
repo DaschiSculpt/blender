@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 
+#include "MEM_guardedalloc.h"
+
 #include "DNA_mesh_types.h"
 #include "DNA_scene_types.h"
 
@@ -902,20 +904,29 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
   }
 
   Mesh &base_mesh = *id_cast<Mesh *>(object.data);
+  if (!base_mesh.multires) {
+    BKE_sculptsession_free_pbvh(object);
+    DEG_id_tag_update(&object.id, ID_RECALC_GEOMETRY);
+    return;
+  }
   Multiresolution &multires = *base_mesh.multires;
 
   switch (us.op_type) {
     case StorageUndoOpType::Subdivide: {
-      const Array<int> subd_face_sets(multires.top_face_sets());
-      const Array<bool> subd_hidden(multires.top_face_attribute<bool>(".hide_poly"));
+      if (us.state_before.top_level == 0) {
+        multires.free();
+        MEM_SAFE_DELETE(base_mesh.multires);
+      }
+      else {
+        const Array<int> subd_face_sets(multires.top_face_sets());
+        const Array<bool> subd_hidden(multires.top_face_attribute<bool>(".hide_poly"));
 
-      multires.top_level = us.state_before.top_level;
-      multires.curr_level = us.state_before.top_level;
-      multires.sculpt_level = us.state_before.sculpt_level;
-      multires.clear_top_storage();
-      multires.hidden_verts_free();
+        multires.top_level = us.state_before.top_level;
+        multires.curr_level = us.state_before.top_level;
+        multires.sculpt_level = us.state_before.sculpt_level;
+        multires.clear_top_storage();
+        multires.hidden_verts_free();
 
-      if (multires.top_level > 0) {
         for (const AttributeDiff &diff : us.top_diffs) {
           BLI_assert(diff.kind == AttributeDiff::Kind::Deleted);
 
@@ -960,6 +971,7 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
               multires.top_face_attribute_for_write<bool>(".hide_poly"));
         }
       }
+      BKE_sculptsession_free_pbvh(object);
       DEG_id_tag_update(&object.id, ID_RECALC_GEOMETRY);
       break;
     }
@@ -1132,6 +1144,7 @@ void undo_step_impl(Object &object, StorageUndoStep &us, Depsgraph *depsgraph)
         restore_face_attr(".hide_poly", dst_hidden.as_span());
       }
 
+      BKE_sculptsession_free_pbvh(object);
       DEG_id_tag_update(&object.id, ID_RECALC_GEOMETRY);
       break;
     }
