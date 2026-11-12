@@ -3671,8 +3671,11 @@ static brushes::CursorSampleResult calc_brush_node_mask(const Depsgraph &depsgra
   const SculptSession &ss = *ob.runtime->sculpt_session;
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
 
-  const bool use_original = brush_type_needs_original(brush.sculpt_brush_type) ? true :
-                                                                                 !ss.cache->accum;
+  bool use_original = brush_type_needs_original(brush.sculpt_brush_type) ? true : !ss.cache->accum;
+
+  if (ELEM(brush.sculpt_brush_type, SCULPT_BRUSH_TYPE_MORPH, SCULPT_BRUSH_TYPE_ERASE_LAYER)) {
+    use_original = false;
+  }
   /* Build a list of all nodes that are potentially within the brush's area of influence */
 
   if (brush_type_needs_all_pbvh_nodes(brush)) {
