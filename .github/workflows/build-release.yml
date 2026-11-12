@@ -38,7 +38,7 @@ jobs:
       base_name: ${{ steps.names.outputs.base_name }}
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           sparse-checkout: |
             source/blender/blenkernel/BKE_blender_version.h
@@ -100,7 +100,7 @@ jobs:
           Get-PSDrive C, D -ErrorAction SilentlyContinue
 
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 2
           lfs: false
@@ -256,7 +256,7 @@ jobs:
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $env:GITHUB_ENV
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}
@@ -313,7 +313,7 @@ jobs:
           git lfs install --skip-repo
 
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 2
           lfs: false
@@ -450,7 +450,7 @@ jobs:
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}
@@ -499,7 +499,7 @@ jobs:
           git lfs install --skip-repo
 
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 2
           lfs: false
@@ -565,7 +565,7 @@ jobs:
           echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> "$GITHUB_ENV"
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_NAME }}
           path: ${{ env.ARCHIVE_NAME }}
@@ -582,7 +582,7 @@ jobs:
 
     steps:
       - name: Download Build Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -591,7 +591,7 @@ jobs:
         run: ls -la dist
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ needs.prepare.outputs.tag_name }}
           tag_name: ${{ needs.prepare.outputs.tag_name }}
