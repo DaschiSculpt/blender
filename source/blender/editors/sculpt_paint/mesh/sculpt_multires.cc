@@ -530,8 +530,10 @@ static void switch_face_attribute(Mesh &base_mesh,
 
   if (src.is_empty()) {
     if (target_lvl == 0) {
-      backup_base_face_attribute<T>(base_mesh, attr_name, attr_type);
-      base_mesh.attributes_for_write().remove(attr_name);
+      if (base_mesh.attributes().contains(attr_name)) {
+        backup_base_face_attribute<T>(base_mesh, attr_name, attr_type);
+        base_mesh.attributes_for_write().remove(attr_name);
+      }
     }
     else if (target_lvl == multires.top_level) {
       multires.top_attribute_storage.wrap().remove(attr_name);
@@ -686,14 +688,9 @@ void flush(Object &object)
     multires.runtime->clear_curr_dirty();
   }
 
-  if (!multires.face_sets().is_empty()) {
-    switch_face_attribute<int>(
-        base_mesh, multires, src_lvl, 0, ".sculpt_face_set", bke::AttrType::Int32);
-  }
-  if (!multires.hidden_faces().is_empty()) {
-    switch_face_attribute<bool>(
-        base_mesh, multires, src_lvl, 0, ".hide_poly", bke::AttrType::Bool);
-  }
+  switch_face_attribute<int>(
+      base_mesh, multires, src_lvl, 0, ".sculpt_face_set", bke::AttrType::Int32);
+  switch_face_attribute<bool>(base_mesh, multires, src_lvl, 0, ".hide_poly", bke::AttrType::Bool);
 
   multires.clear_sculpt_data();
 }
