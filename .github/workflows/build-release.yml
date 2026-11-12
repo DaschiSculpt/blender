@@ -141,14 +141,16 @@ jobs:
           if errorlevel 1 exit /b 1
           cd /d C:\build_blender
           call rebuild.cmd
+          cmake --install C:\build_blender --prefix C:\blender_install
+          if errorlevel 1 exit /b 1
 
       - name: Inject Precompiled Cycles GPU Kernels
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          $BUILD_BIN = Get-Item -Path "C:\blender_install" -ErrorAction SilentlyContinue
           if (-not $BUILD_BIN) {
-            Write-Error "Build output directory C:\build_blender\bin not found!"
+            Write-Error "Install directory C:\blender_install not found!"
             exit 1
           }
 
@@ -237,9 +239,9 @@ jobs:
           $RELEASE_NAME = "$env:BASE_NAME-windows-x64"
           $ARCHIVE_NAME = "$RELEASE_NAME.zip"
 
-          $BUILD_BIN = Get-Item -Path "C:\build_blender\bin" -ErrorAction SilentlyContinue
+          $BUILD_BIN = Get-Item -Path "C:\blender_install" -ErrorAction SilentlyContinue
           if (-not $BUILD_BIN) {
-            Write-Error "Build output directory C:\build_blender\bin not found!"
+            Write-Error "Install directory C:\blender_install not found!"
             exit 1
           }
 
@@ -344,12 +346,13 @@ jobs:
           make release ninja \
             BUILD_DIR=/tmp/build_blender \
             BUILD_CMAKE_ARGS="-DOPTIX_ROOT_DIR=/tmp/optix-dev -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF"
+          cmake --install /tmp/build_blender --prefix /tmp/blender_install
 
       - name: Inject Precompiled Cycles GPU Kernels
         run: |
-          BUILD_BIN="/tmp/build_blender/bin"
+          BUILD_BIN="/tmp/blender_install"
           if [ ! -d "$BUILD_BIN" ]; then
-            echo "Build output directory $BUILD_BIN not found!"
+            echo "Install directory $BUILD_BIN not found!"
             exit 1
           fi
 
@@ -432,10 +435,10 @@ jobs:
         run: |
           RELEASE_NAME="${BASE_NAME}-linux-x64"
           ARCHIVE_NAME="${RELEASE_NAME}.tar.xz"
-          BUILD_BIN="/tmp/build_blender/bin"
+          BUILD_BIN="/tmp/blender_install"
 
           if [ ! -d "$BUILD_BIN" ]; then
-            echo "Build output directory $BUILD_BIN not found!"
+            echo "Install directory $BUILD_BIN not found!"
             exit 1
           fi
 
