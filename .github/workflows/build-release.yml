@@ -196,7 +196,6 @@ jobs:
           $count = 0
           $oneapiEntry = $null
           foreach ($entry in $zip.Entries) {
-            # Skip directory entries (they have an empty file name).
             if ($entry.Name -eq "") {
               continue
             }
@@ -243,6 +242,14 @@ jobs:
           if (-not $BUILD_BIN) {
             Write-Error "Install directory C:\blender_install not found!"
             exit 1
+          }
+
+          $now = Get-Date
+          foreach ($exe in @("blender-launcher.exe", "blender.exe")) {
+            $exePath = Join-Path $BUILD_BIN.FullName $exe
+            if (Test-Path $exePath) {
+              (Get-Item $exePath).LastWriteTime = $now
+            }
           }
 
           Write-Host "Packaging build output from $($BUILD_BIN.FullName) into $ARCHIVE_NAME..."
@@ -300,7 +307,7 @@ jobs:
           dnf -y install gcc-toolset-14
 
           dnf -y install \
-            git git-lfs tar xz bzip2 findutils which make ninja-build python3 \
+            git git-lfs tar xz bzip2 findutils which make python3 \
             mesa-libEGL-devel mesa-libGL-devel mesa-libGLU-devel \
             libxkbcommon-devel libX11-devel libXcursor-devel libXi-devel libXinerama-devel \
             libXrandr-devel libXt-devel libXxf86vm-devel \
@@ -320,7 +327,6 @@ jobs:
 
       - name: Fetch Upstream LFS Assets from Blender
         run: |
-          # The workspace is owned by a different user than the container's root user.
           git config --global --add safe.directory '*'
 
           git config lfs.url "https://projects.blender.org/blender/blender.git/info/lfs"
@@ -339,11 +345,11 @@ jobs:
         run: |
           git clone --depth 1 --branch v8.0.0 https://github.com/NVIDIA/optix-dev.git /tmp/optix-dev
 
-      - name: Compile Official Release (make release ninja)
+      - name: Compile Official Release (make release)
         run: |
           source /opt/rh/gcc-toolset-14/enable
           gcc --version
-          make release ninja \
+          make release \
             BUILD_DIR=/tmp/build_blender \
             BUILD_CMAKE_ARGS="-DOPTIX_ROOT_DIR=/tmp/optix-dev -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF"
           cmake --install /tmp/build_blender --prefix /tmp/blender_install
@@ -537,8 +543,6 @@ jobs:
             exit 1
           fi
 
-          # Same layout as the official DMG: the app plus a link to /Applications, so users can
-          # install it by drag & drop.
           rm -rf "$STAGING"
           mkdir -p "$STAGING"
           mv "$APP_PATH" "$STAGING/$APP_NAME"
