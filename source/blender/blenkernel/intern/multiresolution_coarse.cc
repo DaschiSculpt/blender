@@ -35,8 +35,21 @@ static int target_coarse_level(const Multiresolution &multires)
   if (fine_lvl <= 1) {
     return -1;
   }
-  const int target = std::max(1, multires.base_level(fine_lvl));
-  return (target < fine_lvl) ? target : -1;
+  constexpr int max_coarse_verts = 100'000;
+  if (multires.verts_num() <= max_coarse_verts) {
+    return -1;
+  }
+  for (int lvl = fine_lvl - 1; lvl >= 1; lvl--) {
+    const int verts_num = calc_total_verts(lvl,
+                                           multires.base_verts_num,
+                                           multires.base_edges_num,
+                                           multires.base_faces_num,
+                                           multires.base_corners_num);
+    if (verts_num <= max_coarse_verts) {
+      return lvl;
+    }
+  }
+  return 1;
 }
 
 static int total_verts_at_level(const Multiresolution &multires,
