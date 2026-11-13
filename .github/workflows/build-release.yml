@@ -351,7 +351,7 @@ jobs:
           gcc --version
           make release \
             BUILD_DIR=/tmp/build_blender \
-            BUILD_CMAKE_ARGS="-DOPTIX_ROOT_DIR=/tmp/optix-dev -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF"
+            BUILD_CMAKE_ARGS="-DOPTIX_ROOT_DIR=/tmp/optix-dev -DWITH_CYCLES_CUDA_BINARIES=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF -DSYCL_CPP_FLAGS=--gcc-toolchain=/opt/rh/gcc-toolset-14/root/usr"
           cmake --install /tmp/build_blender --prefix /tmp/blender_install
 
       - name: Inject Precompiled Cycles GPU Kernels
