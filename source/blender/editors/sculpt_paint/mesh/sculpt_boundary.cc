@@ -1660,7 +1660,6 @@ static void do_bend_brush(const Depsgraph &depsgraph,
       Mesh &base_mesh = *id_cast<Mesh *>(object.data);
       Multiresolution &multires = *base_mesh.multires;
       const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
-      const Span<float3> positions = multires.positions();
       const MultiresDeformData deform_data(base_mesh);
       MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
       node_mask.foreach_index(
@@ -4408,7 +4407,6 @@ std::unique_ptr<SculptBoundary> data_init_multires(Object &object,
   const Mesh &mesh = *id_cast<Mesh *>(object.data);
   const Multiresolution &multires = *mesh.multires;
   const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
-  const OffsetIndices faces = mesh.faces();
   const Span<float3> positions = multires.positions();
 
   const std::optional<MultiresCoord> boundary_initial_vert = get_closest_boundary_vert_multires(

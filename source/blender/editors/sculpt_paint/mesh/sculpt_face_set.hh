@@ -131,6 +131,7 @@ void calc_face_indices_grids(const SubdivCCG &subdiv_ccg,
  * \see face_set::ensure_face_sets_mesh if further writing to the attribute is desired.
  */
 bool create_face_sets_mesh(Object &object);
+bool create_face_sets_multires(Object &object);
 
 /**
  * Ensures that the sculpt face set attribute exists on the mesh.

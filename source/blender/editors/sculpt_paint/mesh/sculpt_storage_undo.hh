@@ -13,6 +13,8 @@
 
 #include "sculpt_undo.hh"
 
+#include "ED_sculpt.hh"
+
 namespace blender {
 
 struct Mesh;
@@ -24,7 +26,6 @@ using StorageUndoStep = undo::SculptUndoStep;
 void push_begin(Object &ob, const wmOperator *op, StorageUndoOpType type);
 void push_begin_with_name(Object &ob, const char *name, StorageUndoOpType type);
 
-void push_end(Object &ob);
 bool is_active();
 
 void push_attribute_added(const StorageTarget target,

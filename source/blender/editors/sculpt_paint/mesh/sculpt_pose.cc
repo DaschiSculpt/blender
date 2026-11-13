@@ -468,7 +468,6 @@ static void grow_factors_multires(const ePaintSymmetryFlags symm,
   using MultiresCoord = bke::multiresolution::MultiresCoord;
 
   const int grid_size = multires.grid_size();
-  const IndexRange node_range = node.range(grid_size);
   const Span<float3> positions = multires.positions();
   const Span<bool> hidden = multires.hidden_verts();
   const bke::multiresolution::OffsetsSpan offsets = pbvh.offsets;
@@ -2725,13 +2724,11 @@ void do_pose_brush(const Depsgraph &depsgraph,
       Mesh &base_mesh = *id_cast<Mesh *>(ob.data);
       Multiresolution &multires = *base_mesh.multires;
       const bke::multiresolution::BaseTopology &base_topo = multires.get_base_topology(base_mesh);
-      const int grid_size = multires.grid_size();
       const Span<float3> positions = multires.positions();
       MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();
       const MultiresDeformData deform_data(base_mesh);
       node_mask.foreach_index(
           [&](const int i) {
-            const IndexRange node_range = nodes[i].range(grid_size);
             calc_multires(depsgraph, multires, base_topo, sd, brush, nodes[i], ob, deform_data);
             bke::pbvh::update_node_bounds_multires(
                 multires.grid_size(), positions, pbvh.offsets, nodes[i]);

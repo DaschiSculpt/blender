@@ -2778,7 +2778,6 @@ static wmOperatorStatus sculpt_cloth_filter_modal(bContext *C,
       const Mesh &base_mesh = *id_cast<const Mesh *>(object.data);
       const Multiresolution &multires = *base_mesh.multires;
       const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
-      const bke::AttributeAccessor attributes = base_mesh.attributes();
       const Span<int> face_sets = multires.face_sets();
 
       MutableSpan<bke::pbvh::MultiresNode> nodes = pbvh.nodes<bke::pbvh::MultiresNode>();

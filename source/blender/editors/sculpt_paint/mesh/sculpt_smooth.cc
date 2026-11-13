@@ -1175,7 +1175,6 @@ void calc_relaxed_translations_multires(const Object &object,
                                         const MutableSpan<float3> translations)
 {
   using MultiresCoord = bke::multiresolution::MultiresCoord;
-  using ElemType = bke::multiresolution::ElemType;
 
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const int grid_size = multires.grid_size();

@@ -492,7 +492,7 @@ void push_attribute_deleted(const StorageTarget target,
   diff.name = std::string(attr_name);
   diff.kind = AttributeDiff::Kind::Deleted;
   diff.type = attr_type;
-  diff.values = Vector<std::byte>(attr.cast<std::byte>());
+  diff.values = Vector<std::byte>(attr.template cast<std::byte>());
   diff.origin = origin;
 
   target_diffs.append(std::move(diff));
@@ -706,7 +706,7 @@ void push_face_deleted(const StringRef attr_name,
   diff.name = std::string(attr_name);
   diff.kind = AttributeDiff::Kind::Deleted;
   diff.type = attr_type;
-  diff.values = Vector<std::byte>(attr.cast<std::byte>());
+  diff.values = Vector<std::byte>(attr.template cast<std::byte>());
 
   us->face_diffs.append(std::move(diff));
 }

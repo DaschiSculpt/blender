@@ -773,7 +773,6 @@ static void calc_scale_filter(const Depsgraph &depsgraph,
             LocalData &tls = all_tls.local();
             const IndexRange node_range = nodes[i].range(multires.grid_size());
             const Span<float3> positions = deform_data.positions.slice(node_range);
-            const Span<float3> normals = multires.normals().slice(node_range);
             const OrigPositionData orig_data = orig_position_data_get_multires(object, nodes[i]);
 
             tls.factors.resize(positions.size());
@@ -933,8 +932,6 @@ static void calc_sphere_filter(const Depsgraph &depsgraph,
           [&](const int i) {
             const IndexRange node_range = nodes[i].range(multires.grid_size());
             const Span<float3> positions = deform_data.positions.slice(node_range);
-            const Span<float3> normals = multires.normals().slice(node_range);
-            const OrigPositionData orig_data = orig_position_data_get_multires(object, nodes[i]);
             LocalData &tls = all_tls.local();
 
             tls.factors.resize(positions.size());
@@ -1093,7 +1090,6 @@ static void calc_random_filter(const Depsgraph &depsgraph,
           [&](const int i) {
             const IndexRange node_range = nodes[i].range(multires.grid_size());
             const Span<float3> positions = deform_data.positions.slice(node_range);
-            const Span<float3> normals = multires.normals().slice(node_range);
             const OrigPositionData orig_data = orig_position_data_get_multires(object, nodes[i]);
             LocalData &tls = all_tls.local();
 
@@ -1474,7 +1470,6 @@ static void calc_relax_face_sets_filter(const Depsgraph &depsgraph,
       Multiresolution &multires = *base_mesh.multires;
       const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(base_mesh);
       const Span<int> face_sets = multires.face_sets();
-      const Span<float3> normals = multires.normals();
       const int grid_size = multires.grid_size();
 
       const MultiresDeformData deform_data(base_mesh);
@@ -1485,7 +1480,6 @@ static void calc_relax_face_sets_filter(const Depsgraph &depsgraph,
             LocalData &tls = all_tls.local();
             const IndexRange node_range = nodes[i].range(grid_size);
             const Span<float3> node_positions = deform_data.positions.slice(node_range);
-            const Span<float3> node_normals = normals.slice(node_range);
 
             tls.factors.resize(node_positions.size());
             const MutableSpan<float> factors = tls.factors;

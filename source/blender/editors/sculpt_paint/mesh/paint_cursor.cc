@@ -585,7 +585,7 @@ static void screen_space_overlays_draw(const PaintCursorContext &pcontext)
   if (pcontext.ss->expand_cache) {
     const int vert = pcontext.ss->expand_cache->initial_active_vert;
 
-    float3 position;
+    float3 position(0);
     switch (bke::object::pbvh_get(active_object)->type()) {
       case bke::pbvh::Type::Mesh: {
         const Span<float3> positions = bke::pbvh::vert_positions_eval(*pcontext.depsgraph,

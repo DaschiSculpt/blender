@@ -26,6 +26,7 @@
 
 #include "sculpt_intern.hh"
 #include "sculpt_morph.hh"
+#include "sculpt_multires.hh"
 #include "sculpt_storage_undo.hh"
 
 #include "RNA_access.hh"
@@ -187,8 +188,8 @@ static void propagate_to_top(const Mesh &base_mesh,
   apply_delta(top_attr, top_delta.as_span(), clamp);
 }
 
-void propagate_from_base(const Mesh &base_mesh,
-                         const bke::multiresolution::OffsetsSpan &top_offsets)
+static void propagate_from_base(const Mesh &base_mesh,
+                                const bke::multiresolution::OffsetsSpan &top_offsets)
 {
   Multiresolution &multires = *base_mesh.multires;
   bke::AttributeAccessor attributes = base_mesh.attributes();

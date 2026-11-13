@@ -453,7 +453,6 @@ static void color_filter_task_multires(const Depsgraph &depsgraph,
       const int verts_count = node.verts().size();
       const int edges_count = node.edges().size() * grid_size;
       const int faces_count = node.faces().size() * grid_size * grid_size;
-      const IndexRange node_range = node.range(grid_size);
       const IndexRange local_verts_range(0, verts_count);
       const IndexRange local_edges_range(verts_count, edges_count);
       const IndexRange local_faces_range(verts_count + edges_count, faces_count);

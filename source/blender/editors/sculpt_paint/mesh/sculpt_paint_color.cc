@@ -823,12 +823,12 @@ static void do_sample_wet_paint_task_multires(const Depsgraph &depsgraph,
   }
 }
 
-void do_paint_brush_mesh(const Depsgraph &depsgraph,
-                         Object &ob,
-                         const Sculpt &sd,
-                         const Brush &brush,
-                         const float4x4 &mat,
-                         const IndexMask &node_mask)
+static void do_paint_brush_mesh(const Depsgraph &depsgraph,
+                                Object &ob,
+                                const Sculpt &sd,
+                                const Brush &brush,
+                                const float4x4 &mat,
+                                const IndexMask &node_mask)
 {
   Mesh &mesh = *id_cast<Mesh *>(ob.data);
   const SculptSession &ss = *ob.runtime->sculpt_session;
@@ -927,12 +927,12 @@ void do_paint_brush_mesh(const Depsgraph &depsgraph,
   color_attribute.finish();
 }
 
-void do_paint_brush_multires(const Depsgraph &depsgraph,
-                             Object &ob,
-                             const Sculpt &sd,
-                             const Brush &brush,
-                             const float4x4 &mat,
-                             const IndexMask &node_mask)
+static void do_paint_brush_multires(const Depsgraph &depsgraph,
+                                    Object &ob,
+                                    const Sculpt &sd,
+                                    const Brush &brush,
+                                    const float4x4 &mat,
+                                    const IndexMask &node_mask)
 {
   const SculptSession &ss = *ob.runtime->sculpt_session;
   const Mesh &base_mesh = *id_cast<Mesh *>(ob.data);
@@ -1317,7 +1317,6 @@ static void do_smear_brush_task_multires(const Depsgraph &depsgraph,
   }
 
   using MultiresCoord = bke::multiresolution::MultiresCoord;
-  using ElemType = bke::multiresolution::ElemType;
 
   auto calc_index = [&](const MultiresCoord &coord) -> int {
     return coord.to_index(pbvh.offsets);

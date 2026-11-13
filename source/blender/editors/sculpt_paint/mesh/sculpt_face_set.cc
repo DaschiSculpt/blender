@@ -294,7 +294,6 @@ void filter_verts_with_unique_face_sets_multires(
     const MutableSpan<float> factors)
 {
   using MultiresCoord = bke::multiresolution::MultiresCoord;
-  using ElemType = bke::multiresolution::ElemType;
 
   node.foreach_coord(grid_size, [&](const int node_vert, MultiresCoord coord) {
     if (unique == face_set::vert_has_unique_face_set(coord, base_topo, grid_size, face_sets)) {
@@ -675,7 +674,6 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
         const Multiresolution &multires = *mesh.multires;
         const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
         const Span<int> corner_verts = multires.corner_verts();
-        const OffsetIndices<int> faces = base_topo.faces;
         const Span<bool> hidden_faces = multires.hidden_faces();
         const Span<float> masks = multires.masks();
 
@@ -2689,7 +2687,6 @@ static void gesture_apply_multires(gesture::GestureData &gesture_data, const Ind
   MutableSpan<int> face_sets = ensure_face_sets_multires(base_mesh);
   const Span<int> corner_verts = multires.corner_verts();
   const Span<float3> positions = multires.positions();
-  const Span<float> masks = multires.masks();
   const OffsetIndices<int> base_faces = base_topo.faces;
 
   struct TLS {
