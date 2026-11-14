@@ -68,7 +68,7 @@ static bool all_faces_quads(const Mesh &base_mesh)
   return true;
 }
 
-uint64_t calc_base_topology_hash(const Mesh &base_mesh)
+static uint64_t calc_base_topology_hash(const Mesh &base_mesh)
 {
   XXH3_state_t *state = XXH3_createState();
   XXH3_64bits_reset(state);
@@ -379,7 +379,6 @@ static void calc_edges(const BaseTopology &base_topo,
   const int subedges_per_face = 2 * faces_per_side * (faces_per_side - 1);
   const int face_edge_base_start = edges_num * faces_per_side;
   const OffsetIndices<int> base_faces = base_topo.faces;
-  const Span<int> corner_verts = base_topo.corner_verts;
   const Span<int> corner_edges = base_topo.corner_edges;
   const BitSpan face_edge_reversed = base_topo.face_edge_reversed;
 
@@ -388,7 +387,6 @@ static void calc_edges(const BaseTopology &base_topo,
   threading::parallel_for(IndexRange(faces_num), face_grain_size, [&](const IndexRange range) {
     for (const int face_idx : range) {
       const IndexRange face_range = base_faces[face_idx];
-      const Span<int> face_verts = corner_verts.slice(face_range);
       const Span<int> face_edges = corner_edges.slice(face_range);
 
       std::array<int, 4> border_offsets = {edge_offsets[face_edges[0]],
@@ -2118,7 +2116,6 @@ void subdivide_grids(const int lvl,
                      const Span<T> in_attr,
                      const MutableSpan<T> out_attr)
 {
-  const Span<int2> edges = base_topo.edges;
   const OffsetIndices<int> faces = base_topo.faces;
   const Span<int> corner_verts = base_topo.corner_verts;
   const Span<int> corner_edges = base_topo.corner_edges;
@@ -2644,7 +2641,6 @@ void subdivide_grids_linear(const int lvl,
                             const Span<T> in_attr,
                             const MutableSpan<T> out_attr)
 {
-  const Span<int2> edges = base_topo.edges;
   const OffsetIndices<int> faces = base_topo.faces;
   const Span<int> corner_verts = base_topo.corner_verts;
   const Span<int> corner_edges = base_topo.corner_edges;

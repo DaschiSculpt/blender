@@ -303,7 +303,6 @@ static void do_relax_face_sets_brush_multires(const Depsgraph &depsgraph,
   const MultiresDeformData deform_data(mesh);
   const int grid_size = multires.grid_size();
 
-  const bke::AttributeAccessor attributes = mesh.attributes();
   const Span<int> face_sets = multires.face_sets();
 
   Array<int> node_offset_data;

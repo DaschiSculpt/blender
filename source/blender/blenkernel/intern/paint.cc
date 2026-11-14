@@ -2672,29 +2672,6 @@ void BKE_sculpt_mask_layers_ensure(Depsgraph *depsgraph,
   }
 }
 
-static bool check_sculpt_object_deformed(Object *object, const bool for_construction)
-{
-  bool deformed = false;
-
-  /* Active modifiers means extra deformation, which can't be handled correct
-   * on birth of pbvh::Tree and sculpt "layer" levels, so use pbvh::Tree only for internal brush
-   * stuff and show final evaluated mesh so user would see actual object shape. */
-  deformed |= object->runtime->sculpt_session->deform_modifiers_active;
-
-  if (for_construction) {
-    deformed |= object->runtime->sculpt_session->shapekey_active != nullptr;
-  }
-  else {
-    /* As in case with modifiers, we can't synchronize deformation made against
-     * pbvh::Tree and non-locked keyblock, so also use pbvh::Tree only for brushes and
-     * final DM to give final result to user. */
-    deformed |= object->runtime->sculpt_session->shapekey_active &&
-                (object->shapeflag & OB_SHAPE_LOCK) == 0;
-  }
-
-  return deformed;
-}
-
 void BKE_sculpt_sync_face_visibility_to_grids(const Mesh &mesh, SubdivCCG &subdiv_ccg)
 {
   using namespace blender::bke;

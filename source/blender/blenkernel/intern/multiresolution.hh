@@ -2,21 +2,11 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
-/** \file
- * \ingroup bke
- *
- * Shared subdivision helpers for multiresolution: the exact 1D sliding-window row
- * stencil used for both positions (multiresolution.cc) and UVs (multiresolution_uvs.cc).
- * Keeping a single copy guarantees the two paths can't drift apart.
- *
- * More shared multires helpers (e.g. tangents) can live here in the future.
- */
-
 #pragma once
 
-#include <algorithm>
-
 #include "BLI_span.hh"
+
+#include <algorithm>
 
 namespace blender::bke::multiresolution {
 

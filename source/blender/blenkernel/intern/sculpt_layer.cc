@@ -6,8 +6,6 @@
  * \ingroup bke
  */
 
-#pragma once
-
 #include "DNA_attribute_types.h"
 #include "DNA_object_types.h"
 
@@ -194,9 +192,9 @@ void calc_eval_positions(const Mesh &mesh, MutableSpan<float3> positions)
   apply_layer_displacements(mesh, positions.index_range(), positions);
 }
 
-void calc_eval_positions_range(const Mesh &mesh,
-                               const Span<int> verts,
-                               const MutableSpan<float3> positions)
+static void calc_eval_positions_range(const Mesh &mesh,
+                                      const Span<int> verts,
+                                      const MutableSpan<float3> positions)
 {
   const Span<float3> orig_pos = mesh.vert_positions();
   for (const int v : verts) {
@@ -263,8 +261,7 @@ Span<float3> active_layer_displacements(const Mesh &mesh)
 
 MutableSpan<float3> active_layer_displacements_for_write(Mesh &mesh)
 {
-  const int index = mesh.active_layer_index;
-  BLI_assert(index >= 0 && index < mesh.sculpt_layers_len);
+  BLI_assert(mesh.active_layer_index >= 0 && mesh.active_layer_index < mesh.sculpt_layers_len);
 
   const std::string attr_name = active_layer_attr_name(mesh);
   if (mesh.multires == nullptr || mesh.multires->curr_level == 0) {

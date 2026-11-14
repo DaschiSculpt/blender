@@ -20,7 +20,7 @@ bool ray_face_intersection_quad(const float3 &ray_start,
                                 const float3 &t1,
                                 const float3 &t2,
                                 const float3 &t3,
-                                float *depth);
+                                float &depth);
 bool ray_face_intersection_tri(const float3 &ray_start,
                                const IsectRayPrecalc *isect_precalc,
                                const float3 &t0,

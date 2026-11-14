@@ -672,7 +672,6 @@ static wmOperatorStatus create_op_exec(bContext *C, wmOperator *op)
       }
       else if (pbvh.type() == bke::pbvh::Type::Multires) {
         const Multiresolution &multires = *mesh.multires;
-        const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
         const Span<int> corner_verts = multires.corner_verts();
         const Span<bool> hidden_faces = multires.hidden_faces();
         const Span<float> masks = multires.masks();
