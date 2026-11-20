@@ -237,6 +237,8 @@ static void blo_update_defaults_screen(bScreen *screen,
       v3d->overlay.normals_constant_screen_size = 7.0f;
       /* Always enable Grease Pencil vertex color overlay by default. */
       v3d->overlay.gpencil_vertex_paint_opacity = 1.0f;
+      copy_v4_fl4(v3d->overlay.silhouette_color, 0.0f, 0.0f, 0.0f, 1.0f);
+      copy_v4_fl4(v3d->overlay.silhouette_background_color, 1.0f, 1.0f, 1.0f, 0.0f);
       /* Always use theme color for wireframe by default. */
       v3d->shading.wire_color_type = V3D_SHADING_SINGLE_COLOR;
 
@@ -357,6 +359,7 @@ void BLO_update_defaults_workspace(WorkSpace *workspace, const char *app_templat
               v3d->shading.flag &= ~V3D_SHADING_CAVITY;
               copy_v3_fl(v3d->shading.single_color, 1.0f);
               STRNCPY(v3d->shading.matcap, "basic_1");
+              v3d->overlay.flag |= V3D_OVERLAY_SILHOUETTE;
             }
           }
         }

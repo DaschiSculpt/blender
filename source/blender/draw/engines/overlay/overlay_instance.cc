@@ -43,6 +43,7 @@ void Instance::init()
   state.object_mode = ctx->object_mode;
   state.cfra = DEG_get_ctime(state.depsgraph);
   state.is_viewport_image_render = ctx->is_viewport_image_render();
+  state.is_viewport_xr = ctx->is_viewport_xr();
   state.is_image_render = ctx->is_image_render();
   state.is_depth_only_drawing = ctx->is_depth();
   state.skip_particles = ctx->mode == DRWContext::DEPTH_ACTIVE_OBJECT;
@@ -514,6 +515,7 @@ void Instance::begin_sync()
 
   grid.begin_sync(resources, state);
   anti_aliasing.begin_sync(resources, state);
+  silhouette.begin_sync(resources, state);
   xray_fade.begin_sync(resources, state);
 }
 
@@ -940,10 +942,6 @@ void Instance::draw_v3d(Manager &manager, View &view)
 
     regular.prepass.draw_line(resources.overlay_line_fb, manager, view);
 
-    /* TODO(fclem): Split overlay and rename draw functions. */
-    /* TODO(fclem): Draw on line framebuffer. */
-    regular.empties.draw_images(resources.overlay_fb, manager, view);
-
     if (state.xray_enabled || (state.v3d && state.v3d->shading.type > OB_SOLID)) {
       /* If workbench is not enabled, the infront buffer might contain garbage. */
       GPU_framebuffer_bind(resources.overlay_line_in_front_fb);
@@ -951,6 +949,12 @@ void Instance::draw_v3d(Manager &manager, View &view)
     }
 
     infront.prepass.draw_line(resources.overlay_line_in_front_fb, manager, view);
+
+    silhouette.capture_depth(manager);
+
+    /* TODO(fclem): Split overlay and rename draw functions. */
+    /* TODO(fclem): Draw on line framebuffer. */
+    regular.empties.draw_images(resources.overlay_fb, manager, view);
   }
   {
     /* Copy depth at the end of the prepass to avoid splitting the main render pass. */
@@ -1018,6 +1022,7 @@ void Instance::draw_v3d(Manager &manager, View &view)
 
     background.draw_output(resources.overlay_output_color_only_fb, manager, view);
     anti_aliasing.draw_output(resources.overlay_output_color_only_fb, manager, view);
+    silhouette.draw_output(resources.overlay_output_color_only_fb, manager, view);
     cursor.draw_output(resources.overlay_output_color_only_fb, manager, view);
 
     draw_text(resources.overlay_output_color_only_fb);

@@ -11,8 +11,12 @@
 #include "DNA_ID.h"
 #include "DNA_brush_types.h"
 #include "DNA_mesh_types.h"
+#include "DNA_screen_types.h"
+#include "DNA_space_types.h"
+#include "DNA_view3d_types.h"
 
 #include "BLI_listbase.hh"
+#include "BLI_math_vector_c.hh"
 #include "BLI_sys_types.hh"
 
 #include "BKE_main.hh"
@@ -39,7 +43,7 @@ void do_versions_after_linking_504(FileData * /*fd*/, Main * /*bmain*/)
    */
 }
 
-void blo_do_versions_504(FileData * /*fd*/, Library * /*lib*/, Main *bmain)
+void blo_do_versions_504(FileData *fd, Library * /*lib*/, Main *bmain)
 {
   /* Disable "Set Background Value" input to keep old behavior of Deactivate Voxels node. */
   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 504, 1)) {
@@ -103,6 +107,22 @@ void blo_do_versions_504(FileData * /*fd*/, Library * /*lib*/, Main *bmain)
   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 504, 4)) {
     for (Scene &scene : bmain->scenes) {
       scene.r.compositor_proxy_preview_scale = 50;
+    }
+  }
+
+  for (bScreen &screen : bmain->screens) {
+    for (ScrArea &area : screen.areabase) {
+      for (SpaceLink &sl : area.spacedata) {
+        if (sl.spacetype == SPACE_VIEW3D) {
+          View3D *v3d = reinterpret_cast<View3D *>(&sl);
+          if (is_zero_v4(v3d->overlay.silhouette_color) &&
+              is_zero_v4(v3d->overlay.silhouette_background_color))
+          {
+            copy_v4_fl4(v3d->overlay.silhouette_color, 0.0f, 0.0f, 0.0f, 1.0f);
+            copy_v4_fl4(v3d->overlay.silhouette_background_color, 1.0f, 1.0f, 1.0f, 0.0f);
+          }
+        }
+      }
     }
   }
 

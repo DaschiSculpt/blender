@@ -7383,6 +7383,33 @@ class VIEW3D_PT_overlay_viewer_node(Panel):
         row.prop(overlay, "show_viewer_text", text="Attribute Text")
 
 
+class VIEW3D_PT_overlay_silhouette(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+    bl_parent_id = "VIEW3D_PT_overlay"
+    bl_label = "Silhouette"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        layout = self.layout
+        view = context.space_data
+        overlay = view.overlay
+        layout.active = overlay.show_overlays
+        layout.prop(overlay, "show_silhouette", text=self.bl_label)
+
+    def draw(self, context):
+        layout = self.layout
+        view = context.space_data
+        overlay = view.overlay
+        layout.active = overlay.show_overlays and overlay.show_silhouette
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column()
+        col.prop(overlay, "silhouette_color", text="Color")
+        col.prop(overlay, "silhouette_background_color", text="Background")
+
+
 class VIEW3D_PT_overlay_motion_tracking(Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'HEADER'
@@ -9606,6 +9633,7 @@ classes = (
     VIEW3D_PT_overlay_object,
     VIEW3D_PT_overlay_geometry,
     VIEW3D_PT_overlay_viewer_node,
+    VIEW3D_PT_overlay_silhouette,
     VIEW3D_PT_overlay_motion_tracking,
     VIEW3D_PT_overlay_edit_mesh,
     VIEW3D_PT_overlay_edit_mesh_shading,

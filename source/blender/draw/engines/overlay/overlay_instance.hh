@@ -44,6 +44,7 @@
 #include "overlay_prepass.hh"
 #include "overlay_relation.hh"
 #include "overlay_sculpt.hh"
+#include "overlay_silhouette.hh"
 #include "overlay_speaker.hh"
 #include "overlay_text.hh"
 #include "overlay_wireframe.hh"
@@ -111,6 +112,7 @@ class Instance : public DrawEngine {
 
   Grid grid;
   AntiAliasing anti_aliasing;
+  Silhouette silhouette;
   XrayFade xray_fade;
 
   Instance() : selection_type_(select::SelectionType::DISABLED) {};

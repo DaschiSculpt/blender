@@ -305,6 +305,7 @@ enum eView3DOverlay_Flag : int {
   V3D_OVERLAY_SHOW_LIGHT_COLORS = (1 << 17),
   V3D_OVERLAY_VIEWER_ATTRIBUTE_TEXT = (1 << 18),
   V3D_OVERLAY_PERFORMANCE = (1 << 19),
+  V3D_OVERLAY_SILHOUETTE = (1 << 20),
 };
 ENUM_OPERATORS(eView3DOverlay_Flag)
 
@@ -673,6 +674,9 @@ struct View3DOverlay {
 
   /** Curves sculpt mode settings. */
   float sculpt_curves_cage_opacity = 0;
+
+  float silhouette_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  float silhouette_background_color[4] = {1.0f, 1.0f, 1.0f, 0.0f};
 };
 
 struct View3D_Runtime {

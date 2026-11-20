@@ -146,6 +146,8 @@ struct State {
   bool is_wireframe_mode = false;
   /** Whether we are rendering for an image (viewport render). */
   bool is_viewport_image_render = false;
+  /** Whether we are rendering for an XR viewport. */
+  bool is_viewport_xr = false;
   /** Whether we are rendering for an image. */
   bool is_image_render = false;
   /** True if rendering only to query the depth. Can be for auto-depth rotation. */
@@ -284,6 +286,10 @@ struct State {
   bool show_light_colors() const
   {
     return (this->overlay.flag & V3D_OVERLAY_SHOW_LIGHT_COLORS);
+  }
+  bool show_silhouette() const
+  {
+    return (this->overlay.flag & V3D_OVERLAY_SILHOUETTE);
   }
 };
 
@@ -503,6 +509,8 @@ class ShaderModule {
   StaticShader sculpt_curves = shader_clippable("overlay_sculpt_curves_selection");
   StaticShader sculpt_curves_cage = shader_clippable("overlay_sculpt_curves_cage");
   StaticShader sculpt_mesh = shader_clippable("overlay_sculpt_mask");
+  StaticShader silhouette_composite = {"overlay_silhouette_composite"};
+  StaticShader silhouette_downsample = {"overlay_silhouette_downsample"};
   StaticShader uniform_color = shader_clippable("overlay_uniform_color");
   StaticShader uv_analysis_stretch_angle = {"overlay_edit_uv_stretching_angle"};
   StaticShader uv_analysis_stretch_area = {"overlay_edit_uv_stretching_area"};
@@ -753,6 +761,8 @@ struct Resources : public select::SelectMap {
     shaders->particle_hair.ensure_compile_async();
     shaders->particle_shape.ensure_compile_async();
     shaders->pointcloud_points.ensure_compile_async();
+    shaders->silhouette_composite.ensure_compile_async();
+    shaders->silhouette_downsample.ensure_compile_async();
     shaders->uniform_color.ensure_compile_async();
     shaders->wireframe_curve.ensure_compile_async();
     shaders->wireframe_mesh.ensure_compile_async();
