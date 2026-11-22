@@ -4,11 +4,47 @@
 
 #pragma once
 
+#include "BKE_multiresolution.hh"
+
+#include "BLI_compiler_compat.hh"
+#include "BLI_math_vector_types.hh"
+#include "BLI_offset_indices.hh"
 #include "BLI_span.hh"
 
 #include <algorithm>
 
 namespace blender::bke::multiresolution {
+
+struct LinearOffset {
+  int start;
+  int stride;
+
+  BLI_INLINE_METHOD int operator[](const int index) const
+  {
+    return start + index * stride;
+  }
+};
+
+struct TableOffset {
+  Span<int> offsets;
+
+  BLI_INLINE_METHOD int operator[](const int index) const
+  {
+    return offsets[index];
+  }
+};
+
+inline void make_linear_policies(const int lvl,
+                                 const BaseTopology &base_topo,
+                                 LinearOffset &vert_policy,
+                                 LinearOffset &edge_policy,
+                                 LinearOffset &face_policy)
+{
+  const int grid_size = Multiresolution::grid_size(lvl);
+  vert_policy = {0, 1};
+  edge_policy = {base_topo.verts_num, grid_size};
+  face_policy = {base_topo.verts_num + base_topo.edges_num * grid_size, grid_size * grid_size};
+}
 
 template<typename T>
 void subdivision_kernel(const int out_col,
@@ -142,5 +178,49 @@ void extract_grid_inner_border(const int size,
     std::reverse(r_inner_border.begin(), r_inner_border.end());
   }
 }
+
+template<typename T, typename InPolicy>
+void fill_border_side(const int size,
+                      const Span<int> corner_edges,
+                      const Span<int> corner_verts,
+                      const Span<int2> edges,
+                      const int corner_start,
+                      const int local_edge,
+                      const bool reverse,
+                      const int face_offset,
+                      const InPolicy in_edge_offsets,
+                      const Span<T> in_attr,
+                      const MutableSpan<T> side)
+{
+  extract_grid_inner_border(size, face_offset, local_edge, reverse, in_attr, side.slice(1, size));
+
+  const int prev_edge_local = (local_edge + 3) & 3;
+  const int prev_edge_idx = corner_edges[corner_start + prev_edge_local];
+  const int vert_start = corner_verts[corner_start + local_edge];
+  const int2 prev_edge = edges[prev_edge_idx];
+  const int prev_pt_idx = (prev_edge[0] == vert_start) ? 0 : size - 1;
+
+  const int next_edge_local = (local_edge + 1) & 3;
+  const int next_edge_idx = corner_edges[corner_start + next_edge_local];
+  const int vert_end = corner_verts[corner_start + next_edge_local];
+  const int2 next_edge = edges[next_edge_idx];
+  const int next_pt_idx = (next_edge[0] == vert_end) ? 0 : size - 1;
+
+  const int start_slot = reverse ? (size + 1) : 0;
+  const int end_slot = reverse ? 0 : (size + 1);
+  side[start_slot] = in_attr[in_edge_offsets[prev_edge_idx] + prev_pt_idx];
+  side[end_slot] = in_attr[in_edge_offsets[next_edge_idx] + next_pt_idx];
+}
+
+void propagate_tangent_space_linear(const BaseTopology &base_topo,
+                                    int delta_lvl,
+                                    LinearOffset vert_offsets,
+                                    LinearOffset edge_offsets,
+                                    LinearOffset face_offsets,
+                                    GroupedSpan<int> cyclic_vert_to_corners,
+                                    Span<float3> old_smooth_positions,
+                                    Span<float3> new_smooth_positions,
+                                    Span<float3> old_positions,
+                                    MutableSpan<float3> r_new_positions);
 
 }  // namespace blender::bke::multiresolution

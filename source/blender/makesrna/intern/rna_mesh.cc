@@ -2125,6 +2125,18 @@ static void rna_Mesh_multires_use_linear_set(PointerRNA *ptr, bool value)
   mesh->multires_use_linear = value ? 1 : 0;
 }
 
+static bool rna_Mesh_multires_use_tangent_space_get(PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  return mesh->multires_use_tangent_space != 0;
+}
+
+static void rna_Mesh_multires_use_tangent_space_set(PointerRNA *ptr, bool value)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  mesh->multires_use_tangent_space = value ? 1 : 0;
+}
+
 static int rna_Mesh_multires_curr_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
@@ -3687,6 +3699,14 @@ static void rna_def_mesh(BlenderRNA *brna)
   RNA_def_property_boolean_funcs(
       prop, "rna_Mesh_multires_use_linear_get", "rna_Mesh_multires_use_linear_set");
   RNA_def_property_ui_text(prop, "Linear", "True if subdivision is linear");
+
+  prop = RNA_def_property(srna, "multires_use_tangent_space", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(
+      prop, "rna_Mesh_multires_use_tangent_space_get", "rna_Mesh_multires_use_tangent_space_set");
+  RNA_def_property_update(prop, 0, "rna_Mesh_update_geom_and_params");
+  RNA_def_property_ui_text(prop,
+                           "Tangent-Space Propagation",
+                           "Propagate multiresolution position details in tangent space");
 
   prop = RNA_def_property(srna, "multires_curr_level", PROP_INT, PROP_UNSIGNED);
   RNA_def_property_int_funcs(prop, "rna_Mesh_multires_curr_level_get", nullptr, nullptr);

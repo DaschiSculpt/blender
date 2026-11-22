@@ -156,6 +156,7 @@ struct Multiresolution {
 
   bke::multiresolution::MultiresCoord coord_from_index(const int idx) const;
 
+  const Mesh &get_base_mesh(const Mesh &base_mesh, const int lvl) const;
   bke::multiresolution::BaseTopology get_base_topology(const Mesh &base_mesh, const int lvl) const;
   bke::multiresolution::BaseTopology get_base_topology(const Mesh &base_mesh) const;
 

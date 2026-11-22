@@ -279,6 +279,7 @@ struct MeshRuntime {
   SharedCache<BitVector<>> face_edge_reversed_cache;
   SharedCache<BitVector<>> boundary_edge_cache;
   SharedCache<BitVector<>> boundary_vert_cache;
+  SharedCache<Array<int>> cyclic_vert_to_corner_map_cache;
 
   /** Cache of non-manifold boundary data for shrinkwrap target Project. */
   SharedCache<ShrinkwrapBoundaryData> shrinkwrap_boundary_cache;

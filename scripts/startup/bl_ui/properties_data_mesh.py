@@ -251,9 +251,12 @@ class DATA_PT_sculpt_layers(MeshButtonsPanel, Panel):
 
 def draw_multires(layout, mesh, ob=None):
     is_dyntopo = (ob and ob.use_dynamic_topology_sculpting) or getattr(mesh, "use_dynamic_topology_sculpting", False)
+    in_sculpt = ob is not None and ob.mode == 'SCULPT'
+    curr_level = mesh.multires_curr_level
     sculpt_level = mesh.multires_sculpt_level
     top_level = mesh.multires_top_level
     topology_ok = (not mesh.has_multires or mesh.multires_topology_matches) and not is_dyntopo
+    can_subdivide = not (in_sculpt and mesh.has_multires and curr_level != top_level)
 
     if mesh.has_multires and not topology_ok:
         box = layout.box()
@@ -270,13 +273,17 @@ def draw_multires(layout, mesh, ob=None):
     col.prop(mesh, "multires_view_level", text="View Level")
     col.prop(mesh, "multires_render_level", text="Render Level")
 
-    layout.separator()
-
     col = layout.column()
     col.enabled = topology_ok
-    col.prop(mesh, "multires_use_linear", text="Use linear subdivision")
-    row = col.row()
-    row.operator("sculpt.multires_subdiv", text="Subdivide")
+    col.prop(mesh, "multires_use_tangent_space", text="Use Tangent Space")
+
+    layout.separator()
+
+    col = layout.column(align=True)
+    col.enabled = topology_ok and can_subdivide
+    col.prop(mesh, "multires_use_linear", text="Linear Subdivision")
+    col.separator(factor=0.5)
+    col.operator("sculpt.multires_subdiv", text="Subdivide")
 
     layout.separator()
 

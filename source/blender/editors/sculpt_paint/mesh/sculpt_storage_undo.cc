@@ -593,13 +593,15 @@ bool push_attribute_modified(const StorageTarget target,
                              const StringRef attr_name,
                              const bke::AttrType type,
                              const Span<T> old_attr,
-                             const Span<T> new_attr)
+                             const Span<T> new_attr,
+                             const bool store_new)
 {
   BLI_assert(old_attr.size() == new_attr.size());
   StorageUndoStep *us = get_init_step();
   Vector<AttributeDiff> *target_diffs = us ? &get_target_diffs(*us, target) : nullptr;
+  const Span<T> stored_attr = store_new ? new_attr : old_attr;
   return push_modified_common(
-      target_diffs, attr_name, type, old_attr, [&](const int start, const int end) {
+      target_diffs, attr_name, type, stored_attr, [&](const int start, const int end) {
         for (int i = start; i < end; i++) {
           if (is_nonzero_diff(new_attr[i] - old_attr[i])) {
             return true;
@@ -634,17 +636,20 @@ template bool push_attribute_modified<float>(const StorageTarget target,
                                              const StringRef attr_name,
                                              const bke::AttrType type,
                                              const Span<float> old_attr,
-                                             const Span<float> new_attr);
+                                             const Span<float> new_attr,
+                                             const bool store_new);
 template bool push_attribute_modified<float3>(const StorageTarget target,
                                               const StringRef attr_name,
                                               const bke::AttrType type,
                                               const Span<float3> old_attr,
-                                              const Span<float3> new_attr);
+                                              const Span<float3> new_attr,
+                                              const bool store_new);
 template bool push_attribute_modified<float4>(const StorageTarget target,
                                               const StringRef attr_name,
                                               const bke::AttrType type,
                                               const Span<float4> old_attr,
-                                              const Span<float4> new_attr);
+                                              const Span<float4> new_attr,
+                                              const bool store_new);
 
 template bool push_attribute_modified_delta<float>(const StorageTarget target,
                                                    const StringRef attr_name,

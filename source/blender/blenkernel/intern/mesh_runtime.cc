@@ -271,6 +271,137 @@ BitSpan Mesh::boundary_verts() const
   return this->runtime->boundary_vert_cache.data();
 }
 
+static void walk_vertex_corners_ccw(const int vert,
+                                    const OffsetIndices<int> faces,
+                                    const Span<int> corner_verts,
+                                    const Span<int> corner_edges,
+                                    const GroupedSpan<int> vert_to_corner_map,
+                                    const GroupedSpan<int> edge_to_face_map,
+                                    const Span<int> corner_to_face_map,
+                                    const BitSpan boundary_edges,
+                                    const BitSpan boundary_verts,
+                                    const MutableSpan<int> r_dst)
+{
+  const Span<int> vert_corners = vert_to_corner_map[vert];
+  const int corners_num = int(vert_corners.size());
+  if (corners_num == 0) {
+    return;
+  }
+
+  const bool is_boundary = boundary_verts[vert];
+  int start_corner = -1;
+  if (is_boundary) {
+    for (const int corner : vert_corners) {
+      if (boundary_edges[corner_edges[corner]]) {
+        start_corner = corner;
+        break;
+      }
+    }
+    if (start_corner == -1) [[unlikely]] {
+      r_dst.fill(-1);
+      return;
+    }
+  }
+  else {
+    start_corner = vert_corners[0];
+  }
+
+  auto step_ccw = [&](const int corner, const int face, int &r_next_face) -> int {
+    const IndexRange face_range = faces[face];
+    const int prev_corner = (corner == face_range.start()) ? int(face_range.last()) : (corner - 1);
+    const int next_edge = corner_edges[prev_corner];
+    const Span<int> adj_faces = edge_to_face_map[next_edge];
+    if (adj_faces.size() != 2) [[unlikely]] {
+      return -1;
+    }
+
+    const int other_face = (adj_faces[0] == face) ? adj_faces[1] : adj_faces[0];
+    for (const int other_corner : faces[other_face]) {
+      if (corner_edges[other_corner] == next_edge) {
+        if (corner_verts[other_corner] != vert) [[unlikely]] {
+          return -1;
+        }
+        r_next_face = other_face;
+        return other_corner;
+      }
+    }
+    return -1;
+  };
+
+  r_dst[0] = start_corner;
+  int curr_corner = start_corner;
+  int curr_face = corner_to_face_map[curr_corner];
+
+  for (int i = 1; i < corners_num; i++) {
+    int next_face = -1;
+    const int next_corner = step_ccw(curr_corner, curr_face, next_face);
+    if (next_corner == -1 || next_corner == start_corner) [[unlikely]] {
+      r_dst.fill(-1);
+      return;
+    }
+
+    r_dst[i] = next_corner;
+    curr_corner = next_corner;
+    curr_face = next_face;
+  }
+
+  if (is_boundary) {
+    const IndexRange last_face_range = faces[curr_face];
+    const int prev_corner = (curr_corner == last_face_range.start()) ?
+                                int(last_face_range.last()) :
+                                (curr_corner - 1);
+    if (!boundary_edges[corner_edges[prev_corner]]) [[unlikely]] {
+      r_dst.fill(-1);
+    }
+  }
+  else {
+    int dummy_face = -1;
+    if (step_ccw(curr_corner, curr_face, dummy_face) != start_corner) [[unlikely]] {
+      r_dst.fill(-1);
+    }
+  }
+}
+
+GroupedSpan<int> Mesh::cyclic_vert_to_corner_map() const
+{
+  const OffsetIndices offsets = this->vert_to_face_map_offsets();
+  this->runtime->cyclic_vert_to_corner_map_cache.ensure([&](Array<int> &r_data) {
+    if (this->verts_num == 0 || this->corners_num == 0) {
+      r_data.reinitialize(0);
+      return;
+    }
+
+    const OffsetIndices<int> faces = this->faces();
+    const Span<int> corner_verts = this->corner_verts();
+    const Span<int> corner_edges = this->corner_edges();
+    const GroupedSpan<int> vert_to_corner_map = this->vert_to_corner_map();
+    const GroupedSpan<int> edge_to_face_map = this->edge_to_face_map();
+    const Span<int> corner_to_face_map = this->corner_to_face_map();
+    const BitSpan boundary_edges = this->boundary_edges();
+    const BitSpan boundary_verts = this->boundary_verts();
+
+    r_data.reinitialize(this->corners_num);
+    threading::parallel_for(IndexRange(this->verts_num), 1024, [&](const IndexRange range) {
+      for (const int vert : range) {
+        const IndexRange v_range = offsets[vert];
+        if (!v_range.is_empty()) {
+          walk_vertex_corners_ccw(vert,
+                                  faces,
+                                  corner_verts,
+                                  corner_edges,
+                                  vert_to_corner_map,
+                                  edge_to_face_map,
+                                  corner_to_face_map,
+                                  boundary_edges,
+                                  boundary_verts,
+                                  r_data.as_mutable_span().slice(v_range));
+        }
+      }
+    });
+  });
+  return {offsets, this->runtime->cyclic_vert_to_corner_map_cache.data()};
+}
+
 bool Mesh::no_overlapping_topology() const
 {
   return this->flag & ME_NO_OVERLAPPING_TOPOLOGY;
@@ -418,6 +549,7 @@ void BKE_mesh_runtime_clear_geometry(Mesh *mesh)
   mesh->runtime->face_edge_reversed_cache.tag_dirty();
   mesh->runtime->boundary_edge_cache.tag_dirty();
   mesh->runtime->boundary_vert_cache.tag_dirty();
+  mesh->runtime->cyclic_vert_to_corner_map_cache.tag_dirty();
   mesh->runtime->vert_normals_cache.tag_dirty();
   mesh->runtime->vert_normals_true_cache.tag_dirty();
   mesh->runtime->face_normals_cache.tag_dirty();
@@ -466,6 +598,7 @@ void Mesh::tag_edges_split()
   this->runtime->face_edge_reversed_cache.tag_dirty();
   this->runtime->boundary_edge_cache.tag_dirty();
   this->runtime->boundary_vert_cache.tag_dirty();
+  this->runtime->cyclic_vert_to_corner_map_cache.tag_dirty();
 
   if (this->runtime->verts_no_face_cache.is_cached() &&
       !this->runtime->verts_no_face_cache.data().mask.is_empty())
@@ -499,9 +632,11 @@ void Mesh::tag_face_winding_changed()
   this->runtime->face_normals_true_cache.tag_dirty();
   this->runtime->corner_normals_cache.tag_dirty();
   this->runtime->vert_to_corner_map_cache.tag_dirty();
+  this->runtime->cyclic_vert_to_corner_map_cache.tag_dirty();
   /* Reversing faces swaps edges stored for each of its corners, but the number of corners using
    * each edge doesn't change, so only the indices are recalculated, not the offsets. */
   this->runtime->edge_to_corner_map_cache.tag_dirty();
+  this->runtime->face_edge_reversed_cache.tag_dirty();
   this->runtime->shrinkwrap_boundary_cache.tag_dirty();
 }
 

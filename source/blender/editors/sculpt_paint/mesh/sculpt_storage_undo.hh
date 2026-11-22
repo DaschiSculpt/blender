@@ -44,7 +44,8 @@ bool push_attribute_modified(const StorageTarget target,
                              const StringRef attr_name,
                              const bke::AttrType type,
                              const Span<T> old_attr,
-                             const Span<T> new_attr);
+                             const Span<T> new_attr,
+                             const bool store_new = false);
 
 template<typename T>
 bool push_attribute_modified_delta(const StorageTarget target,

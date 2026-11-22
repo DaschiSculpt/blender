@@ -227,6 +227,7 @@ set(SRC
   intern/multires_versioning.cc
   intern/multiresolution.cc
   intern/multiresolution_coarse.cc
+  intern/multiresolution_tangents.cc
   intern/multiresolution_uvs.cc
   intern/nla.cc
   intern/node.cc

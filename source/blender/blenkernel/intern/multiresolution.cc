@@ -36,26 +36,11 @@ using BaseTopology = bke::multiresolution::BaseTopology;
 
 using bke::multiresolution::extract_grid_inner_border;
 using bke::multiresolution::fill_border;
+using bke::multiresolution::fill_border_side;
+using bke::multiresolution::LinearOffset;
+using bke::multiresolution::make_linear_policies;
 using bke::multiresolution::run_row;
-
-struct LinearOffset {
-  int start;
-  int stride;
-
-  BLI_INLINE_METHOD int operator[](const int index) const
-  {
-    return start + index * stride;
-  }
-};
-
-struct TableOffset {
-  Span<int> offsets;
-
-  BLI_INLINE_METHOD int operator[](const int index) const
-  {
-    return offsets[index];
-  }
-};
+using bke::multiresolution::TableOffset;
 
 static bool all_faces_quads(const Mesh &base_mesh)
 {
@@ -135,18 +120,6 @@ Multiresolution *BKE_multiresolution_create(const Mesh &base_mesh)
 namespace bke {
 
 namespace multiresolution {
-
-static void make_linear_policies(const int lvl,
-                                 const bke::multiresolution::BaseTopology &base_topo,
-                                 LinearOffset &vert_policy,
-                                 LinearOffset &edge_policy,
-                                 LinearOffset &face_policy)
-{
-  const int grid_size = Multiresolution::grid_size(lvl);
-  vert_policy = {0, 1};
-  edge_policy = {base_topo.verts_num, grid_size};
-  face_policy = {base_topo.verts_num + base_topo.edges_num * grid_size, grid_size * grid_size};
-};
 
 int MultiresCoord::to_index(const OffsetsSpan &offsets) const
 {
@@ -1107,6 +1080,7 @@ void MultiresolutionRuntime::clear_sculpt_data()
   corner_verts_.clear_and_shrink();
   normals_.clear_and_shrink();
   coord_from_index_map.clear_and_shrink();
+  coarse_view.reset();
 }
 
 }  // namespace multiresolution
@@ -1237,8 +1211,7 @@ bke::multiresolution::MultiresCoord Multiresolution::coord_from_index(const int 
   return this->runtime->coord_from_index_map[idx];
 }
 
-bke::multiresolution::BaseTopology Multiresolution::get_base_topology(const Mesh &base_mesh,
-                                                                      const int lvl) const
+const Mesh &Multiresolution::get_base_mesh(const Mesh &base_mesh, const int lvl) const
 {
   const int base_lvl = base_level(lvl);
 
@@ -1247,6 +1220,12 @@ bke::multiresolution::BaseTopology Multiresolution::get_base_topology(const Mesh
   }
 
   return this->runtime->ensure_base_mesh(base_mesh, base_lvl, this->base_all_quads);
+}
+
+bke::multiresolution::BaseTopology Multiresolution::get_base_topology(const Mesh &base_mesh,
+                                                                      const int lvl) const
+{
+  return this->get_base_mesh(base_mesh, lvl);
 }
 
 bke::multiresolution::BaseTopology Multiresolution::get_base_topology(const Mesh &base_mesh) const
@@ -2277,40 +2256,6 @@ void subdivide_grids(const int lvl,
           }
         }
       });
-}
-
-template<typename T, typename InPolicy>
-void fill_border_side(const int size,
-                      const Span<int> corner_edges,
-                      const Span<int> corner_verts,
-                      const Span<int2> edges,
-                      const int corner_start,
-                      const int local_edge,
-                      const bool reverse,
-                      const int face_offset,
-                      const InPolicy in_edge_offsets,
-                      const Span<T> in_attr,
-                      const MutableSpan<T> side)
-{
-  extract_grid_inner_border(size, face_offset, local_edge, false, in_attr, side.slice(1, size));
-
-  const int prev_edge_local = (local_edge + 3) & 3;
-  const int prev_edge_idx = corner_edges[corner_start + prev_edge_local];
-  const int vert_start = corner_verts[corner_start + local_edge];
-  const int2 prev_edge = edges[prev_edge_idx];
-  const int prev_pt_idx = (prev_edge[0] == vert_start) ? 0 : size - 1;
-  side[0] = in_attr[in_edge_offsets[prev_edge_idx] + prev_pt_idx];
-
-  const int next_edge_local = (local_edge + 1) & 3;
-  const int next_edge_idx = corner_edges[corner_start + next_edge_local];
-  const int vert_end = corner_verts[corner_start + next_edge_local];
-  const int2 next_edge = edges[next_edge_idx];
-  const int next_pt_idx = (next_edge[0] == vert_end) ? 0 : size - 1;
-  side[size + 1] = in_attr[in_edge_offsets[next_edge_idx] + next_pt_idx];
-
-  if (reverse) {
-    std::reverse(side.begin(), side.end());
-  }
 }
 
 template<typename T, typename InPolicy, typename OutPolicy>
@@ -4408,6 +4353,7 @@ static void copy_sculpt_layers_meta(const Mesh &mesh, Mesh &eval_mesh)
 
 struct EvalMeshContext {
   Mesh *eval_mesh = nullptr;
+  const Mesh *eff_mesh = nullptr;
   BaseTopology eff_base;
   int eff_lvl = 0;
   bool use_base1 = false;
@@ -4425,6 +4371,7 @@ static EvalMeshContext create_eval_mesh(const Multiresolution &multires,
   const Mesh &eff_mesh = ctx.use_base1 ?
                              multires.runtime->ensure_base_mesh(mesh, 1, multires.base_all_quads) :
                              mesh;
+  ctx.eff_mesh = &eff_mesh;
   ctx.eff_base = BaseTopology(eff_mesh);
   ctx.eff_lvl = ctx.use_base1 ? target_lvl - 1 : target_lvl;
   bke::multiresolution::make_linear_policies(
@@ -4475,6 +4422,32 @@ static void table_to_direct_order(const BaseTopology &eff_base,
   }
 }
 
+template<typename T>
+static bool base_attr_dirty(const Span<T> base_attr,
+                            const Span<T> top_attr,
+                            const Span<int> top_vert_offsets)
+{
+  for (const int i : base_attr.index_range()) {
+    if (base_attr[i] != top_attr[top_vert_offsets[i]]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static Array<float3> gather_old_base_positions(const Span<float3> top_positions,
+                                               const Span<int> top_vert_offsets,
+                                               const int verts_num)
+{
+  Array<float3> old_base(verts_num);
+  threading::parallel_for(IndexRange(verts_num), 8192, [&](const IndexRange range) {
+    for (const int i : range) {
+      old_base[i] = top_positions[top_vert_offsets[i]];
+    }
+  });
+  return old_base;
+}
+
 Mesh *Multiresolution::eval_to_mesh(const Mesh &mesh, const int target_lvl)
 {
   const Multiresolution &multires = *mesh.multires;
@@ -4483,8 +4456,8 @@ Mesh *Multiresolution::eval_to_mesh(const Mesh &mesh, const int target_lvl)
   const EvalMeshContext ctx = create_eval_mesh(multires, mesh, target_lvl);
   Mesh &eval_mesh = *ctx.eval_mesh;
 
-  const bke::multiresolution::BaseTopology top_base = multires.get_base_topology(
-      mesh, multires.top_level);
+  const Mesh &top_base_mesh = multires.get_base_mesh(mesh, multires.top_level);
+  const bke::multiresolution::BaseTopology top_base(top_base_mesh);
   const int top_base_lvl = multires.base_level(multires.top_level);
   const Offsets top_offsets = build_table_offsets(multires, top_base, multires.top_level);
 
@@ -4557,14 +4530,7 @@ Mesh *Multiresolution::eval_to_mesh(const Mesh &mesh, const int target_lvl)
     eval_top_to_out(top_attr, out);
 
     const Span<int> top_vert_offsets = top_offsets.verts;
-    bool dirty = false;
-    for (const int i : base_attr.index_range()) {
-      if (base_attr[i] != top_attr[top_vert_offsets[i]]) {
-        dirty = true;
-        break;
-      }
-    }
-    if (!dirty) {
+    if (!base_attr_dirty<T>(base_attr, top_attr, top_vert_offsets)) {
       return;
     }
 
@@ -4613,14 +4579,111 @@ Mesh *Multiresolution::eval_to_mesh(const Mesh &mesh, const int target_lvl)
     });
   };
 
+  auto eval_positions_tangent_space = [&]() {
+    const Span<float3> top_positions = multires.top_base_positions();
+    const Span<float3> base_positions = mesh.vert_positions();
+    if (top_positions.is_empty() || base_positions.is_empty()) {
+      eval_attr(
+          top_positions, [&]() { return eval_mesh.vert_positions_for_write(); }, base_positions);
+      return;
+    }
+
+    MutableSpan<float3> out = eval_mesh.vert_positions_for_write();
+    if (!base_attr_dirty<float3>(base_positions, top_positions, top_offsets.verts)) {
+      eval_top_to_out(top_positions, out);
+      return;
+    }
+
+    Array<float3> old_base = gather_old_base_positions(
+        top_positions, top_offsets.verts, mesh.verts_num);
+
+    if (target_lvl == multires.top_level && ctx.eff_lvl <= 5) {
+      eval_top_to_out(top_positions, out);
+
+      Array<float3> old_smooth(out.size());
+      subdivide_base_to_direct<float3>(mesh,
+                                       ctx.eff_base,
+                                       ctx.eff_lvl,
+                                       ctx.use_base1,
+                                       ctx.dir_vp,
+                                       ctx.dir_ep,
+                                       ctx.dir_fp,
+                                       old_base.as_span(),
+                                       old_smooth.as_mutable_span(),
+                                       false);
+      old_base = {};
+
+      Array<float3> new_smooth(out.size());
+      subdivide_base_to_direct<float3>(mesh,
+                                       ctx.eff_base,
+                                       ctx.eff_lvl,
+                                       ctx.use_base1,
+                                       ctx.dir_vp,
+                                       ctx.dir_ep,
+                                       ctx.dir_fp,
+                                       base_positions,
+                                       new_smooth.as_mutable_span(),
+                                       false);
+
+      bke::multiresolution::propagate_tangent_space_linear(
+          ctx.eff_base,
+          ctx.eff_lvl,
+          ctx.dir_vp,
+          ctx.dir_ep,
+          ctx.dir_fp,
+          ctx.eff_mesh->cyclic_vert_to_corner_map(),
+          old_smooth.as_span(),
+          new_smooth.as_span(),
+          out.as_span(),
+          out);
+      return;
+    }
+
+    Array<float3> old_smooth(top_positions.size());
+    multires.subdivide_base_to<float3>(mesh,
+                                       multires.top_level,
+                                       top_offsets,
+                                       old_base.as_span(),
+                                       old_smooth.as_mutable_span(),
+                                       false);
+    old_base = {};
+
+    Array<float3> new_smooth(top_positions.size());
+    multires.subdivide_base_to<float3>(mesh,
+                                       multires.top_level,
+                                       top_offsets,
+                                       base_positions,
+                                       new_smooth.as_mutable_span(),
+                                       false);
+
+    Array<float3> new_top(top_positions.size());
+    bke::multiresolution::propagate_tangent_space(top_base,
+                                                  multires.top_level - top_base_lvl,
+                                                  top_offsets,
+                                                  top_base_mesh.cyclic_vert_to_corner_map(),
+                                                  old_smooth.as_span(),
+                                                  new_smooth.as_span(),
+                                                  top_positions,
+                                                  new_top.as_mutable_span());
+    old_smooth = {};
+    new_smooth = {};
+
+    eval_top_to_out(new_top.as_span(), out);
+  };
+
   const bke::AttributeAccessor base_attributes = mesh.attributes();
   const VArraySpan<float> base_masks = *base_attributes.lookup<float>(".sculpt_mask",
                                                                       bke::AttrDomain::Point);
 
-  eval_attr(
-      multires.top_base_positions(),
-      [&]() { return eval_mesh.vert_positions_for_write(); },
-      mesh.vert_positions());
+  if (mesh.multires_use_tangent_space != 0) {
+    eval_positions_tangent_space();
+  }
+  else {
+    eval_attr(
+        multires.top_base_positions(),
+        [&]() { return eval_mesh.vert_positions_for_write(); },
+        mesh.vert_positions());
+  }
 
   eval_attr(
       multires.top_masks(),

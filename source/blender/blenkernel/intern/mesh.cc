@@ -172,6 +172,8 @@ static void mesh_copy_data(Main *bmain,
   mesh_dst->runtime->face_edge_reversed_cache = mesh_src->runtime->face_edge_reversed_cache;
   mesh_dst->runtime->boundary_edge_cache = mesh_src->runtime->boundary_edge_cache;
   mesh_dst->runtime->boundary_vert_cache = mesh_src->runtime->boundary_vert_cache;
+  mesh_dst->runtime->cyclic_vert_to_corner_map_cache =
+      mesh_src->runtime->cyclic_vert_to_corner_map_cache;
 
   mesh_dst->runtime->bvh_cache_edges = mesh_src->runtime->bvh_cache_edges;
   mesh_dst->runtime->bvh_cache_faces = mesh_src->runtime->bvh_cache_faces;
@@ -1725,6 +1727,7 @@ void BKE_mesh_copy_parameters(Mesh *me_dst, const Mesh *me_src)
   me_dst->face_sets_color_seed = me_src->face_sets_color_seed;
   me_dst->face_sets_color_default = me_src->face_sets_color_default;
   me_dst->multires_use_linear = me_src->multires_use_linear;
+  me_dst->multires_use_tangent_space = me_src->multires_use_tangent_space;
 
   /* Copy texture space. */
   me_dst->texspace_flag = me_src->texspace_flag;

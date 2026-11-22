@@ -128,7 +128,7 @@ static void apply_delta(const MutableSpan<T> attr, const Span<T> delta, const bo
 
 template<typename T>
 static void propagate_to_top(const Mesh &base_mesh,
-                             const Multiresolution &multires,
+                             Multiresolution &multires,
                              const int curr_lvl,
                              const int top_lvl,
                              const bke::multiresolution::OffsetsSpan &curr_offsets,
@@ -139,48 +139,106 @@ static void propagate_to_top(const Mesh &base_mesh,
                              const MutableSpan<T> top_attr,
                              const bool clamp)
 {
-  Array<T> curr_delta(curr_attr.size());
-  if (curr_lvl == 0) {
-    Multiresolution::downsample_to_base<T>(
-        top_offsets.verts, top_attr, curr_delta.as_mutable_span());
+  const bool use_tangent_space = std::is_same_v<T, float3> && name == "position" &&
+                                 base_mesh.multires_use_tangent_space != 0;
+
+  Array<T> curr_old;
+  Array<T> curr_delta;
+  MutableSpan<T> downsample_dst;
+  if (use_tangent_space) {
+    curr_old.reinitialize(curr_attr.size());
+    downsample_dst = curr_old.as_mutable_span();
   }
   else {
-    multires.downsample_to<T>(base_mesh,
-                              top_lvl,
-                              top_offsets,
-                              top_attr,
-                              curr_lvl,
-                              curr_offsets,
-                              curr_delta.as_mutable_span());
+    curr_delta.reinitialize(curr_attr.size());
+    downsample_dst = curr_delta.as_mutable_span();
   }
 
-  threading::parallel_for(IndexRange(curr_attr.size()), 8192, [&](const IndexRange range) {
-    for (const int i : range) {
-      curr_delta[i] = curr_attr[i] - curr_delta[i];
-    }
-  });
+  if (curr_lvl == 0) {
+    Multiresolution::downsample_to_base<T>(top_offsets.verts, top_attr, downsample_dst);
+  }
+  else {
+    multires.downsample_to<T>(
+        base_mesh, top_lvl, top_offsets, top_attr, curr_lvl, curr_offsets, downsample_dst);
+  }
 
-  const bool curr_dirty = storage_undo::push_attribute_modified_delta(
-      storage_undo::StorageTarget::Curr, name, type, curr_attr, curr_delta.as_span());
+  bool curr_dirty = false;
+  if (use_tangent_space) {
+    curr_dirty = storage_undo::push_attribute_modified(
+        storage_undo::StorageTarget::Curr, name, type, curr_old.as_span(), curr_attr, true);
+  }
+  else {
+    threading::parallel_for(IndexRange(curr_attr.size()), 8192, [&](const IndexRange range) {
+      for (const int i : range) {
+        curr_delta[i] = curr_attr[i] - downsample_dst[i];
+      }
+    });
+
+    curr_dirty = storage_undo::push_attribute_modified_delta(
+        storage_undo::StorageTarget::Curr, name, type, curr_attr, curr_delta.as_span());
+  }
   if (!curr_dirty) {
     return;
   }
 
+  auto subdivide_attr = [&](const Span<T> src, const MutableSpan<T> dst) {
+    if (curr_lvl == 0) {
+      multires.subdivide_base_to<T>(base_mesh, top_lvl, top_offsets, src, dst, false);
+    }
+    else {
+      multires.subdivide_to<T>(
+          base_mesh, curr_lvl, curr_offsets, src, top_lvl, top_offsets, dst, false);
+    }
+  };
+
+  if constexpr (std::is_same_v<T, float3>) {
+    if (use_tangent_space) {
+      Array<float3> old_smooth(top_attr.size());
+      subdivide_attr(curr_old.as_span(), old_smooth.as_mutable_span());
+      curr_old = {};
+
+      Array<float3> new_smooth(top_attr.size());
+      subdivide_attr(curr_attr, new_smooth.as_mutable_span());
+
+      const int top_base_lvl = multires.base_level(top_lvl);
+      const Mesh &top_base_mesh = multires.get_base_mesh(base_mesh, top_lvl);
+      const bke::multiresolution::BaseTopology top_base(top_base_mesh);
+      const GroupedSpan<int> cyclic_vert_to_corners = top_base_mesh.cyclic_vert_to_corner_map();
+
+      const bool undo_active = storage_undo::is_active();
+      std::optional<bke::GList> new_top_data;
+      MutableSpan<float3> dst_top = top_attr;
+      if (undo_active) {
+        const CPPType &float3_type = CPPType::get<float3>();
+        new_top_data.emplace(float3_type,
+                             bke::GList::ArrayData::ForUninitialized(float3_type, top_attr.size()),
+                             top_attr.size());
+        dst_top = std::get<GMutableSpan>(new_top_data->values_for_write()).typed<float3>();
+      }
+
+      bke::multiresolution::propagate_tangent_space(top_base,
+                                                    top_lvl - top_base_lvl,
+                                                    top_offsets,
+                                                    cyclic_vert_to_corners,
+                                                    old_smooth.as_span(),
+                                                    new_smooth.as_span(),
+                                                    top_attr.as_span(),
+                                                    dst_top);
+
+      if (undo_active) {
+        storage_undo::push_attribute_modified(
+            storage_undo::StorageTarget::Top, name, type, top_attr.as_span(), dst_top.as_span());
+
+        bke::Attribute *attr = multires.top_attribute_storage.wrap().lookup(name);
+        BLI_assert(attr != nullptr);
+        attr->assign_data(std::move(*new_top_data));
+      }
+      return;
+    }
+  }
+
   Array<T> top_delta(top_attr.size());
-  if (curr_lvl == 0) {
-    multires.subdivide_base_to(
-        base_mesh, top_lvl, top_offsets, curr_delta.as_span(), top_delta.as_mutable_span(), false);
-  }
-  else {
-    multires.subdivide_to(base_mesh,
-                          curr_lvl,
-                          curr_offsets,
-                          curr_delta.as_span(),
-                          top_lvl,
-                          top_offsets,
-                          top_delta.as_mutable_span(),
-                          false);
-  }
+  subdivide_attr(curr_delta.as_span(), top_delta.as_mutable_span());
 
   storage_undo::push_attribute_modified_delta(
       storage_undo::StorageTarget::Top, name, type, top_attr.as_span(), top_delta.as_span());
@@ -599,12 +657,24 @@ void switch_level(Object &ob, const int target_lvl)
   const bool to_top = (target_lvl == multires.top_level);
   const bool from_base = (src_lvl == 0);
 
+  auto clear_sculpt_caches = [&]() {
+    BKE_sculptsession_free_pbvh(ob);
+    multires.clear_sculpt_data();
+  };
+
   bke::multiresolution::Offsets top_offsets;
 
   if (from_top) {
     top_offsets = steal_or_build_offsets(ss, base_mesh, multires, multires.top_level);
+    clear_sculpt_caches();
   }
   else {
+    const bke::multiresolution::Offsets curr_offsets = from_base ?
+                                                           bke::multiresolution::Offsets{} :
+                                                           steal_or_build_offsets(
+                                                               ss, base_mesh, multires, src_lvl);
+    clear_sculpt_caches();
+
     const bke::multiresolution::BaseTopology top_base = multires.get_base_topology(
         base_mesh, multires.top_level);
     top_offsets = Multiresolution::build_table_offsets(multires, top_base, multires.top_level);
@@ -613,13 +683,9 @@ void switch_level(Object &ob, const int target_lvl)
       propagate_from_base(base_mesh, top_offsets);
     }
     else {
-      const bke::multiresolution::Offsets curr_offsets = steal_or_build_offsets(
-          ss, base_mesh, multires, src_lvl);
       propagate_curr_to_top(base_mesh, multires, src_lvl, curr_offsets, top_offsets);
     }
   }
-
-  BKE_sculptsession_free_pbvh(ob);
 
   if (to_top) {
     multires.curr_level = multires.top_level;
@@ -668,6 +734,8 @@ void flush(Object &object)
     return;
   }
 
+  multires.clear_sculpt_data();
+
   const int src_lvl = multires.curr_level;
 
   const bke::multiresolution::BaseTopology top_base = multires.get_base_topology(
@@ -692,8 +760,6 @@ void flush(Object &object)
   switch_face_attribute<int>(
       base_mesh, multires, src_lvl, 0, ".sculpt_face_set", bke::AttrType::Int32);
   switch_face_attribute<bool>(base_mesh, multires, src_lvl, 0, ".hide_poly", bke::AttrType::Bool);
-
-  multires.clear_sculpt_data();
 }
 
 void ensure_curr_storage(Object &object)
@@ -776,6 +842,8 @@ void subdivide(Object &object)
           Multiresolution::build_table_offsets(multires, target_base, target_lvl);
 
   if (target_lvl == 1) {
+    BKE_sculptsession_free_pbvh(object);
+    multires.clear_sculpt_data();
     multires.top_level = 1;
     multires.subdivide_base_to(base_mesh,
                                target_lvl,
@@ -837,6 +905,8 @@ void subdivide(Object &object)
 
     const bke::multiresolution::Offsets curr_offsets = steal_or_build_offsets(
         in_sculpt ? object.runtime->sculpt_session : nullptr, base_mesh, multires, from_lvl);
+    BKE_sculptsession_free_pbvh(object);
+    multires.clear_sculpt_data();
 
     bke::AttributeStorage &top_storage = multires.top_attribute_storage.wrap();
 
@@ -910,8 +980,6 @@ void subdivide(Object &object)
   if (multires.runtime != nullptr) {
     multires.runtime->clear_curr_dirty();
   }
-
-  BKE_sculptsession_free_pbvh(object);
 }
 
 static void delete_lower(Object &object, const int target_lvl)

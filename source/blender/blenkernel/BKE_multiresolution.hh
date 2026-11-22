@@ -200,6 +200,20 @@ void calc_top_eval_positions(const Mesh &base_mesh,
                              const Span<float3> top_base_positions,
                              const MutableSpan<float3> r_eval_positions);
 
+/**
+ * Propagates `old_positions` using Catmull-Clark limit tangent frames between
+ * `old_smooth_positions` and `new_smooth_positions`. `r_new_positions` may alias `old_positions`
+ * for in-place transformation.
+ */
+void propagate_tangent_space(const BaseTopology &base_topo,
+                             int delta_lvl,
+                             const OffsetsSpan &offsets,
+                             GroupedSpan<int> cyclic_vert_to_corners,
+                             Span<float3> old_smooth_positions,
+                             Span<float3> new_smooth_positions,
+                             Span<float3> old_positions,
+                             MutableSpan<float3> r_new_positions);
+
 }  // namespace multiresolution
 
 namespace multiresolution::uv {

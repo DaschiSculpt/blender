@@ -204,7 +204,8 @@ struct Mesh {
 
   struct Multiresolution *multires = nullptr;
   char multires_use_linear = 0;
-  char _pad[7] = {};
+  char multires_use_tangent_space = 0;
+  char _pad[6] = {};
 
   /**
    * List of vertex group (#bDeformGroup) names and flags only. Actual weights are stored in dvert.
@@ -505,6 +506,7 @@ struct Mesh {
   BitSpan face_edge_reversed() const;
   BitSpan boundary_edges() const;
   BitSpan boundary_verts() const;
+  GroupedSpan<int> cyclic_vert_to_corner_map() const;
   /**
    * True if the mesh has no faces or edges "inside" of other faces. Those edges or faces would
    * reuse a subset of the vertices of a face. Knowing the mesh is "clean" or "good" can mean
