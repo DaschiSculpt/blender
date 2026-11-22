@@ -71,7 +71,7 @@ class Silhouette : Overlay {
       return;
     }
 
-    const float sil_h_f = math::min(200.0f * UI_SCALE_FAC, float(vis_h) * 0.25f);
+    const float sil_h_f = math::min(125.0f * UI_SCALE_FAC, float(vis_h) * 0.25f);
     const int sil_h = int(math::round(sil_h_f));
     const int sil_w = int(math::round(sil_h_f * (float(vis_w) / float(vis_h))));
     if (sil_w < 16 || sil_h < 16) {
