@@ -36,6 +36,9 @@ jobs:
     outputs:
       tag_name: ${{ steps.names.outputs.tag_name }}
       base_name: ${{ steps.names.outputs.base_name }}
+      upstream_sha: ${{ steps.upstream.outputs.upstream_sha }}
+      windows_upstream_url: ${{ steps.upstream.outputs.windows_upstream_url }}
+      linux_upstream_url: ${{ steps.upstream.outputs.linux_upstream_url }}
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v6
@@ -47,17 +50,21 @@ jobs:
       - name: Compute Tag & Archive Base Name
         id: names
         run: |
+          HEADER="source/blender/blenkernel/BKE_blender_version.h"
+          SHORT_VER="5.4"
+          if [ -f "$HEADER" ]; then
+            VER=$(grep -E '^#define[[:space:]]+BLENDER_VERSION[[:space:]]+' "$HEADER" | awk '{print $3}')
+            PATCH=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_PATCH[[:space:]]+' "$HEADER" | awk '{print $3}')
+            CYCLE=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_CYCLE[[:space:]]+' "$HEADER" | awk '{print $3}')
+
+            MAJOR=$(( VER / 100 ))
+            MINOR=$(( VER % 100 ))
+            SHORT_VER="${MAJOR}.${MINOR}"
+          fi
+
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then
-            HEADER="source/blender/blenkernel/BKE_blender_version.h"
             if [ -f "$HEADER" ]; then
-              VER=$(grep -E '^#define[[:space:]]+BLENDER_VERSION[[:space:]]+' "$HEADER" | awk '{print $3}')
-              PATCH=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_PATCH[[:space:]]+' "$HEADER" | awk '{print $3}')
-              CYCLE=$(grep -E '^#define[[:space:]]+BLENDER_VERSION_CYCLE[[:space:]]+' "$HEADER" | awk '{print $3}')
-
-              MAJOR=$(( VER / 100 ))
-              MINOR=$(( VER % 100 ))
-
               if [ -n "$CYCLE" ] && [ "$CYCLE" != "release" ]; then
                 VERSION="${MAJOR}.${MINOR}.${PATCH}-${CYCLE}"
               else
@@ -77,9 +84,73 @@ jobs:
           fi
           BASE_NAME="${TAG_NAME}"
 
-          echo "Using version: $VERSION"
+          echo "Using version: $VERSION (short: $SHORT_VER)"
           echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "base_name=$BASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "short_ver=$SHORT_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Upstream Daily Build
+        id: upstream
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.build_windows }}" != "true" ] && [ "${{ inputs.build_linux }}" != "true" ]; then
+            echo "Neither Windows nor Linux build requested; skipping upstream daily build lookup."
+            exit 0
+          fi
+
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --filter=blob:none --unshallow origin
+          fi
+          git fetch --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main
+
+          MERGE_BASE=$(git merge-base HEAD refs/remotes/origin/main || true)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::error::Could not find a common ancestor between HEAD and origin/main."
+            exit 1
+          fi
+
+          UPSTREAM_SHA="${MERGE_BASE:0:12}"
+          echo "Last merged main commit: $MERGE_BASE (short: $UPSTREAM_SHA)"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          SHORT_VER="${{ steps.names.outputs.short_ver }}"
+          ESCAPED_VER=$(printf '%s' "$SHORT_VER" | sed 's/\./\\./g')
+
+          DAILY_PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/")
+          ARCHIVE_PAGE=""
+          FOUND_URL=""
+
+          resolve_upstream_url() {
+            local suffix="$1"
+            FOUND_URL=$(printf '%s' "$DAILY_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/blender-${ESCAPED_VER}[^\"[:space:]]*${UPSTREAM_SHA}[^\"[:space:]]*${suffix}" | head -n 1 || true)
+            if [ -z "$FOUND_URL" ]; then
+              if [ -z "$ARCHIVE_PAGE" ]; then
+                ARCHIVE_PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/archive/")
+              fi
+              FOUND_URL=$(printf '%s' "$ARCHIVE_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/archive/blender-${ESCAPED_VER}[^\"[:space:]]*${UPSTREAM_SHA}[^\"[:space:]]*${suffix}" | head -n 1 || true)
+            fi
+          }
+
+          if [ "${{ inputs.build_windows }}" = "true" ]; then
+            resolve_upstream_url "windows\.amd64-release\.zip"
+            if [ -z "$FOUND_URL" ]; then
+              echo "::error::Could not find a Blender ${SHORT_VER} Windows x64 daily build for commit ${UPSTREAM_SHA} on builder.blender.org (/download/daily/ or /download/daily/archive/)."
+              exit 1
+            fi
+            echo "Windows upstream URL: $FOUND_URL"
+            echo "windows_upstream_url=$FOUND_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${{ inputs.build_linux }}" = "true" ]; then
+            resolve_upstream_url "linux\.x86_64-release\.tar\.xz"
+            if [ -z "$FOUND_URL" ]; then
+              echo "::error::Could not find a Blender ${SHORT_VER} Linux x64 daily build for commit ${UPSTREAM_SHA} on builder.blender.org (/download/daily/ or /download/daily/archive/)."
+              exit 1
+            fi
+            echo "Linux upstream URL: $FOUND_URL"
+            echo "linux_upstream_url=$FOUND_URL" >> "$GITHUB_OUTPUT"
+          fi
 
   build-windows:
     name: Build Windows
@@ -146,6 +217,9 @@ jobs:
 
       - name: Inject Precompiled Cycles GPU Kernels
         shell: pwsh
+        env:
+          UPSTREAM_URL: ${{ needs.prepare.outputs.windows_upstream_url }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
         run: |
           $ProgressPreference = 'SilentlyContinue'
           $BUILD_BIN = Get-Item -Path "C:\blender_install" -ErrorAction SilentlyContinue
@@ -156,35 +230,14 @@ jobs:
 
           $VER_DIR = Get-ChildItem -Path $BUILD_BIN.FullName -Directory | Where-Object { $_.Name -match '^\d+\.\d+$' } | Select-Object -First 1
           $BLENDER_VER = if ($VER_DIR) { $VER_DIR.Name } else { "5.4" }
-          $ESCAPED_VER = [regex]::Escape($BLENDER_VER)
-          $PARENT_SHA = (git rev-parse --short=12 HEAD~1 2>$null)
 
-          Write-Host "Finding official Blender $BLENDER_VER daily build on builder.blender.org (parent SHA: $PARENT_SHA)..."
-          $page = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/" -UseBasicParsing
-          $match = $null
-          if ($PARENT_SHA) {
-            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
-          }
-          if (-not $match -or -not $match.Success) {
-            $match = [regex]::Match($page.Content, "https://cdn\.builder\.blender\.org/download/daily/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
-          }
-          if (-not $match.Success) {
-            Write-Warning "Could not find a $BLENDER_VER build on /download/daily/; checking /download/daily/archive/..."
-            $archivePage = Invoke-WebRequest -Uri "https://builder.blender.org/download/daily/archive/" -UseBasicParsing
-            if ($PARENT_SHA) {
-              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]*$PARENT_SHA[^\s`"]*windows\.amd64-release\.zip")
-            }
-            if (-not $match -or -not $match.Success) {
-              $match = [regex]::Match($archivePage.Content, "https://cdn\.builder\.blender\.org/download/daily/archive/blender-$ESCAPED_VER[^\s`"]+windows\.amd64-release\.zip")
-            }
-          }
-          if (-not $match.Success) {
-            Write-Error "Could not locate a Windows x64 build for Blender $BLENDER_VER on builder.blender.org!"
+          $url = $env:UPSTREAM_URL
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            Write-Error "Missing upstream daily build URL for commit $($env:UPSTREAM_SHA)!"
             exit 1
           }
 
-          $url = $match.Value
-          Write-Host "Downloading upstream archive from: $url"
+          Write-Host "Downloading upstream archive for commit $($env:UPSTREAM_SHA) from: $url"
           Invoke-WebRequest -Uri $url -OutFile "C:\blender-upstream.zip"
 
           Write-Host "Extracting Cycles GPU kernels (CUDA / OptiX / HIP)..."
@@ -355,6 +408,9 @@ jobs:
           cmake --install /tmp/build_blender --prefix /tmp/blender_install
 
       - name: Inject Precompiled Cycles GPU Kernels
+        env:
+          UPSTREAM_URL: ${{ needs.prepare.outputs.linux_upstream_url }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
         run: |
           BUILD_BIN="/tmp/blender_install"
           if [ ! -d "$BUILD_BIN" ]; then
@@ -364,35 +420,14 @@ jobs:
 
           BLENDER_VER=$(find "$BUILD_BIN" -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]+\.[0-9]+' -printf '%f\n' | head -n 1)
           BLENDER_VER=${BLENDER_VER:-5.4}
-          ESCAPED_VER=$(echo "$BLENDER_VER" | sed 's/\./\\./g')
-          PARENT_SHA=$(git rev-parse --short=12 HEAD~1 2>/dev/null || true)
 
-          echo "Finding official Blender $BLENDER_VER daily build on builder.blender.org (parent SHA: $PARENT_SHA)..."
-          PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/")
-          URL=""
-          if [ -n "$PARENT_SHA" ]; then
-            URL=$(echo "$PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/blender-${ESCAPED_VER}[^\"[:space:]]*${PARENT_SHA}[^\"[:space:]]*linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
-          fi
+          URL="$UPSTREAM_URL"
           if [ -z "$URL" ]; then
-            URL=$(echo "$PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/blender-${ESCAPED_VER}[^\"[:space:]]+linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
-          fi
-          if [ -z "$URL" ]; then
-            echo "Could not find a $BLENDER_VER build on /download/daily/; checking /download/daily/archive/..."
-            ARCHIVE_PAGE=$(curl -fsSL "https://builder.blender.org/download/daily/archive/")
-            if [ -n "$PARENT_SHA" ]; then
-              URL=$(echo "$ARCHIVE_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/archive/blender-${ESCAPED_VER}[^\"[:space:]]*${PARENT_SHA}[^\"[:space:]]*linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
-            fi
-            if [ -z "$URL" ]; then
-              URL=$(echo "$ARCHIVE_PAGE" | grep -oE "https://cdn\.builder\.blender\.org/download/daily/archive/blender-${ESCAPED_VER}[^\"[:space:]]+linux\.x86_64-release\.tar\.xz" | head -n 1 || true)
-            fi
-          fi
-
-          if [ -z "$URL" ]; then
-            echo "Could not locate a Linux x64 build for Blender $BLENDER_VER on builder.blender.org!"
+            echo "Missing upstream daily build URL for commit $UPSTREAM_SHA!"
             exit 1
           fi
 
-          echo "Downloading upstream archive from: $URL"
+          echo "Downloading upstream archive for commit $UPSTREAM_SHA from: $URL"
           curl -fsSL "$URL" -o /tmp/blender-upstream.tar.xz
 
           UPSTREAM_DIR=/tmp/blender-upstream
