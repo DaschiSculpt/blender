@@ -137,7 +137,7 @@ static wmOperatorStatus vertex_parent_set_exec(bContext *C, wmOperator *op)
 
     EditMesh *em = mesh->runtime->edit_mesh.get();
 
-    BKE_editmesh_looptris_and_normals_calc(em, BKE_editmesh_bmesh_get_for_write(mesh));
+    BKE_editmesh_looptris_and_normals_calc(em, BKE_editmesh_bmesh_ensure(mesh));
 
     /* Make sure the evaluated mesh is updated.
      *
@@ -149,7 +149,7 @@ static wmOperatorStatus vertex_parent_set_exec(bContext *C, wmOperator *op)
     BMVert *eve;
     BMIter iter;
     int curr_index;
-    BMesh *bm = BKE_editmesh_bmesh_get_for_write(obedit);
+    BMesh *bm = BKE_editmesh_bmesh_ensure(obedit);
     BM_ITER_MESH_INDEX (eve, &iter, bm, BM_VERTS_OF_MESH, curr_index) {
       if (BM_elem_flag_test(eve, BM_ELEM_SELECT)) {
         if (par1 == INDEX_UNSET) {
@@ -827,7 +827,7 @@ static void parent_set_vert_find(const KDTree<float3> &tree,
   const float3 co_find = child->object_to_world().location();
   if (is_tri) {
     std::array<KDTree<float3>::Nearest, 3> nearest;
-    const int tot = tree.find_nearest_n(co_find, nearest);
+    const int tot = tree.find_nearest_n(co_find, std::numeric_limits<float>::max(), nearest);
     BLI_assert(tot == 3);
     UNUSED_VARS_NDEBUG(tot);
 

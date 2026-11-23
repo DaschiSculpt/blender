@@ -2729,11 +2729,10 @@ static void rna_SpaceGraphEditor_normalize_update(bContext *C, PointerRNA * /*pt
   ANIM_animdata_filter(&ac, &anim_data, filter, ac.data, eAnimCont_Types(ac.datatype));
   for (bAnimListElem &ale : anim_data) {
     FCurve *fcu = static_cast<FCurve *>(ale.key_data);
-    float offset;
     /* Calling this function updates the cached values in the `FCurve`. Doing so makes it so that
      * the normalization will be correct after enabling the normalization, even with auto normalize
      * disabled. */
-    ANIM_unit_mapping_get_factor(ac.scene, ale.id, fcu, ANIM_UNITCONV_NORMALIZE, &offset);
+    ANIM_unit_mapping_get(ac.scene, ale.id, fcu, ANIM_UNITCONV_NORMALIZE);
   }
   ANIM_animdata_freelist(&anim_data);
 
@@ -2807,36 +2806,6 @@ static void rna_SequenceEditor_render_size_update(bContext *C, PointerRNA *ptr)
 
   seq_build_proxy(C, ptr);
   seq::cache_cleanup(scene, seq::CacheCleanup::All);
-}
-
-static bool rna_SequenceEditor_clamp_view_get(PointerRNA *ptr)
-{
-  SpaceSeq *sseq = static_cast<SpaceSeq *>(ptr->data);
-  return (sseq->flag & SEQ_CLAMP_VIEW) != 0;
-}
-
-static void rna_SequenceEditor_clamp_view_set(PointerRNA *ptr, bool value)
-{
-  SpaceSeq *sseq = static_cast<SpaceSeq *>(ptr->data);
-  ScrArea *area;
-  ARegion *region;
-
-  area = rna_area_from_space(ptr); /* can be nullptr */
-  if (area == nullptr) {
-    return;
-  }
-
-  region = BKE_area_find_region_type(area, RGN_TYPE_WINDOW);
-  if (region) {
-    if (value) {
-      sseq->flag |= SEQ_CLAMP_VIEW;
-      region->v2d.align &= ~V2D_ALIGN_NO_NEG_Y;
-    }
-    else {
-      sseq->flag &= ~SEQ_CLAMP_VIEW;
-      region->v2d.align |= V2D_ALIGN_NO_NEG_Y;
-    }
-  }
 }
 
 static void rna_Sequencer_view_type_update(Main * /*bmain*/, Scene * /*scene*/, PointerRNA *ptr)
@@ -7184,8 +7153,6 @@ static void rna_def_space_sequencer(BlenderRNA *brna)
 
   prop = RNA_def_property(srna, "use_clamp_view", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "flag", SEQ_CLAMP_VIEW);
-  RNA_def_property_boolean_funcs(
-      prop, "rna_SequenceEditor_clamp_view_get", "rna_SequenceEditor_clamp_view_set");
   RNA_def_property_ui_text(
       prop, "Limit View to Contents", "Limit timeline height to maximum used channel slot");
   RNA_def_property_update(prop, NC_SPACE | ND_SPACE_SEQUENCER, nullptr);

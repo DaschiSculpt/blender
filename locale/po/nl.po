@@ -1,9 +1,9 @@
 
 msgid ""
 msgstr ""
-"Project-Id-Version: Blender 5.3.0 Beta (b'9a146ef5783c')\n"
+"Project-Id-Version: Blender 5.4.0 Alpha (b'023dcaed86e9')\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-11-02 10:58+0000\n"
+"POT-Creation-Date: 2026-11-16 11:03+0000\n"
 "PO-Revision-Date: 2026-07-08 11:12+0000\n"
 "Last-Translator: Timo Hoetmer <timo@timohoetmer.nl>\n"
 "Language-Team: Dutch <https://translate.blender.org/projects/blender-ui/ui/nl/>\n"
@@ -2621,10 +2621,6 @@ msgid "A color space, view or display was not found, which likely means the Open
 msgstr "Er was geen kleurruimte, beeld of weergave gevonden, wat waarschijnlijk betekent dat de OpenColorIO config gebruikt om dit blend bestand te creëren mist"
 
 
-msgid "Blender"
-msgstr "Blender"
-
-
 msgid "Only link data, instead of appending it"
 msgstr "Alleen data linken, in plaats van het bij te voegen"
 
@@ -2764,6 +2760,10 @@ msgstr "Blendbestand Importeer Context Bibliotheken"
 
 msgid "Collection of source libraries, i.e. blendfile paths"
 msgstr "Collectie van bron bibliotheken, d.w.z. blendbestand paden"
+
+
+msgid "Blender"
+msgstr "Blender"
 
 
 msgid "Path"
@@ -3517,14 +3517,6 @@ msgstr "Actieve Laag"
 
 msgid "Random Settings"
 msgstr "Willekeurige Instellingen"
-
-
-msgid "Mode Type"
-msgstr "Type Modus"
-
-
-msgid "Fill"
-msgstr "Vul"
 
 
 msgid "Object Path"
@@ -4705,6 +4697,10 @@ msgid "Sound"
 msgstr "Geluid"
 
 
+msgid "Dynamic"
+msgstr "Dynamisch"
+
+
 msgid "Inclusive"
 msgstr "Inclusief"
 
@@ -4767,10 +4763,6 @@ msgstr "Zijkant (Y-Z)"
 
 msgid "Top (X-Y)"
 msgstr "Bovenkant (X-Y)"
-
-
-msgid "Dynamic"
-msgstr "Dynamisch"
 
 
 msgid "Show Value"
@@ -5768,24 +5760,12 @@ msgid "Dots"
 msgstr "Stippen"
 
 
-msgid "Show/Hide"
-msgstr "Toon/Verberg"
-
-
-msgid "Names"
-msgstr "Namen"
-
-
-msgid "Mirror"
-msgstr "Spiegel"
-
-
-msgid "Local View"
-msgstr "Lokale Scherm"
-
-
 msgid "Navigation"
 msgstr "Navigatie"
+
+
+msgid "Import"
+msgstr "Importeren"
 
 
 msgid "Select Similar"
@@ -5794,10 +5774,6 @@ msgstr "Selecteer Vergelijkbaar"
 
 msgid "Select Linked"
 msgstr "Selecteer Aaneengesloten"
-
-
-msgid "Import"
-msgstr "Importeren"
 
 
 msgid "Light"
@@ -5820,8 +5796,20 @@ msgid "Quick Effects"
 msgstr "Snelle Effecten"
 
 
+msgid "Show/Hide"
+msgstr "Toon/Verberg"
+
+
 msgid "Convert"
 msgstr "Converteer"
+
+
+msgid "Linked"
+msgstr "Gekoppeld"
+
+
+msgid "Layout"
+msgstr "Indeling"
 
 
 msgid "Hooks"
@@ -5832,12 +5820,16 @@ msgid "Clear Transform"
 msgstr "Maak Transformatie Leeg"
 
 
-msgid "Linked"
-msgstr "Gekoppeld"
+msgid "Names"
+msgstr "Namen"
 
 
-msgid "Layout"
-msgstr "Indeling"
+msgid "Mirror"
+msgstr "Spiegel"
+
+
+msgid "Local View"
+msgstr "Lokale Scherm"
 
 
 msgctxt "MovieClip"
@@ -6027,6 +6019,10 @@ msgstr "Knip Randen"
 
 msgid "Grow"
 msgstr "Groeien"
+
+
+msgid "Fill"
+msgstr "Vul"
 
 
 msgctxt "Curve"
@@ -9224,10 +9220,6 @@ msgid "Set \"Fake User\" for appended items (except objects and collections)"
 msgstr "Stel \"Neppe Gebruiker\" in voor bijgevoegde items (behalve objecten en collecties)"
 
 
-msgid "Localize all appended data, including those indirectly linked from other libraries"
-msgstr "Lokaliseer alle bijgevoegde data, inclusief data direct gelinkt van andere bibliotheken"
-
-
 msgctxt "ID"
 msgid "Metaballs"
 msgstr "Metaballs"
@@ -10421,6 +10413,10 @@ msgstr "Animatie"
 msgctxt "WindowManager"
 msgid "Animation Channels"
 msgstr "Animatie Kanalen"
+
+
+msgid "Close"
+msgstr "Sluit"
 
 
 msgctxt "Operator"
@@ -12110,10 +12106,6 @@ msgstr "Icosphere"
 
 msgid "Seams"
 msgstr "Naden"
-
-
-msgid "Close"
-msgstr "Sluit"
 
 
 msgid "No edges selected"

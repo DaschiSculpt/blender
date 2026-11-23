@@ -1331,12 +1331,10 @@ void dynamicPaint_Modifier_copy(const DynamicPaintModifierData *pmd,
      * that pointer. See e.g. `BKE_object_copy_particlesystems` or `BKE_object_copy_modifier`. */
     t_brush->psys = brush->psys;
 
-    if (brush->paint_ramp) {
-      memcpy(t_brush->paint_ramp, brush->paint_ramp, sizeof(ColorBand));
-    }
-    if (brush->vel_ramp) {
-      memcpy(t_brush->vel_ramp, brush->vel_ramp, sizeof(ColorBand));
-    }
+    MEM_SAFE_DELETE(t_brush->paint_ramp);
+    t_brush->paint_ramp = BKE_colorband_copy_or_null(brush->paint_ramp);
+    MEM_SAFE_DELETE(t_brush->vel_ramp);
+    t_brush->vel_ramp = BKE_colorband_copy_or_null(brush->vel_ramp);
 
     t_brush->proximity_falloff = brush->proximity_falloff;
     t_brush->wave_type = brush->wave_type;
@@ -4376,6 +4374,7 @@ static void dynamic_paint_paint_particle_cell_point_cb_ex(
     /* Find nearest particle and get distance to it */
     float nearest_dist_sq;
     const int nearest_index = tree.find_nearest(bData->realCoord[bData->s_pos[index]].v,
+                                                std::numeric_limits<float>::max(),
                                                 &nearest_dist_sq);
     const float nearest_dist = std::sqrt(nearest_dist_sq);
     /* if outside maximum range, no other particle can influence either */

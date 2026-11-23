@@ -1631,6 +1631,9 @@ int pyrna_pydict_to_props(PointerRNA *ptr,
     if (STREQ(arg_name, "rna_type")) {
       continue;
     }
+    if (RNA_property_is_shadowed(*ptr, *prop)) {
+      continue;
+    }
 
     if (kw == nullptr) {
       PyErr_Format(
@@ -8995,6 +8998,11 @@ bool pyrna_id_CheckPyObject(PyObject *obj)
          RNA_struct_is_ID((reinterpret_cast<BPy_StructRNA *>(obj))->ptr->type);
 }
 
+bool pyrna_struct_CheckPyObject(PyObject *obj)
+{
+  return BPy_StructRNA_Check(obj);
+}
+
 void BPY_rna_init()
 {
 #ifdef USE_MATHUTILS /* Register mathutils callbacks, ok to run more than once. */
@@ -9335,9 +9343,12 @@ StructRNA *pyrna_struct_as_srna(PyObject *self, const bool parent, const char *e
 
   /* Unfortunately PyObject_GetAttrString won't look up this types tp_dict first :/ */
   if (PyType_Check(self)) {
-    py_srna = reinterpret_cast<BPy_StructRNA *>(
-        PyDict_GetItem((reinterpret_cast<PyTypeObject *>(self))->tp_dict, bpy_intern_str_bl_rna));
-    Py_XINCREF(py_srna);
+    PyTypeObject *py_type = reinterpret_cast<PyTypeObject *>(self);
+    if (py_type->tp_dict) {
+      py_srna = reinterpret_cast<BPy_StructRNA *>(
+          PyDict_GetItem(py_type->tp_dict, bpy_intern_str_bl_rna));
+      Py_XINCREF(py_srna);
+    }
   }
 
   if (parent) {
@@ -9493,6 +9504,22 @@ static int deferred_register_prop(StructRNA *srna, PyObject *key, PyObject *item
                        "bpy_struct \"%.200s\" registration error: "
                        "'%.200s' %.200s could not register because "
                        "this type doesn't support data-block properties",
+                       RNA_struct_identifier(srna),
+                       key_str,
+                       func_name);
+          return -1;
+        }
+      }
+    }
+    if (!RNA_struct_idprops_struct_allowed(srna)) {
+      PyCFunctionWithKeywords py_func_ref = *(
+          PyCFunctionWithKeywords)(void *)PyCFunction_GET_FUNCTION(py_func);
+      if (ELEM(py_func_ref, BPy_PointerProperty, BPy_CollectionProperty)) {
+        if (RNA_struct_idprops_contains_struct(type_srna)) {
+          PyErr_Format(PyExc_ValueError,
+                       "bpy_struct \"%.200s\" registration error: "
+                       "'%.200s' %.200s could not register because "
+                       "this type doesn't support struct properties (e.g. CurveMapping)",
                        RNA_struct_identifier(srna),
                        key_str,
                        func_name);
@@ -10558,8 +10585,8 @@ static PyObject *pyrna_register_class(PyObject * /*self*/, PyObject *py_class)
     return nullptr;
   }
 
-  if (PyDict_GetItem((reinterpret_cast<PyTypeObject *>(py_class))->tp_dict, bpy_intern_str_bl_rna))
-  {
+  PyObject *py_class_dict = reinterpret_cast<PyTypeObject *>(py_class)->tp_dict;
+  if (py_class_dict && PyDict_GetItem(py_class_dict, bpy_intern_str_bl_rna)) {
     PyErr_Format(PyExc_ValueError,
                  "%s already registered as a subclass '%.200s'",
                  error_prefix,

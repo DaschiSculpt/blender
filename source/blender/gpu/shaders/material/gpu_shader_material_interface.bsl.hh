@@ -240,12 +240,7 @@ Closure closure_eval(KernelGlobals & /*kg*/,
 {
   return {};
 }
-Closure closure_eval(KernelGlobals & /*kg*/,
-                     ShadingData & /*sd*/,
-                     ClosureDiffuse /*diffuse*/,
-                     ClosureReflection /*reflection*/,
-                     ClosureReflection /*coat*/,
-                     ClosureRefraction /*refraction*/)
+Closure closure_eval(KernelGlobals & /*kg*/, ShadingData & /*sd*/, ClosureSheen /*sheen*/)
 {
   return {};
 }
@@ -315,6 +310,13 @@ float3 oren_nayar_lut(const KernelGlobals & /*kg*/,
   return float3(0.0f);
 }
 
+float sheen_albedo(const KernelGlobals & /*kg*/,
+                   const float /*cos_theta*/,
+                   const float /*roughness*/)
+{
+  return 0.0f;
+}
+
 float f0_from_ior(float /*eta*/)
 {
   return 0.0f;
@@ -354,7 +356,7 @@ float ambient_occlusion_eval(const KernelGlobals & /*kg*/,
   return 0.0f;
 }
 
-/* Attribute node occlusion node. */
+/* Attribute node. */
 
 float4 attr_load_color_post(KernelGlobals & /*kg*/, float4 attr)
 {

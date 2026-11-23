@@ -148,6 +148,7 @@
 [[maybe_unused]] static constexpr int RAYTRACE_GROUP_SIZE = 8;
 /* Keep this as a define to avoid shader variations. */
 #define RAYTRACE_RADIANCE_FORMAT UFLOAT_11_11_10
+#define RAYTRACE_RAYDATA_FORMAT UINT_16_16_16_16
 #define RAYTRACE_RAYTIME_FORMAT SFLOAT_32
 #define RAYTRACE_VARIANCE_FORMAT SFLOAT_16
 #define RAYTRACE_TILEMASK_FORMAT UINT_8
@@ -203,6 +204,7 @@
 
 /* Utility Texture. */
 #define UTIL_TEX_SIZE 64
+#define UTIL_SHEEN_TEX_SIZE 32
 #define UTIL_BSDF_LAYER_COUNT 16
 /* Scale and bias to avoid interpolation of the border pixel.
  * Remap UVs to the border pixels centers. */
@@ -214,9 +216,10 @@
 #define UTIL_LTC_MAT_GGX_LAYER 2
 #define UTIL_OREN_NAYAR_LAYER 3
 #define UTIL_LTC_MAT_OREN_NAYAR_LAYER 4
-#define UTIL_BRDF_LAYER 5
+#define UTIL_LTC_SHEEN_LAYER 5
+#define UTIL_BRDF_LAYER 6
 /* NOTE: UTIL_BSDF_LAYER should be the last layer to have the correct layer_count. */
-#define UTIL_BSDF_LAYER 6
+#define UTIL_BSDF_LAYER 7
 
 #define UTIL_DISK_INTEGRAL_LAYER UTIL_SSS_TRANSMITTANCE_PROFILE_LAYER
 #define UTIL_DISK_INTEGRAL_COMP 3

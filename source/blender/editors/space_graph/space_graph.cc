@@ -266,11 +266,11 @@ static void graph_main_region_draw(const bContext *C, ARegion *region)
   /* draw data */
   if (ANIM_animdata_get_context(C, &ac)) {
     /* draw ghost curves */
-    graph_draw_ghost_curves(&ac, sipo, region);
+    graph_draw_ghost_curves(&ac, sipo, region->v2d);
 
     /* draw curves twice - unselected, then selected, so that the are fewer occlusion problems */
-    graph_draw_curves(&ac, sipo, region, 0);
-    graph_draw_curves(&ac, sipo, region, 1);
+    graph_draw_curves(&ac, sipo, region->v2d, 0);
+    graph_draw_curves(&ac, sipo, region->v2d, 1);
 
     /* XXX(ton): the slow way to set tot rect... but for nice sliders needed. */
     /* Excluding handles from the calculation to save performance. This cuts the time it takes for
@@ -954,8 +954,9 @@ static void graph_space_blend_read_data(BlendDataReader *reader, SpaceLink *sl)
   sipo->runtime = SpaceGraph_Runtime{};
 }
 
-static void graph_space_blend_write(BlendWriter *writer, SpaceLink *sl)
+static void graph_space_blend_write(ScreenBlendWriteData &screen_writer, SpaceLink *sl)
 {
+  BlendWriter *writer = screen_writer.writer;
   SpaceGraph *sipo = reinterpret_cast<SpaceGraph *>(sl);
   writer->write_struct_cast<SpaceGraph>(sl, [](BlendStructWriter<SpaceGraph> &struct_writer) {
     struct_writer.shallow_data.runtime = {};

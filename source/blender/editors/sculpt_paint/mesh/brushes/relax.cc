@@ -15,6 +15,7 @@
 #include "BKE_subdiv_ccg.hh"
 
 #include "BLI_enumerable_thread_specific.hh"
+#include "BLI_math_matrix.hh"
 #include "BLI_task.hh"
 
 #include "editors/sculpt_paint/mesh/mesh_brush_common.hh"
@@ -35,21 +36,25 @@ inline namespace relax_cc {
  * \{ */
 
 struct MeshLocalData {
+  Vector<float3> local_positions;
   Vector<float> factors;
   Vector<float> distances;
 };
 
 struct MultiresLocalData {
+  Vector<float3> local_positions;
   Vector<float> factors;
   Vector<float> distances;
 };
 
 struct GridLocalData {
+  Vector<float3> local_positions;
   Vector<float> factors;
   Vector<float> distances;
 };
 
 struct BMeshLocalData {
+  Vector<float3> local_positions;
   Vector<float> factors;
   Vector<float> distances;
 };
@@ -611,6 +616,7 @@ BLI_NOINLINE static void calc_topology_relax_factors_faces(const Depsgraph &deps
                                                            const Brush &brush,
                                                            const float strength,
                                                            const Object &object,
+                                                           const float4x4 &mat,
                                                            const MeshAttributeData &attribute_data,
                                                            const bke::pbvh::MeshNode &node,
                                                            MeshLocalData &tls,
@@ -619,15 +625,33 @@ BLI_NOINLINE static void calc_topology_relax_factors_faces(const Depsgraph &deps
   const OrigPositionData orig_data = orig_position_data_get_mesh(object, node);
 
   tls.distances.resize(orig_data.positions.size());
-  calc_factors_common_from_orig_data_mesh(depsgraph,
-                                          brush,
-                                          object,
-                                          attribute_data,
-                                          orig_data.positions,
-                                          orig_data.normals,
-                                          node,
-                                          factors,
-                                          tls.distances);
+
+  if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+    tls.local_positions.resize(orig_data.positions.size());
+    const MutableSpan<float3> local_positions = tls.local_positions;
+    calc_cube_tip_factors_common_from_orig_data_mesh(depsgraph,
+                                                     brush,
+                                                     object,
+                                                     mat,
+                                                     attribute_data,
+                                                     orig_data.positions,
+                                                     orig_data.normals,
+                                                     local_positions,
+                                                     node,
+                                                     factors,
+                                                     tls.distances);
+  }
+  else {
+    calc_factors_common_from_orig_data_mesh(depsgraph,
+                                            brush,
+                                            object,
+                                            attribute_data,
+                                            orig_data.positions,
+                                            orig_data.normals,
+                                            node,
+                                            factors,
+                                            tls.distances);
+  }
 
   scale_factors(factors, strength);
 }
@@ -637,6 +661,7 @@ static void do_topology_relax_brush_mesh(const Depsgraph &depsgraph,
                                          const Brush &brush,
                                          Object &object,
                                          const IndexMask &node_mask,
+                                         const float4x4 &mat,
                                          const float strength)
 {
   const SculptSession &ss = *object.runtime->sculpt_session;
@@ -665,6 +690,7 @@ static void do_topology_relax_brush_mesh(const Depsgraph &depsgraph,
                                           brush,
                                           strength,
                                           object,
+                                          mat,
                                           attribute_data,
                                           nodes[i],
                                           tls,
@@ -712,6 +738,7 @@ BLI_NOINLINE static void calc_topology_relax_factors_multires(
     const Brush &brush,
     const float strength,
     const Object &object,
+    const float4x4 &mat,
     const bke::pbvh::MultiresNode &node,
     MultiresLocalData &tls,
     const MutableSpan<float3> node_positions,
@@ -725,16 +752,34 @@ BLI_NOINLINE static void calc_topology_relax_factors_multires(
   const OrigPositionData orig_data = orig_position_data_get_multires(object, node);
 
   tls.distances.resize(node_positions.size());
-  calc_factors_common_multires(depsgraph,
-                               brush,
-                               object,
-                               multires,
-                               base_topo,
-                               orig_data.positions,
-                               orig_data.normals,
-                               node,
-                               factors,
-                               tls.distances);
+  if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+    tls.local_positions.resize(orig_data.positions.size());
+    const MutableSpan<float3> local_positions = tls.local_positions;
+    calc_cube_tip_factors_common_multires(depsgraph,
+                                          brush,
+                                          object,
+                                          mat,
+                                          multires,
+                                          base_topo,
+                                          orig_data.positions,
+                                          orig_data.normals,
+                                          local_positions,
+                                          node,
+                                          factors,
+                                          tls.distances);
+  }
+  else {
+    calc_factors_common_multires(depsgraph,
+                                 brush,
+                                 object,
+                                 multires,
+                                 base_topo,
+                                 orig_data.positions,
+                                 orig_data.normals,
+                                 node,
+                                 factors,
+                                 tls.distances);
+  }
 
   scale_factors(factors, strength);
 }
@@ -744,6 +789,7 @@ static void do_topology_relax_brush_multires(const Depsgraph &depsgraph,
                                              const Brush &brush,
                                              Object &object,
                                              const IndexMask &node_mask,
+                                             const float4x4 &mat,
                                              const float strength)
 {
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -775,6 +821,7 @@ static void do_topology_relax_brush_multires(const Depsgraph &depsgraph,
             brush,
             strength,
             object,
+            mat,
             nodes[i],
             tls,
             current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
@@ -817,6 +864,7 @@ BLI_NOINLINE static void calc_topology_relax_factors_grids(const Depsgraph &deps
                                                            const Brush &brush,
                                                            const float strength,
                                                            const Object &object,
+                                                           const float4x4 &mat,
                                                            const bke::pbvh::GridsNode &node,
                                                            GridLocalData &tls,
                                                            const MutableSpan<float3> positions,
@@ -833,14 +881,31 @@ BLI_NOINLINE static void calc_topology_relax_factors_grids(const Depsgraph &deps
   const OrigPositionData orig_data = orig_position_data_get_grids(object, node);
 
   tls.distances.resize(grid_verts_num);
-  calc_factors_common_from_orig_data_grids(depsgraph,
-                                           brush,
-                                           object,
-                                           orig_data.positions,
-                                           orig_data.normals,
-                                           node,
-                                           factors,
-                                           tls.distances);
+
+  if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+    tls.local_positions.resize(grid_verts_num);
+    const MutableSpan<float3> local_positions = tls.local_positions;
+    calc_cube_tip_factors_common_from_orig_data_grids(depsgraph,
+                                                      brush,
+                                                      object,
+                                                      mat,
+                                                      orig_data.positions,
+                                                      orig_data.normals,
+                                                      local_positions,
+                                                      node,
+                                                      factors,
+                                                      tls.distances);
+  }
+  else {
+    calc_factors_common_from_orig_data_grids(depsgraph,
+                                             brush,
+                                             object,
+                                             orig_data.positions,
+                                             orig_data.normals,
+                                             node,
+                                             factors,
+                                             tls.distances);
+  }
 
   scale_factors(factors, strength);
 }
@@ -850,6 +915,7 @@ static void do_topology_relax_brush_grids(const Depsgraph &depsgraph,
                                           const Brush &brush,
                                           Object &object,
                                           const IndexMask &node_mask,
+                                          const float4x4 &mat,
                                           const float strength)
 {
   const SculptSession &ss = *object.runtime->sculpt_session;
@@ -884,6 +950,7 @@ static void do_topology_relax_brush_grids(const Depsgraph &depsgraph,
             brush,
             strength,
             object,
+            mat,
             nodes[i],
             tls,
             current_positions.as_mutable_span().slice(node_vert_offsets[pos]),
@@ -925,6 +992,7 @@ static void do_topology_relax_brush_grids(const Depsgraph &depsgraph,
 static void calc_topology_relax_factors_bmesh(const Depsgraph &depsgraph,
                                               Object &object,
                                               const Brush &brush,
+                                              const float4x4 &mat,
                                               bke::pbvh::BMeshNode &node,
                                               const float strength,
                                               BMeshLocalData &tls,
@@ -942,8 +1010,25 @@ static void calc_topology_relax_factors_bmesh(const Depsgraph &depsgraph,
   gather_bmesh_positions(verts, positions);
 
   tls.distances.resize(verts.size());
-  calc_factors_common_from_orig_data_bmesh(
-      depsgraph, brush, object, orig_positions, orig_normals, node, factors, tls.distances);
+
+  if (BKE_brush_has_cube_tip(&brush, PaintMode::Sculpt)) {
+    tls.local_positions.resize(verts.size());
+    const MutableSpan<float3> local_positions = tls.local_positions;
+    calc_cube_tip_factors_common_from_orig_data_bmesh(depsgraph,
+                                                      brush,
+                                                      object,
+                                                      mat,
+                                                      orig_positions,
+                                                      orig_normals,
+                                                      local_positions,
+                                                      node,
+                                                      factors,
+                                                      tls.distances);
+  }
+  else {
+    calc_factors_common_from_orig_data_bmesh(
+        depsgraph, brush, object, orig_positions, orig_normals, node, factors, tls.distances);
+  }
 
   scale_factors(factors, strength);
 }
@@ -953,6 +1038,7 @@ static void do_topology_relax_brush_bmesh(const Depsgraph &depsgraph,
                                           const Brush &brush,
                                           Object &object,
                                           const IndexMask &node_mask,
+                                          const float4x4 &mat,
                                           const float strength)
 {
   bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
@@ -976,6 +1062,7 @@ static void do_topology_relax_brush_bmesh(const Depsgraph &depsgraph,
             depsgraph,
             object,
             brush,
+            mat,
             nodes[i],
             strength,
             tls,
@@ -1067,21 +1154,23 @@ void do_topology_relax_brush(const Depsgraph &depsgraph,
 
   const float strength = ss.cache->bstrength;
 
+  const float4x4 mat = cube_tip_init(object, brush);
+
   boundary::ensure_boundary_info(object);
 
   for (int i = 0; i < 4; i++) {
     switch (bke::object::pbvh_get(object)->type()) {
       case bke::pbvh::Type::Mesh:
-        do_topology_relax_brush_mesh(depsgraph, sd, brush, object, node_mask, strength);
+        do_topology_relax_brush_mesh(depsgraph, sd, brush, object, node_mask, mat, strength);
         break;
       case bke::pbvh::Type::Multires:
-        do_topology_relax_brush_multires(depsgraph, sd, brush, object, node_mask, strength);
+        do_topology_relax_brush_multires(depsgraph, sd, brush, object, node_mask, mat, strength);
         break;
       case bke::pbvh::Type::Grids:
-        do_topology_relax_brush_grids(depsgraph, sd, brush, object, node_mask, strength);
+        do_topology_relax_brush_grids(depsgraph, sd, brush, object, node_mask, mat, strength);
         break;
       case bke::pbvh::Type::BMesh:
-        do_topology_relax_brush_bmesh(depsgraph, sd, brush, object, node_mask, strength);
+        do_topology_relax_brush_bmesh(depsgraph, sd, brush, object, node_mask, mat, strength);
         break;
     }
   }

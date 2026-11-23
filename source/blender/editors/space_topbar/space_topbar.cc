@@ -268,6 +268,7 @@ static void recent_files_menu_register()
   STRNCPY_UTF8(mt->label, N_("Open Recent"));
   STRNCPY_UTF8(mt->translation_context, BLT_I18NCONTEXT_DEFAULT_BPYRNA);
   mt->draw = recent_files_menu_draw;
+  mt->flag = MenuTypeFlag::KeepOrder;
   WM_menutype_add(mt);
 }
 
@@ -327,9 +328,9 @@ static void undo_history_menu_register()
   WM_menutype_add(mt);
 }
 
-static void topbar_space_blend_write(BlendWriter *writer, SpaceLink *sl)
+static void topbar_space_blend_write(ScreenBlendWriteData &screen_writer, SpaceLink *sl)
 {
-  writer->write_struct_cast<SpaceTopBar>(sl);
+  screen_writer.writer->write_struct_cast<SpaceTopBar>(sl);
 }
 
 void ED_spacetype_topbar()

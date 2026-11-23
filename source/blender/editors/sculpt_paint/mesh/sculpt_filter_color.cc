@@ -350,7 +350,7 @@ static void color_filter_task_mesh(const Depsgraph &depsgraph,
           new_colors[i] += delta_color * factors[i];
         }
         else {
-          blend_color_interpolate_float(new_colors[i], colors[i], average_colors[i], factors[i]);
+          new_colors[i] = math::interpolate(colors[i], average_colors[i], factors[i]);
         }
 
         new_colors[i] = math::clamp(new_colors[i], 0.0f, 1.0f);

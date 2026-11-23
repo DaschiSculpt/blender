@@ -872,7 +872,8 @@ class ShaderNodesInliner {
     const std::optional<PrimitiveSocketValue> iterations_value_opt =
         iterations_socket_value->to_primitive(*iterations_input->typeinfo);
     if (!iterations_value_opt) {
-      this->add_dynamic_repeat_zone_iterations_error(repeat_input_node);
+      this->report_required_constant_input_or_backtrack(
+          repeat_input_node, TIP_("Iterations input has to be a constant value"));
     }
     const int iterations = iterations_value_opt.has_value() ?
                                std::get<int>(iterations_value_opt->value) :
@@ -953,13 +954,6 @@ class ShaderNodesInliner {
     PreservedZone &preserved_zone = copied_zone_by_zone_output_node_.lookup_or_add_default(
         repeat_output_node);
     preserved_zone.input_node = &copied_node;
-  }
-
-  void add_dynamic_repeat_zone_iterations_error(const NodeInContext &repeat_input_node)
-  {
-    this->report_error(repeat_input_node,
-                       TIP_("Iterations input has to be a constant value"),
-                       NodeWarningType::Error);
   }
 
   void handle_output_socket__repeat_input(const SocketInContext &socket)
@@ -1403,6 +1397,7 @@ class ShaderNodesInliner {
     /* Use a truncate node to turn the input value into an int. */
     bNode &truncate_math_node = *this->add_node("ShaderNodeMath"_ustr);
     truncate_math_node.custom1 = NODE_MATH_TRUNC;
+    truncate_math_node.typeinfo->updatefunc(&dst_tree_, &truncate_math_node);
     bNodeSocket &truncate_input = *truncate_math_node.inputs.first();
     bNodeSocket &truncate_output = *truncate_math_node.outputs.first();
     this->set_input_socket_value(node, truncate_math_node, truncate_input, *index_input_value);
@@ -1423,6 +1418,7 @@ class ShaderNodesInliner {
       else {
         bNode &add_math_node = *this->add_node("ShaderNodeMath"_ustr);
         add_math_node.custom1 = NODE_MATH_ADD;
+        add_math_node.typeinfo->updatefunc(&dst_tree_, &add_math_node);
         bNodeSocket &add_in_1 = *add_math_node.inputs.first();
         bNodeSocket &add_in_2 = *add_in_1.next;
         bke::node_add_link(
@@ -2231,6 +2227,7 @@ class ShaderNodesInliner {
   {
     bNode &math_node = *this->add_node("ShaderNodeMath"_ustr);
     math_node.custom1 = NODE_MATH_GREATER_THAN;
+    math_node.typeinfo->updatefunc(&dst_tree_, &math_node);
     bNodeSocket &value_in = *math_node.inputs.first();
     bNodeSocket &threshold_in = *value_in.next;
     bNodeSocket &value_out = *math_node.outputs.first();
@@ -2293,7 +2290,9 @@ class ShaderNodesInliner {
       const bool is_iterations_input = dst_node.inputs.first_ == &dst_socket &&
                                        dst_node.is_type("GeometryNodeRepeatInput"_ustr);
       if (is_iterations_input) {
-        this->add_dynamic_repeat_zone_iterations_error(original_node);
+        this->report_error(original_node,
+                           TIP_("Iterations input has to be a constant value"),
+                           NodeWarningType::Error);
         this->set_primitive_value_on_socket(dst_socket, PrimitiveSocketValue{0});
         return;
       }

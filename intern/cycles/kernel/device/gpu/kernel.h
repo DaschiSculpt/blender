@@ -10,6 +10,12 @@
 
 #include "kernel/sample/lcg.h"
 
+/* The kg passed by the kernels that read specialization constants, see
+ * oneapi/context_intersect_begin.h. */
+#ifndef ccl_gpu_kernel_kg
+#  define ccl_gpu_kernel_kg nullptr
+#endif
+
 /* Include constant tables before entering Metal's context class scope (context_begin.h) */
 #include "kernel/tables.h"
 
@@ -165,7 +171,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_closest(nullptr, state, render_buffer));
+    ccl_gpu_kernel_call(integrator_intersect_closest(ccl_gpu_kernel_kg, state, render_buffer));
   }
 }
 ccl_gpu_kernel_postfix
@@ -179,7 +185,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_shadow(nullptr, state));
+    ccl_gpu_kernel_call(integrator_intersect_shadow(ccl_gpu_kernel_kg, state));
   }
 }
 ccl_gpu_kernel_postfix
@@ -193,7 +199,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_subsurface(nullptr, state));
+    ccl_gpu_kernel_call(integrator_intersect_subsurface(ccl_gpu_kernel_kg, state));
   }
 }
 ccl_gpu_kernel_postfix
@@ -208,7 +214,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_volume_stack(nullptr, state));
+    ccl_gpu_kernel_call(integrator_intersect_volume_stack(ccl_gpu_kernel_kg, state));
   }
 #  endif
 }
@@ -223,7 +229,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_dedicated_light(nullptr, state));
+    ccl_gpu_kernel_call(integrator_intersect_dedicated_light(ccl_gpu_kernel_kg, state));
   }
 }
 ccl_gpu_kernel_postfix
@@ -238,7 +244,7 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 
   if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
     const int state = (path_index_array) ? path_index_array[global_index] : global_index;
-    ccl_gpu_kernel_call(integrator_intersect_mnee(nullptr, state));
+    ccl_gpu_kernel_call(integrator_intersect_mnee(ccl_gpu_kernel_kg, state));
   }
 #  endif
 }
@@ -355,7 +361,8 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
     kg += __dummy_constant;
     ccl_gpu_kernel_call(integrator_shade_surface_raytrace(kg, state, render_buffer));
 #  else
-    ccl_gpu_kernel_call(integrator_shade_surface_raytrace(nullptr, state, render_buffer));
+    ccl_gpu_kernel_call(
+        integrator_shade_surface_raytrace(ccl_gpu_kernel_kg, state, render_buffer));
 #  endif
   }
 }
@@ -1063,9 +1070,9 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
   ccl_global float *denoised_pixel = buffer + pass_denoised;
 
   float4 color_value;
-  color_value.x = denoised_pixel[0];
-  color_value.y = denoised_pixel[1];
-  color_value.z = denoised_pixel[2];
+  color_value.x = max(denoised_pixel[0], 0.0f);
+  color_value.y = max(denoised_pixel[1], 0.0f);
+  color_value.z = max(denoised_pixel[2], 0.0f);
   color_value.w = num_components > 3 ? denoised_pixel[3] : 1.0f;
 
   surf2Dwrite(color_value, color_surface, x * sizeof(float4), y);
@@ -1213,9 +1220,9 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
     const ccl_global float *albedo_in = buffer + render_pass_albedo;
 
     float4 albedo_value;
-    albedo_value.x = albedo_in[0] * pixel_scale;
-    albedo_value.y = albedo_in[1] * pixel_scale;
-    albedo_value.z = albedo_in[2] * pixel_scale;
+    albedo_value.x = max(albedo_in[0] * pixel_scale, 0.0f);
+    albedo_value.y = max(albedo_in[1] * pixel_scale, 0.0f);
+    albedo_value.z = max(albedo_in[2] * pixel_scale, 0.0f);
     albedo_value.w = 1.0;
 
     /* Tonemap the albedo with simple reinhard operator. */

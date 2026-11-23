@@ -28,6 +28,7 @@
 #include "DNA_texture_types.h"
 
 #include "BKE_attribute.hh"
+#include "BKE_colorband.hh"
 #include "BKE_effect.h"
 #include "BKE_fluid.h"
 #include "BKE_global.hh"
@@ -1502,7 +1503,8 @@ static void emit_from_particles_task_cb(void *__restrict userdata,
       /* Find particle distance from the kdtree. */
       const float range = data->solid + data->smooth;
       float nearest_dist_sq;
-      const int nearest_index = data->tree->find_nearest(ray_start, &nearest_dist_sq);
+      const int nearest_index = data->tree->find_nearest(
+          ray_start, std::numeric_limits<float>::max(), &nearest_dist_sq);
       const float nearest_dist = std::sqrt(nearest_dist_sq);
 
       if (nearest_dist < range) {
@@ -4965,9 +4967,7 @@ void BKE_fluid_modifier_copy(const FluidModifierData *fmd, FluidModifierData *tf
     tfds->slice_depth = fds->slice_depth;
     tfds->display_thickness = fds->display_thickness;
     tfds->show_gridlines = fds->show_gridlines;
-    if (fds->coba) {
-      tfds->coba = MEM_dupalloc(fds->coba);
-    }
+    tfds->coba = BKE_colorband_copy_or_null(fds->coba);
     tfds->vector_scale = fds->vector_scale;
     tfds->vector_draw_type = fds->vector_draw_type;
     tfds->vector_field = fds->vector_field;

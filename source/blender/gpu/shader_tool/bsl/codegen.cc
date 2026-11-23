@@ -75,6 +75,21 @@ static const char *to_token_string(TokenType tok)
   }
 }
 
+static string this_identifier_override(const SymbolClass *caller_class,
+                                       const SymbolClass *callee_class,
+                                       const string &base)
+{
+  if (callee_class->size == 0) {
+    /* Call constructor for empty classes. */
+    return callee_class->identifier + "_ctor_()";
+  }
+  if (caller_class != callee_class) {
+    /* We need to figure out what inheritance path this function is visible in. */
+    return base + caller_class->get_path_to_base_class(*callee_class);
+  }
+  return base;
+}
+
 struct CodegenContext : NodeErrorHandler {
   SymbolTable &table;
   metadata::Source &metadata;
@@ -535,7 +550,7 @@ struct CodegenContext : NodeErrorHandler {
       bool preceded_by_dot = id.front().prev() == '.' ||
                              id.parent().prev().type() == NodeType::OpDeref;
       if (!var.is_static && !preceded_by_dot && var.parent->as_class() != nullptr) {
-        return {"this_." + var.identifier + whitespace,
+        return {ctx.this_identifier + "." + var.identifier + whitespace,
                 var.type,
                 var.array_dimensions,
                 var.is_bitfield};
@@ -580,22 +595,16 @@ struct CodegenContext : NodeErrorHandler {
       FuncParamList list = call.parameters();
       std::string params_str;
       if (sym.fn_type == SymbolFunction::MEMBER && !preceded_by_dot) {
-        params_str += "this_";
-
         const SymbolFunction *method = sym.as_function();
         const SymbolFunction *scope_fn = scope.parent_function();
         if (scope_fn && scope_fn->fn_type == SymbolFunction::MEMBER) {
-          const SymbolClass *caller_class = scope_fn->parent_class();
-          const SymbolClass *callee_class = method->parent_class();
-          if (callee_class->size == 0) {
-            /* Call constructor for empty classes. */
-            params_str = callee_class->identifier + "_ctor_()";
-          }
-          else if (caller_class != callee_class) {
-            /* We need to figure out what inheritance path this function is visible in. */
-            params_str += caller_class->get_path_to_base_class(*callee_class);
-          }
+          params_str += this_identifier_override(
+              scope_fn->parent_class(), method->parent_class(), ctx.this_identifier);
         }
+        else {
+          params_str += ctx.this_identifier;
+        }
+
         if (!sym.arg_types.empty()) {
           params_str += ", ";
         }
@@ -952,13 +961,13 @@ struct CodegenContext : NodeErrorHandler {
 
     if (is_graphic) {
       Expr vert_fn = params.child_first();
-      if (!vert_fn.is_valid() || vert_fn.child_count() != 1) {
+      IdQualified vert_id = LocalVar(vert_fn.child_first()).identifier();
+      if (!vert_fn.is_valid() || vert_fn.child_count() != 1 || !vert_id.is_valid()) {
         error(params, Diag::ExpectedVertexShaderEntryPoint);
         return;
       }
       /* Resolve vertex function. */
-      auto &fn =
-          scope.lookup_function(table, LocalVar(vert_fn.child_first()).identifier()).unwrap(this);
+      auto &fn = scope.lookup_function(table, vert_id).unwrap(this);
       if (fn.entry_point_type != SymbolFunction::EntryPointType::VERT) {
         error(vert_fn, Diag::ExpectedVertexShaderEntryPoint);
         return;
@@ -968,13 +977,13 @@ struct CodegenContext : NodeErrorHandler {
       match_if(',');
 
       Expr frag_fn = vert_fn.next();
-      if (!frag_fn.is_valid() || frag_fn.child_count() != 1) {
+      IdQualified frag_id = LocalVar(frag_fn.child_first()).identifier();
+      if (!frag_fn.is_valid() || frag_fn.child_count() != 1 || !frag_id.is_valid()) {
         error(frag_fn, Diag::ExpectedFragmentShaderEntryPoint);
         return;
       }
       /* Resolve fragment function. */
-      auto &fn2 =
-          scope.lookup_function(table, LocalVar(frag_fn.child_first()).identifier()).unwrap(this);
+      auto &fn2 = scope.lookup_function(table, frag_id).unwrap(this);
       if (fn2.entry_point_type != SymbolFunction::EntryPointType::FRAG) {
         error(frag_fn, Diag::ExpectedFragmentShaderEntryPoint);
         return;
@@ -987,13 +996,13 @@ struct CodegenContext : NodeErrorHandler {
     }
     else {
       Expr comp_fn = params.child_first();
-      if (!comp_fn.is_valid() || comp_fn.child_count() != 1) {
+      IdQualified comp_id = LocalVar(comp_fn.child_first()).identifier();
+      if (!comp_fn.is_valid() || comp_fn.child_count() != 1 || !comp_id.is_valid()) {
         error(comp_fn, Diag::ExpectedComputeShaderEntryPoint);
         return;
       }
       /* Resolve compute function. */
-      auto &fn =
-          scope.lookup_function(table, LocalVar(comp_fn.child_first()).identifier()).unwrap(this);
+      auto &fn = scope.lookup_function(table, comp_id).unwrap(this);
       if (fn.entry_point_type != SymbolFunction::EntryPointType::COMP) {
         error(comp_fn, Diag::ExpectedComputeShaderEntryPoint);
         return;
@@ -1513,7 +1522,6 @@ struct CodegenContext : NodeErrorHandler {
         builder.ss << union_getter(cls, *var) + "\n";
         builder.ss << union_setter(cls, *var) + "\n";
       }
-      return;
     }
 
     if (cls.is_crtp) {
@@ -1528,7 +1536,30 @@ struct CodegenContext : NodeErrorHandler {
     }
 
     /* Member functions. */
+    class_and_crtp_functions_prototypes(body, cls);
+    class_and_crtp_functions_decl(body, cls);
+  }
 
+  /* Call `fn` with the body and symbol of each class nested in `cls`, including anonymous ones. */
+  template<typename FnT>
+  void foreach_nested_class(LocalScope body, SymbolClass &cls, const FnT &fn)
+  {
+    int class_id = 0;
+    for (ClassDecl decl : body.children_of_type<ClassDecl>()) {
+      /* Enums count, the identifiers of anonymous classes are based on the declaration index. */
+      const int nested_id = class_id++;
+      if (decl.is_enum()) {
+        continue;
+      }
+      SymbolClass &nested = lookup_class(decl.identifier(), cls, nested_id);
+      if (!nested.is_error) {
+        fn(decl.body(), nested);
+      }
+    }
+  }
+
+  void class_and_crtp_functions_prototypes(LocalScope body, SymbolClass &cls)
+  {
     for (auto [id, base] : cls.base_classes) {
       if (base->is_crtp) {
         ClassDecl decl = base->template_data->decl.decl();
@@ -1537,7 +1568,10 @@ struct CodegenContext : NodeErrorHandler {
       }
     }
     class_functions_prototypes(body, cls);
+  }
 
+  void class_and_crtp_functions_decl(LocalScope body, SymbolClass &cls)
+  {
     for (auto [id, base] : cls.base_classes) {
       if (base->is_crtp) {
         ClassDecl decl = base->template_data->decl.decl();
@@ -1550,13 +1584,12 @@ struct CodegenContext : NodeErrorHandler {
 
   void class_functions_prototypes(LocalScope body, SymbolClass &cls)
   {
-    /* Nested classes. */
-    for (auto decl : body.children_of_type<ClassDecl>()) {
-      /* Don't process anonymous classes. */
-      if (decl.identifier().is_valid()) {
-        SymbolClass &nested = cls.lookup_class(table, decl.identifier()).unwrap(this);
-        class_functions_prototypes(decl.body(), nested);
-      }
+    foreach_nested_class(body, cls, [&](LocalScope nested_body, SymbolClass &nested) {
+      class_and_crtp_functions_prototypes(nested_body, nested);
+    });
+
+    if (cls.is_anonymous) {
+      return;
     }
 
     if (!body.child_first(NodeType::FuncDecl).is_valid() &&
@@ -1581,13 +1614,12 @@ struct CodegenContext : NodeErrorHandler {
 
   void class_functions_decl(LocalScope body, SymbolClass &cls)
   {
-    /* Nested classes. */
-    for (auto decl : body.children_of_type<ClassDecl>()) {
-      /* Don't process anonymous classes. */
-      if (decl.identifier().is_valid()) {
-        SymbolClass &nested = cls.lookup_class(table, decl.identifier()).unwrap(this);
-        class_functions_decl(decl.body(), nested);
-      }
+    foreach_nested_class(body, cls, [&](LocalScope nested_body, SymbolClass &nested) {
+      class_and_crtp_functions_decl(nested_body, nested);
+    });
+
+    if (cls.is_anonymous) {
+      return;
     }
 
     /* Emit function members. */
@@ -1951,12 +1983,18 @@ struct CodegenContext : NodeErrorHandler {
       if (member.array_dimensions > 0) {
         error(member.loc.tok, Diag::UnionArrayUnsupported);
       }
+      if (member_type.is_matrix()) {
+        error(member.loc.tok, Diag::UnionMatrixUnsupported);
+      }
       string to_var = "this_." +
                       union_data_access(member.offset, member_type.size, union_type.size);
       fn_body += "  " + to_var + " = " + member_to_float(member.type, "v") + ";\n";
     }
     else {
       for (const auto &var : member_type.get_all_members_flat().unwrap(this)) {
+        if (var.type->is_matrix()) {
+          error(member.loc.tok, Diag::UnionMatrixUnsupported);
+        }
         string to_var = "this_." +
                         union_data_access(var.absolute_offset, var.type->size, union_type.size);
         string access = "v." + var.path;
@@ -2179,13 +2217,26 @@ struct CodegenContext : NodeErrorHandler {
       return {nullptr, {}};
     }
 
-    if (fn.is_virtual && (fn.is_overridden() || fn.is_pure_virtual)) {
+    /* A qualified call like `A::f()` is not virtual, and inlining emits the body of `A::f`. */
+    const bool is_qualified = call.identifier().has_namespace();
+    if (fn.is_virtual && ((fn.is_overridden() && !is_qualified) || fn.is_pure_virtual)) {
       error(call, Diag::InvalidVirtualFunctionCall, fn.original);
+    }
+    else if (!fn.decl.is_valid()) {
+      error(call, Diag::InliningNoDefinition, fn.original);
+    }
+
+    /* There is no body to inline. Errors are only reported after code generation finished. */
+    if (!fn.decl.is_valid()) {
+      return {nullptr, {}};
     }
     return {&fn, call};
   }
 
   vector<SymbolFunction *> inlining_stack;
+  /* Expression for the object of the member function being emitted. Differs from `this_` when
+   * inlining the method of a base class. */
+  string this_identifier = "this_";
 
   string inline_function(SymbolFunction *fn, FuncCall call, const SymbolScope &scope)
   {
@@ -2211,8 +2262,20 @@ struct CodegenContext : NodeErrorHandler {
       builder.ss << fn->return_type->identifier << " " << ret_val << ";\n";
     }
 
+    /* IMPORTANT: We only emit the `do {} while(false)` if inlined function has a return statement
+     * otherwise it can increase compile time drastically (see #166511). */
+    bool has_return_stmt = false;
+    for ([[maybe_unused]] auto stmt : fn->decl.descendants_of_type<ReturnStmt>()) {
+      has_return_stmt = true;
+      break;
+    }
+
     /* Create local scope. */
-    builder.ss << "do {\n";
+
+    if (has_return_stmt) {
+      builder.ss << "do ";
+    }
+    builder.ss << "{\n";
     jump_to(fn->decl.front());
 
     /* Declare argument copies. */
@@ -2249,10 +2312,35 @@ struct CodegenContext : NodeErrorHandler {
     }
     builder.ss << "\n";
 
+    /* Access members of a base class method through the base class member. */
+    const string original_this_identifier = this_identifier;
+    const SymbolFunction *caller_fn = scope.parent_function();
+    const bool preceded_by_dot = call.prev().back() == '.' ||
+                                 call.prev().type() == NodeType::OpDeref;
+    if (fn->fn_type == SymbolFunction::MEMBER && !preceded_by_dot && caller_fn &&
+        caller_fn->fn_type == SymbolFunction::MEMBER)
+    {
+      this_identifier = this_identifier_override(
+          caller_fn->parent_class(), fn->parent_class(), this_identifier);
+
+      if (auto it = fn->variables.find("this_"); it != fn->variables.end()) {
+        SymbolVariable *var = it->second.second;
+        original_identifiers.emplace_back(var, var->identifier);
+        var->identifier = this_identifier;
+      }
+    }
+
     local_scope(fn->decl.body(), *fn);
 
-    /* Create argument assignments. */
-    builder.ss << "} while (false);\n";
+    this_identifier = original_this_identifier;
+
+    /* Close the local scope. */
+    if (has_return_stmt) {
+      builder.ss << "} while (false);\n";
+    }
+    else {
+      builder.ss << "}\n";
+    }
 
     inlining_stack.pop_back();
 
@@ -2286,6 +2374,9 @@ struct CodegenContext : NodeErrorHandler {
       else if (id == "metal_max_total_threads_per_threadgroup") {
         create_info_decl += "MTL_MAX_TOTAL_THREADS_PER_THREADGROUP" +
                             string(attr.parameters().str()) + "\n";
+      }
+      else if (id == "no_fast_math") {
+        create_info_decl += "NO_FAST_MATH()\n";
       }
     }
 

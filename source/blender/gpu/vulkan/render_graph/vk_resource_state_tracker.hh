@@ -66,9 +66,9 @@ ENUM_OPERATORS(VKResourceType);
  * State being tracked for a resource.
  */
 struct VKResourceBarrierState {
-  /** Last used access flags. Will be reset by the last write. Reads will accumulate flags. */
+  /** Last used access flags. */
   VkAccessFlags vk_access = VK_ACCESS_NONE;
-  /* Last known pipeline stage. Will be reset by the last write. Reads will accumulate flags. */
+  /* Last known pipeline stage. */
   VkPipelineStageFlags vk_pipeline_stages = VK_PIPELINE_STAGE_NONE;
   /** Last known image layout of an image resource. */
   VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -183,6 +183,14 @@ class VKResourceStateTracker {
    * - Device instance isn't accessible in test cases.
    */
   Mutex mutex;
+
+  /**
+   * Does the device support #VK_KHR_dynamic_rendering_local_read?
+   *
+   * The tracked image layout depends on it, so it is stored here instead of on the device. That
+   * keeps the render graph usable without an initialized device (unit tests).
+   */
+  bool use_dynamic_rendering_local_read = false;
 
   /**
    * Register a buffer resource.
@@ -359,8 +367,6 @@ class VKResourceStateTracker {
     ResourceHandle handle = image_resources_.lookup(vk_image);
     return {.handle = handle, .stamp = resources_[handle].stamp};
   }
-
-  bool use_dynamic_rendering_local_read = true;
 
   void debug_print() const;
 

@@ -23,6 +23,7 @@
 #    endif
 #  endif
 
+#  include "kernel/device/gpu/block_sizes.h"
 #  include "kernel/device/oneapi/globals.h"
 #  include "kernel/device/oneapi/kernel.h"
 
@@ -120,22 +121,8 @@ OneapiDevice::OneapiDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
     LOG_INFO << "oneAPI will use hardware ray tracing for intersection acceleration.";
   }
 
-  size_t globals_segment_size;
-  is_finished_ok = kernel_globals_size(globals_segment_size);
-  if (is_finished_ok == false) {
-    set_error("oneAPI constant memory initialization got runtime exception \"" +
-              oneapi_error_string_ + "\"");
-  }
-  else {
-    LOG_TRACE << "Successfully created global/constant memory segment (kernel globals object)";
-  }
-
-  kg_memory_ = usm_aligned_alloc_host(device_queue_, globals_segment_size, 16);
-  usm_memset(device_queue_, kg_memory_, 0, globals_segment_size);
-
-  kg_memory_device_ = usm_alloc_device(device_queue_, globals_segment_size);
-
-  kg_memory_size_ = globals_segment_size;
+  kernel_params_ = usm_alloc_device(device_queue_, sizeof(KernelParamsOneAPI));
+  usm_memset(device_queue_, kernel_params_, 0, sizeof(KernelParamsOneAPI));
 
   max_memory_on_device_ = get_memcapacity();
   init_host_memory();
@@ -160,10 +147,7 @@ OneapiDevice::~OneapiDevice()
 #  endif
 
   image_info.free();
-  usm_free(device_queue_, kg_memory_);
-  usm_free(device_queue_, kg_memory_device_);
-
-  const_mem_map_.clear();
+  usm_free(device_queue_, kernel_params_);
 
   if (device_queue_) {
     free_queue(device_queue_);
@@ -285,12 +269,28 @@ bool OneapiDevice::load_kernels(const uint64_t requested_features)
   }
 
   is_finished_ok = oneapi_load_kernels(
-      device_queue_, (const unsigned int)requested_features, use_hardware_raytracing);
+      device_queue_, requested_features, use_hardware_raytracing, kernel_infos_);
   if (is_finished_ok == false) {
     set_error("oneAPI kernels loading: got a runtime exception \"" + oneapi_error_string_ + "\"");
   }
   else {
     LOG_INFO << "Kernels loading (compilation) has been done for \"" << info.description << "\"";
+    if (LOG_IS_ON(LOG_LEVEL_DEBUG)) {
+      for (int i = 0; i < DEVICE_KERNEL_NUM; i++) {
+        const DeviceKernel kernel = DeviceKernel(i);
+        const OneAPIKernelInfo &kernel_info = kernel_infos_[kernel];
+        if (kernel_info.max_sub_group_size == 0) {
+          continue;
+        }
+        size_t global_size = 0;
+        size_t local_size = 0;
+        get_adjusted_global_and_local_sizes(device_queue_, kernel, global_size, local_size);
+        LOG_DEBUG << "Kernel " << device_kernel_as_string(kernel) << ": SIMD"
+                  << kernel_info.max_sub_group_size << ", max work-group size "
+                  << kernel_info.max_work_group_size << ", concurrent work-groups per EU "
+                  << kernel_info.max_num_work_groups << ", using work-group size " << local_size;
+      }
+    }
   }
 
   if (is_finished_ok) {
@@ -404,9 +404,9 @@ int OneapiDevice::scene_max_shaders()
   return scene_max_shaders_;
 }
 
-void *OneapiDevice::kernel_globals_device_pointer()
+void *OneapiDevice::kernel_params_device_pointer()
 {
-  return kg_memory_device_;
+  return kernel_params_;
 }
 
 void *OneapiDevice::host_alloc(const MemoryType type, const size_t size)
@@ -641,27 +641,20 @@ void OneapiDevice::const_copy_to(const char *name, void *host, const size_t size
 #  endif
   }
 
-  ConstMemMap::iterator i = const_mem_map_.find(name);
-  device_vector<uchar> *data;
-
-  if (i == const_mem_map_.end()) {
-    unique_ptr<device_vector<uchar>> data_ptr = make_unique<device_vector<uchar>>(
-        this, name, MEM_READ_ONLY);
-    data_ptr->alloc(size);
-    data = data_ptr.get();
-    const_mem_map_.insert(ConstMemMap::value_type(name, std::move(data_ptr)));
-  }
-  else {
-    data = i->second.get();
-  }
-
-  assert(data->memory_size() <= size);
-  memcpy(data->data(), host, size);
-  data->copy_to_device();
-
-  set_global_memory(device_queue_, kg_memory_, name, (void *)data->device_pointer);
-
-  usm_memcpy(device_queue_, kg_memory_device_, kg_memory_, kg_memory_size_);
+  /* Update data storage pointers in launch parameters. */
+#  define KERNEL_DATA_ARRAY(data_type, data_name) \
+    if (strcmp(name, #data_name) == 0) { \
+      assert(size <= sizeof(KernelParamsOneAPI::data_name)); \
+      usm_memcpy(device_queue_, \
+                 static_cast<char *>(kernel_params_) + offsetof(KernelParamsOneAPI, data_name), \
+                 host, \
+                 size); \
+      return; \
+    }
+  KERNEL_DATA_ARRAY(KernelData, data)
+  KERNEL_DATA_ARRAY(IntegratorStateGPU, integrator_state)
+#  include "kernel/data_arrays.h"
+#  undef KERNEL_DATA_ARRAY
 }
 
 void OneapiDevice::global_alloc(device_memory &mem)
@@ -674,9 +667,7 @@ void OneapiDevice::global_alloc(device_memory &mem)
   generic_alloc(mem);
   generic_copy_to(mem);
 
-  set_global_memory(device_queue_, kg_memory_, mem.global_name(), (void *)mem.device_pointer);
-
-  usm_memcpy(device_queue_, kg_memory_device_, kg_memory_, kg_memory_size_);
+  const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(mem.device_pointer));
 }
 
 void OneapiDevice::global_copy_to(device_memory &mem)
@@ -1257,52 +1248,6 @@ bool OneapiDevice::queue_synchronize(SyclQueue *queue_)
   }
 }
 
-bool OneapiDevice::kernel_globals_size(size_t &kernel_global_size)
-{
-  kernel_global_size = sizeof(KernelGlobalsGPU);
-
-  return true;
-}
-
-void OneapiDevice::set_global_memory(SyclQueue *queue_,
-                                     void *kernel_globals,
-                                     const char *memory_name,
-                                     void *memory_device_pointer)
-{
-  assert(queue_);
-  assert(kernel_globals);
-  assert(memory_name);
-  assert(memory_device_pointer);
-  KernelGlobalsGPU *globals = (KernelGlobalsGPU *)kernel_globals;
-  OneapiDevice::check_usm(queue_, memory_device_pointer, true);
-  OneapiDevice::check_usm(queue_, kernel_globals, true);
-
-  std::string matched_name(memory_name);
-
-/* This macro will change global ptr of KernelGlobals via name matching. */
-#  define KERNEL_DATA_ARRAY(type, name) \
-    else if (#name == matched_name) \
-    { \
-      globals->__##name = (type *)memory_device_pointer; \
-      return; \
-    }
-  if (false) {
-  }
-  else if ("integrator_state" == matched_name) {
-    globals->integrator_state = (IntegratorStateGPU *)memory_device_pointer;
-    return;
-  }
-  KERNEL_DATA_ARRAY(KernelData, data)
-#  include "kernel/data_arrays.h"
-  else
-  {
-    std::cerr << "Can't found global/constant memory with name \"" << matched_name << "\"!"
-              << std::endl;
-    assert(false);
-  }
-#  undef KERNEL_DATA_ARRAY
-}
-
 bool OneapiDevice::enqueue_kernel(KernelContext *kernel_context,
                                   const int kernel,
                                   const size_t global_size,
@@ -1318,6 +1263,52 @@ bool OneapiDevice::enqueue_kernel(KernelContext *kernel_context,
                                args);
 }
 
+/* Number of sub-groups to put in each work-group of a kernel, at most max_sub_groups.
+ *
+ * All sub-groups of a work-group run on the same Xe-core. An Xe-core can run
+ * sub_groups_per_xe_core sub-groups of the kernel, depending on its register usage, and only as
+ * many work-groups as fit in its local memory. Kernels that need a fixed number of work-groups
+ * pass it as num_work_groups, others pass zero.
+ *
+ * Among the sizes that keep the most sub-groups running on the device, the largest one is used.
+ * Without memory or work-group limits, that is the largest number of sub-groups that divides
+ * sub_groups_per_xe_core, so that work-groups fill Xe-cores without leaving thread slots unused.
+ */
+static size_t oneapi_sub_groups_per_work_group(const size_t max_sub_groups,
+                                               const size_t sub_groups_per_xe_core,
+                                               const size_t num_xe_cores,
+                                               const size_t local_mem_per_xe_core,
+                                               const size_t local_mem_per_work_group,
+                                               const size_t num_work_groups)
+{
+  /* Local memory is allocated per work-group in steps that are at most the next power of two of
+   * the requested size, so rounding up to it never overestimates the number of work-groups. */
+  size_t max_work_groups_per_xe_core = sub_groups_per_xe_core;
+  if (local_mem_per_work_group > 0) {
+    size_t allocated_local_mem = std::max(local_mem_per_work_group, size_t(1024));
+    if (!is_power_of_two(allocated_local_mem)) {
+      allocated_local_mem = next_power_of_two(uint32_t(allocated_local_mem));
+    }
+    max_work_groups_per_xe_core = std::max(local_mem_per_xe_core / allocated_local_mem, size_t(1));
+  }
+
+  size_t best_sub_groups = 1;
+  size_t best_running_sub_groups = 0;
+  for (size_t sub_groups = max_sub_groups; sub_groups > 0; sub_groups--) {
+    const size_t work_groups_per_xe_core = std::min(sub_groups_per_xe_core / sub_groups,
+                                                    max_work_groups_per_xe_core);
+    size_t running_work_groups = work_groups_per_xe_core * num_xe_cores;
+    if (num_work_groups > 0) {
+      running_work_groups = std::min(running_work_groups, num_work_groups);
+    }
+    if (running_work_groups * sub_groups > best_running_sub_groups) {
+      best_running_sub_groups = running_work_groups * sub_groups;
+      best_sub_groups = sub_groups;
+    }
+  }
+  return best_sub_groups;
+}
+
 void OneapiDevice::get_adjusted_global_and_local_sizes(SyclQueue *queue,
                                                        const DeviceKernel kernel,
                                                        size_t &kernel_global_size,
@@ -1327,18 +1318,17 @@ void OneapiDevice::get_adjusted_global_and_local_sizes(SyclQueue *queue,
   static const size_t preferred_work_group_size_intersect = 128;
   static const size_t preferred_work_group_size_shading = 256;
   static const size_t preferred_work_group_size_shading_simd8 = 64;
-  /* Shader evaluation kernels seems to use some amount of shared memory, so better
-   * to avoid usage of maximum work group sizes for them. */
-  static const size_t preferred_work_group_size_shader_evaluation = 256;
-  /* NOTE(@nsirgien): 1024 currently may lead to issues with cryptomatte kernels, so
-   * for now their work-group size is restricted to 512. */
-  static const size_t preferred_work_group_size_cryptomatte = 512;
   static const size_t preferred_work_group_size_default = 1024;
-
-  const sycl::device &device = reinterpret_cast<sycl::queue *>(queue)->get_device();
-  const size_t max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
-
   size_t preferred_work_group_size = 0;
+
+  const OneAPIKernelInfo &kernel_info = kernel_infos_[kernel];
+  const sycl::device &device = reinterpret_cast<sycl::queue *>(queue)->get_device();
+
+  /* Work-groups needed by kernels processing one partition per work-group, zero otherwise. */
+  size_t num_work_groups = 0;
+  /* Local memory that each work-group of the kernel allocates when enqueued. */
+  size_t local_mem_size = 0;
+
   switch (kernel) {
     case DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA:
     case DEVICE_KERNEL_INTEGRATOR_INIT_FROM_BAKE:
@@ -1359,7 +1349,11 @@ void OneapiDevice::get_adjusted_global_and_local_sizes(SyclQueue *queue,
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW:
-    case DEVICE_KERNEL_INTEGRATOR_SHADE_DEDICATED_LIGHT: {
+    case DEVICE_KERNEL_INTEGRATOR_SHADE_DEDICATED_LIGHT:
+    case DEVICE_KERNEL_SHADER_EVAL_DISPLACE:
+    case DEVICE_KERNEL_SHADER_EVAL_BACKGROUND:
+    case DEVICE_KERNEL_SHADER_EVAL_CURVE_SHADOW_TRANSPARENCY:
+    case DEVICE_KERNEL_SHADER_EVAL_VOLUME_DENSITY: {
       const bool device_is_simd8 =
           (device.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
            device.get_info<sycl::ext::intel::info::device::gpu_eu_simd_width>() == 8);
@@ -1367,38 +1361,85 @@ void OneapiDevice::get_adjusted_global_and_local_sizes(SyclQueue *queue,
                                                       preferred_work_group_size_shading;
     } break;
 
-    case DEVICE_KERNEL_CRYPTOMATTE_POSTPROCESS:
-      preferred_work_group_size = preferred_work_group_size_cryptomatte;
+    case DEVICE_KERNEL_INTEGRATOR_QUEUED_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_QUEUED_SHADOW_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_ACTIVE_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_TERMINATED_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_TERMINATED_SHADOW_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_COMPACT_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_COMPACT_SHADOW_PATHS_ARRAY:
+      preferred_work_group_size = GPU_PARALLEL_ACTIVE_INDEX_DEFAULT_BLOCK_SIZE;
       break;
 
-    case DEVICE_KERNEL_SHADER_EVAL_DISPLACE:
-    case DEVICE_KERNEL_SHADER_EVAL_BACKGROUND:
-    case DEVICE_KERNEL_SHADER_EVAL_CURVE_SHADOW_TRANSPARENCY:
-    case DEVICE_KERNEL_SHADER_EVAL_VOLUME_DENSITY:
-      preferred_work_group_size = preferred_work_group_size_shader_evaluation;
+    case DEVICE_KERNEL_INTEGRATOR_SORTED_PATHS_ARRAY:
+    case DEVICE_KERNEL_INTEGRATOR_COMPACT_STATES:
+    case DEVICE_KERNEL_INTEGRATOR_COMPACT_SHADOW_STATES:
+      preferred_work_group_size = GPU_PARALLEL_SORTED_INDEX_DEFAULT_BLOCK_SIZE;
+      break;
+
+    case DEVICE_KERNEL_INTEGRATOR_SORT_BUCKET_PASS:
+    case DEVICE_KERNEL_INTEGRATOR_SORT_WRITE_PASS:
+      /* These kernels process one partition per work-group, get enqueued with
+       * GPU_PARALLEL_SORT_BLOCK_SIZE work-items per partition, and use local memory for one
+       * counter per shader. They work with any work-group size, but need this exact number of
+       * work-groups. */
+      assert(kernel_global_size % GPU_PARALLEL_SORT_BLOCK_SIZE == 0);
+      preferred_work_group_size = GPU_PARALLEL_SORT_BLOCK_SIZE;
+      num_work_groups = kernel_global_size / GPU_PARALLEL_SORT_BLOCK_SIZE;
+      local_mem_size = scene_max_shaders_ * sizeof(int);
+      break;
+
+    case DEVICE_KERNEL_PREFIX_SUM:
+      preferred_work_group_size = GPU_PARALLEL_PREFIX_SUM_DEFAULT_BLOCK_SIZE;
+      num_work_groups = 1;
       break;
 
     default:
-      /* Do nothing and keep initial zero value. */
+      preferred_work_group_size = preferred_work_group_size_default;
       break;
   }
 
-  /* Such order of logic allow us to override Blender default values, if needed,
-   * yet respect them otherwise. */
-  if (preferred_work_group_size == 0) {
-    preferred_work_group_size = oneapi_suggested_gpu_kernel_size((::DeviceKernel)kernel);
-  }
-
-  /* If there is no recommendation, then use manual default value. */
-  if (preferred_work_group_size == 0) {
-    preferred_work_group_size = preferred_work_group_size_default;
+  /* The maximum work-group size of a kernel depends on its SIMD width and register usage, and can
+   * be lower than the maximum of the device. */
+  size_t max_work_group_size = kernel_info.max_work_group_size;
+  if (max_work_group_size == 0) {
+    max_work_group_size = device.get_info<sycl::info::device::max_work_group_size>();
   }
 
   kernel_local_size = std::min(max_work_group_size, preferred_work_group_size);
 
-  /* NOTE(@nsirgien): As for now non-uniform work-groups don't work on most oneAPI devices,
-   * we extend work size to fit uniformity requirements. */
-  kernel_global_size = round_up(kernel_global_size, kernel_local_size);
+  /* Use fewer sub-groups per work-group when that keeps more of them running. Compute units are
+   * Xe-cores, whose local memory size is the one of the device. The occupancy query uses
+   * work-groups of one sub-group per EU of an Xe-core, and devices without support for it
+   * return 1. */
+  const size_t simd_width = kernel_info.max_sub_group_size;
+  const size_t num_xe_cores =
+      device.get_info<sycl::ext::oneapi::info::device::num_compute_units>();
+  const size_t eus_per_xe_core =
+      device.has(sycl::aspect::ext_intel_eus_per_xe_core) ?
+          device.get_info<sycl::ext::intel::info::device::eus_per_xe_core>() :
+          0;
+  if (simd_width > 0 && num_xe_cores > 0 && eus_per_xe_core > 0 &&
+      kernel_info.max_num_work_groups >= num_xe_cores)
+  {
+    const size_t sub_groups = oneapi_sub_groups_per_work_group(
+        std::max(kernel_local_size / simd_width, size_t(1)),
+        kernel_info.max_num_work_groups / num_xe_cores * eus_per_xe_core,
+        num_xe_cores,
+        get_local_mem_size(),
+        local_mem_size,
+        num_work_groups);
+    kernel_local_size = sub_groups * simd_width;
+  }
+
+  if (num_work_groups > 0) {
+    kernel_global_size = num_work_groups * kernel_local_size;
+  }
+  else {
+    /* NOTE(@nsirgien): As for now non-uniform work-groups don't work on most oneAPI devices,
+     * we extend work size to fit uniformity requirements. */
+    kernel_global_size = round_up(kernel_global_size, kernel_local_size);
+  }
 
   assert(kernel_global_size % kernel_local_size == 0);
 }
@@ -1901,6 +1942,13 @@ int OneapiDevice::get_max_num_threads_per_multiprocessor()
   /* We'd want sycl::info::device::max_threads_per_compute_unit which doesn't exist yet.
    * max_work_group_size is the closest approximation but it can still be several times off. */
   return device.get_info<sycl::info::device::max_work_group_size>();
+}
+
+size_t OneapiDevice::get_local_mem_size()
+{
+  return reinterpret_cast<sycl::queue *>(device_queue_)
+      ->get_device()
+      .get_info<sycl::info::device::local_mem_size>();
 }
 
 CCL_NAMESPACE_END

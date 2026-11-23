@@ -164,7 +164,8 @@ static SeqResult do_compositor_effect(const RenderData *context,
   const int x = context->rectx;
   const int y = context->recty;
   SeqResult out;
-  out.image = IMB_allocImBuf(x, y, ImBufFlags::FloatData | ImBufFlags::UninitializedPixels);
+  out.image = IMB_allocImBuf(
+      x, y, ImBufFlags::FloatData | ImBufFlags::UninitializedPixels | ImBufFlags::PoolPixels);
   IMB_colormanagement_assign_float_colorspace(
       out.image, IMB_colormanagement_role_colorspace_name_get(COLOR_ROLE_SCENE_LINEAR));
 
@@ -209,12 +210,12 @@ static void init_compositor_effect(Strip *strip)
   strip->effectdata = data;
 }
 
-static void free_compositor_effect(Strip *strip, const bool /*do_id_user*/)
+static void free_compositor_effect(Strip *strip, const bool do_id_user)
 {
   if (strip->effectdata) {
     CompositorEffectVars *data = static_cast<CompositorEffectVars *>(strip->effectdata);
     if (data->system_properties != nullptr) {
-      IDP_FreeProperty_ex(data->system_properties, false);
+      IDP_FreeProperty_ex(data->system_properties, do_id_user);
     }
     MEM_delete(data);
     strip->effectdata = nullptr;

@@ -42,6 +42,7 @@ struct Layout;
 struct Block;
 }  // namespace ui
 
+class ResourceScope;
 struct ARegion;
 struct ARegionType;
 struct AssetShelfType;
@@ -96,6 +97,15 @@ struct wmSpaceTypeListenerParams {
   const wmNotifier *notifier;
   const Scene *scene;
   const Main *bmain;
+};
+
+struct ScreenBlendWriteData {
+  BlendWriter *writer;
+  /**
+   * Any allocation of data that's written to DNA has to happen via #scope. This ensures that the
+   * pointers are unique within the scope of the owning ID (the bScreen).
+   */
+  ResourceScope &scope;
 };
 
 struct SpaceType {
@@ -183,7 +193,7 @@ struct SpaceType {
   /**
    * Write all structs that should be saved in a .blend file.
    */
-  void (*blend_write)(BlendWriter *writer, SpaceLink *space_link);
+  void (*blend_write)(ScreenBlendWriteData &screen_writer, SpaceLink *space_link);
 
   /** Region type definitions. */
   ListBaseT<ARegionType> regiontypes;
@@ -682,7 +692,7 @@ struct ARegionRuntime {
   short do_draw = 0;
 
   /** Private, cached notifier events. */
-  short do_draw_paintcursor;
+  short do_draw_cursor_overlay;
 
   /** Tag for IME cursor position refresh on next draw. */
   bool do_ime = false;
@@ -783,6 +793,10 @@ enum class MenuTypeFlag {
    * Automatically start searching in the menu when pressing a key.
    */
   SearchOnKeyPress = (1 << 1),
+  /**
+   * Don't sort menu items alphabetically when flag is set.
+   */
+  KeepOrder = (1 << 2),
 };
 ENUM_OPERATORS(MenuTypeFlag)
 
@@ -1104,7 +1118,13 @@ void BKE_screen_header_alignment_reset(bScreen *screen);
 void BKE_screen_view3d_shading_blend_write(BlendWriter *writer, View3DShading *shading);
 void BKE_screen_view3d_shading_blend_read_data(BlendDataReader *reader, View3DShading *shading);
 
-void BKE_screen_area_map_blend_write(BlendWriter *writer, ScrAreaMap *area_map);
+/**
+ * \param scope: Must outlive the writing of the whole owning ID, as pointers allocated in it have
+ * to be unique within that ID (e.g. all global area maps of a window-manager share one scope).
+ */
+void BKE_screen_area_map_blend_write(BlendWriter *writer,
+                                     ResourceScope &scope,
+                                     ScrAreaMap *area_map);
 /**
  * \return false on error.
  */

@@ -291,7 +291,10 @@ static void image_refresh(const bContext *C, ScrArea *area)
   Image *ima;
 
   ima = ED_space_image(sima);
-  BKE_image_user_frame_calc(ima, &sima->iuser, scene->r.cfra);
+  /* Match #BKE_image_editors_update_frame, which keeps the stored frame without Auto Refresh. */
+  if (sima->iuser.flag & (IMA_ANIM_ALWAYS | IMA_NEED_FRAME_RECALC)) {
+    BKE_image_user_frame_calc(ima, &sima->iuser, scene->r.cfra);
+  }
 }
 
 static void image_listener(const wmSpaceTypeListenerParams *params)
@@ -1371,9 +1374,9 @@ static void image_space_blend_read_data(BlendDataReader * /*reader*/, SpaceLink 
 #endif
 }
 
-static void image_space_blend_write(BlendWriter *writer, SpaceLink *sl)
+static void image_space_blend_write(ScreenBlendWriteData &screen_writer, SpaceLink *sl)
 {
-  writer->write_struct_cast<SpaceImage>(sl);
+  screen_writer.writer->write_struct_cast<SpaceImage>(sl);
 }
 
 /**************************** spacetype *****************************/

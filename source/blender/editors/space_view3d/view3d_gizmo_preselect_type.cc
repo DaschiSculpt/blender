@@ -63,7 +63,8 @@ namespace blender {
  * outside the scope of what gizmos are meant to be used for, so keep this workaround localized
  * to this gizmo type unless this seems worth supporting for more typical use-cases.
  *
- * Longer term it may be better to use #wmPaintCursor instead of gizmos (as snapping preview does).
+ * Longer term it may be better to use #wmCursorOverlay instead of gizmos (as snapping preview
+ * does).
  */
 static bool gizmo_preselect_poll_for_draw(const bContext *C, wmGizmo *gz)
 {
@@ -222,7 +223,7 @@ static int gizmo_preselect_elem_test_select(bContext *C, wmGizmo *gz, const int 
 
   if (best.ele) {
     gz_ele->base_index = best.base_index;
-    bm = BKE_editmesh_bmesh_get_for_write(gz_ele->bases[gz_ele->base_index]->object);
+    bm = BKE_editmesh_bmesh_ensure(gz_ele->bases[gz_ele->base_index]->object);
     BM_mesh_elem_index_ensure(bm, best.ele->head.htype);
 
     if (best.ele->head.htype == BM_VERT) {
@@ -419,7 +420,7 @@ static int gizmo_preselect_edgering_test_select(bContext *C, wmGizmo *gz, const 
   BMesh *bm = nullptr;
   if (best.eed) {
     gz_ring->base_index = best.base_index;
-    bm = BKE_editmesh_bmesh_get_for_write(gz_ring->bases[gz_ring->base_index]->object);
+    bm = BKE_editmesh_bmesh_ensure(gz_ring->bases[gz_ring->base_index]->object);
     BM_mesh_elem_index_ensure(bm, BM_EDGE);
     gz_ring->edge_index = BM_elem_index_get(best.eed);
   }
@@ -554,7 +555,7 @@ void ED_view3d_gizmo_mesh_preselect_get_active(const bContext *C,
   *r_ele = nullptr;
 
   if (obedit) {
-    BMesh *bm = BKE_editmesh_bmesh_get_for_write(obedit);
+    BMesh *bm = BKE_editmesh_bmesh_ensure(obedit);
     PropertyRNA *prop;
 
     /* Ring select only defines edge, check properties exist first. */

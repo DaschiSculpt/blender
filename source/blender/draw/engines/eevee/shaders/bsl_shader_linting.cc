@@ -11,6 +11,7 @@
 #include "eevee_bxdf_lut_gen.bsl.hh"                 /* IWYU pragma: export */
 #include "eevee_bxdf_lut_lib.bsl.hh"                 /* IWYU pragma: export */
 #include "eevee_bxdf_microfacet.bsl.hh"              /* IWYU pragma: export */
+#include "eevee_bxdf_sheen.bsl.hh"                   /* IWYU pragma: export */
 #include "eevee_bxdf_types.bsl.hh"                   /* IWYU pragma: export */
 #include "eevee_camera_lib.bsl.hh"                   /* IWYU pragma: export */
 #include "eevee_closure.bsl.hh"                      /* IWYU pragma: export */
@@ -77,8 +78,8 @@
 #include "eevee_nodetree_vert_lib.bsl.hh"            /* IWYU pragma: export */
 #include "eevee_occupancy_convert.bsl.hh"            /* IWYU pragma: export */
 #include "eevee_occupancy_lib.bsl.hh"                /* IWYU pragma: export */
-#include "eevee_octahedron_lib.bsl.hh"               /* IWYU pragma: export */
 #include "eevee_pipeline.bsl.hh"                     /* IWYU pragma: export */
+#include "eevee_ray_data_lib.bsl.hh"                 /* IWYU pragma: export */
 #include "eevee_ray_denoise.bsl.hh"                  /* IWYU pragma: export */
 #include "eevee_ray_generate.bsl.hh"                 /* IWYU pragma: export */
 #include "eevee_ray_tile.bsl.hh"                     /* IWYU pragma: export */

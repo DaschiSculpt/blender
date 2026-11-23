@@ -352,6 +352,11 @@ add_blender_test(
 )
 
 add_blender_test(
+  script_pyapi_idprop_struct
+  --python ${CMAKE_CURRENT_LIST_DIR}/bl_pyapi_idprop_struct.py
+)
+
+add_blender_test(
   script_pyapi_prop
   --python ${CMAKE_CURRENT_LIST_DIR}/bl_pyapi_prop.py
 )
@@ -1811,10 +1816,30 @@ if(WITH_UI_TESTS)
     test_sculpt.mask_gestures
     test_sculpt.trim_gestures
     test_sculpt.primitive_tool_add
+    test_brush_stroke.spacing_on_press
+    # Disabled until #163212 lands, this test currently fails.
+    # test_brush_stroke.spacing_on_small_drag
+    test_brush_stroke.anchored
+    test_brush_stroke.dots
+    test_brush_stroke.drag_dot
+    test_brush_stroke.move_onto_mesh
+    test_brush_stroke.line
+    test_brush_stroke.airbrush
+    test_brush_stroke.smooth_stroke
     test_tools.sculpt_mode_toolbar
     test_mesh_edit_draw.view3d_mesh_edit_draw_modifiers
+    test_edit_mesh_select.view3d_mesh_edit_box_select_vertex_mode
+    test_edit_mesh_select.view3d_mesh_edit_box_select_occlusion
+    test_edit_mesh_select.view3d_mesh_edit_box_select_extend
+    test_edit_mesh_select.view3d_mesh_edit_box_select_face_mode
+    test_edit_mesh_select.view3d_mesh_edit_box_select_mixed_mode
+    test_edit_mesh_select.view3d_mesh_edit_select_pick_extend
+    test_edit_mesh_select.view3d_mesh_edit_select_pick_flushes
+    test_edit_mesh_select.view3d_mesh_edit_select_pick_active_element
     test_transform.view3d_mesh_edit_snap_to_self
     test_transform.view3d_mesh_edit_snap_to_self_shape_key
+    test_transform.view3d_mesh_edit_snap_skips_hidden
+    test_transform.view3d_mesh_edit_snap_skips_selection
     test_undo.compositor_make_group
     test_undo.text_editor_edit_mode_mix
     test_undo.text_editor_simple

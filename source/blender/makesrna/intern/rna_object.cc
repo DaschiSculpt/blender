@@ -484,7 +484,7 @@ static void rna_Object_active_shape_update(Main *bmain, Scene * /*scene*/, Point
 
         DEG_id_tag_update(&mesh->id, 0);
 
-        BKE_editmesh_looptris_and_normals_calc(em, BKE_editmesh_bmesh_get_for_write(mesh));
+        BKE_editmesh_looptris_and_normals_calc(em, BKE_editmesh_bmesh_ensure(mesh));
         break;
       }
       case OB_CURVES_LEGACY:
@@ -678,7 +678,9 @@ static bool rna_Object_parent_override_apply(Main *bmain,
   else {
     ob->parent = parent_src;
   }
-  RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  if (bmain) {
+    RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  }
   return true;
 }
 
@@ -724,7 +726,9 @@ static bool rna_Object_parent_type_override_apply(Main *bmain,
   }
 
   ob->partype = eObject_Partype(parent_type_src);
-  RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  if (bmain) {
+    RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  }
   return true;
 }
 
@@ -809,7 +813,9 @@ static bool rna_Object_parent_bone_override_apply(Main *bmain,
   }
 
   STRNCPY(ob->parsubstr, parent_bone_src);
-  RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  if (bmain) {
+    RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  }
   return true;
 }
 
@@ -1645,6 +1651,23 @@ static void rna_Object_constraints_remove(Object *object,
   WM_main_add_notifier(NC_OBJECT | ND_CONSTRAINT | NA_REMOVED, object);
 }
 
+static void rna_Object_constraints_remove_constraints(Object *object,
+                                                      Main *bmain,
+                                                      ReportList *reports,
+                                                      const int *indices_ptr,
+                                                      const int indices_num)
+{
+  ListBaseT<bConstraint> *constraints = &object->constraints;
+
+  if (!indices_ptr || indices_num == 0) {
+    ed::object::constraint_remove_all(bmain, object, constraints);
+    return;
+  }
+
+  Span<int> indices(indices_ptr, indices_num);
+  ed::object::constraint_remove(bmain, object, constraints, reports, indices);
+}
+
 static void rna_Object_constraints_clear(Object *object, Main *bmain)
 {
   BKE_constraints_free(&object->constraints);
@@ -1726,7 +1749,9 @@ bool rna_Object_constraints_override_apply(Main *bmain,
   BKE_constraint_unique_name(con_dst, &ob_dst->constraints);
 
   //  printf("%s: We inserted a constraint...\n", __func__);
-  RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  if (bmain) {
+    RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  }
   return true;
 }
 
@@ -1851,6 +1876,8 @@ bool rna_Object_modifiers_override_apply(Main *bmain,
      * `rna_CollisionSettings_dependency_update` does add the `eModifierType_Collision` singleton
      * modifier).
      *
+     * It can also happen if trying to add a ParticleSystem modifier without a Main currently.
+     *
      * Try to handle this by finding already existing one here. */
     const ModifierTypeInfo *mti = BKE_modifier_get_info(mod_src->type);
     if (mti->flags & eModifierTypeFlag_Single) {
@@ -1885,7 +1912,9 @@ bool rna_Object_modifiers_override_apply(Main *bmain,
   BLI_insertlinkafter(&ob_dst->modifiers, mod_anchor, mod_dst);
 
   //  printf("%s: We inserted a modifier '%s'...\n", __func__, mod_dst->name);
-  RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  if (bmain) {
+    RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
+  }
   return true;
 }
 
@@ -2281,10 +2310,11 @@ bool rna_Object_light_linking_override_apply(Main *bmain,
      * handle them here. */
   }
 
-  DEG_id_tag_update(&ob_dst->id, ID_RECALC_SHADING);
-
-  DEG_relations_tag_update(bmain);
-  WM_main_add_notifier(NC_OBJECT | ND_DRAW, &ob_dst->id);
+  if (bmain) {
+    DEG_id_tag_update_ex(bmain, &ob_dst->id, ID_RECALC_SHADING);
+    DEG_relations_tag_update(bmain);
+    WM_main_add_notifier(bmain, NC_OBJECT | ND_DRAW, &ob_dst->id);
+  }
   return true;
 }
 
@@ -2515,6 +2545,23 @@ static void rna_def_object_constraints(BlenderRNA *brna, PropertyRNA *cprop)
   parm = RNA_def_pointer(func, "constraint", "Constraint", "", "Removed constraint");
   RNA_def_parameter_flags(parm, PROP_NEVER_NULL, PARM_REQUIRED | PARM_RNAPTR);
   RNA_def_parameter_clear_flags(parm, PROP_THICK_WRAP, ParameterFlag(0));
+
+  func = RNA_def_function(srna, "remove_constraints", "rna_Object_constraints_remove_constraints");
+  RNA_def_function_ui_description(func,
+                                  "Remove multiple constraints from this object specified by "
+                                  "indices. If no indices are provided, remove all constraints.");
+  RNA_def_function_flag(func, FUNC_USE_MAIN | FUNC_USE_REPORTS);
+  parm = RNA_def_int_array(func,
+                           "indices",
+                           1,
+                           nullptr,
+                           INT_MIN,
+                           INT_MAX,
+                           "Indices",
+                           "The indices of the constraints to remove",
+                           0,
+                           INT_MAX);
+  RNA_def_parameter_flags(parm, PROP_DYNAMIC, ParameterFlag(0));
 
   func = RNA_def_function(srna, "clear", "rna_Object_constraints_clear");
   RNA_def_function_flag(func, FUNC_USE_MAIN);

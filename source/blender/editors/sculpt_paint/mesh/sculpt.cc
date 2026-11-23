@@ -1789,6 +1789,7 @@ static void restore_from_undo_step(const Depsgraph &depsgraph, const Sculpt &sd,
 {
   SculptSession &ss = *object.runtime->sculpt_session;
   const Brush *brush = BKE_paint_brush_for_read(&sd.paint);
+  bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
 
   switch (brush->sculpt_brush_type) {
     case SCULPT_BRUSH_TYPE_MASK:
@@ -1802,7 +1803,8 @@ static void restore_from_undo_step(const Depsgraph &depsgraph, const Sculpt &sd,
     case SCULPT_BRUSH_TYPE_DRAW_FACE_SETS:
       if (ss.cache->toggle_settings.alt_smooth) {
         restore_position_from_undo_step(depsgraph, object);
-        bke::pbvh::update_normals(depsgraph, object, *bke::object::pbvh_get(object));
+        bke::pbvh::update_normals(depsgraph, object, pbvh);
+        pbvh.update_bounds(depsgraph, object);
       }
       else {
         restore_face_set_from_undo_step(object);
@@ -1810,7 +1812,8 @@ static void restore_from_undo_step(const Depsgraph &depsgraph, const Sculpt &sd,
       break;
     default:
       restore_position_from_undo_step(depsgraph, object);
-      bke::pbvh::update_normals(depsgraph, object, *bke::object::pbvh_get(object));
+      bke::pbvh::update_normals(depsgraph, object, pbvh);
+      pbvh.update_bounds(depsgraph, object);
       break;
   }
 }
@@ -1830,8 +1833,8 @@ const float *brush_frontface_normal_from_falloff_shape(const SculptSession &ss, 
 
 struct SamplePlaneData {
   /* 0 = towards view, 1 = flipped */
-  std::array<float3, 2> plane_positions;
-  std::array<int, 2> position_count;
+  std::array<float3, 2> plane_displacements;
+  std::array<int, 2> displacement_count;
 
   std::array<float3, 2> plane_normals;
   std::array<int, 2> normal_count;
@@ -1864,37 +1867,17 @@ static float sample_plane_get_position_radius(const SculptSession &ss, const Bru
   return test_radius;
 }
 
-/* Weight the normals towards the center. */
-static float area_normal_calc_weight(const float distance, const float radius_inv)
+static void accumulate_plane_center_displacements(const float3 &test_location,
+                                                  const float3 &position,
+                                                  const float distance,
+                                                  const float radius_inv,
+                                                  const int flip_index,
+                                                  SamplePlaneData &sample_data)
 {
-  float p = 1.0f - (distance * radius_inv);
-  return std::clamp(3.0f * p * p - 2.0f * p * p * p, 0.0f, 1.0f);
-}
-
-/* Weight the coordinates towards the center. */
-static float3 area_center_calc_weighted(const float3 &test_location,
-                                        const float distance,
-                                        const float radius_inv,
-                                        const float3 &co)
-{
-  /* Weight the coordinates towards the center. */
-  float p = 1.0f - (distance * radius_inv);
-  const float afactor = std::clamp(3.0f * p * p - 2.0f * p * p * p, 0.0f, 1.0f);
-
-  const float3 disp = (co - test_location) * (1.0f - afactor);
-  return test_location + disp;
-}
-
-static void accumulate_plane_center(const float3 &test_location,
-                                    const float3 &position,
-                                    const float distance,
-                                    const float radius_inv,
-                                    const int flip_index,
-                                    SamplePlaneData &sample_data)
-{
-  sample_data.plane_positions[flip_index] += area_center_calc_weighted(
-      test_location, distance, radius_inv, position);
-  sample_data.position_count[flip_index] += 1;
+  const float p = distance * radius_inv;
+  const float factor = (3.0f - 2.0f * p) * p * p;
+  sample_data.plane_displacements[flip_index] += (position - test_location) * factor;
+  sample_data.displacement_count[flip_index] += 1;
 }
 
 static void accumulate_plane_normal(const float3 &normal,
@@ -1903,7 +1886,9 @@ static void accumulate_plane_normal(const float3 &normal,
                                     const int flip_index,
                                     SamplePlaneData &sample_data)
 {
-  sample_data.plane_normals[flip_index] += normal * area_normal_calc_weight(distance, radius_inv);
+  const float p = 1.0f - distance * radius_inv;
+  const float factor = (3.0f - 2.0f * p) * p * p;
+  sample_data.plane_normals[flip_index] += normal * factor;
   sample_data.normal_count[flip_index] += 1;
 }
 
@@ -1917,6 +1902,7 @@ static void sample_plane_normal_and_center_mesh(const Brush &brush,
                                                 const Span<float3> vert_positions,
                                                 const Span<float3> vert_normals,
                                                 const Span<bool> hide_vert,
+                                                const float3 &location,
                                                 const float normal_radius,
                                                 const float position_radius,
                                                 const bke::pbvh::MeshNode &node,
@@ -1924,7 +1910,6 @@ static void sample_plane_normal_and_center_mesh(const Brush &brush,
 {
   PRF_scope(ProfileCategory::Editor);
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const float3 &location = ss.cache ? ss.cache->location_symm : ss.cursor_location;
   const float3 &view_normal = ss.cache ? ss.cache->view_normal_symm : ss.cursor_view_normal;
   const float position_radius_sq = position_radius * position_radius;
   const float position_radius_inv = math::safe_rcp(position_radius);
@@ -1961,7 +1946,7 @@ static void sample_plane_normal_and_center_mesh(const Brush &brush,
         const float distance = std::sqrt(distances_sq[i]);
         const int flip_index = math::dot(view_normal, normal) <= 0.0f;
         if (needs_center) {
-          accumulate_plane_center(
+          accumulate_plane_center_displacements(
               location, orig_positions[i], distance, position_radius_inv, flip_index, sample_data);
         }
         if (needs_normal) {
@@ -1989,7 +1974,7 @@ static void sample_plane_normal_and_center_mesh(const Brush &brush,
     const float distance = std::sqrt(distances_sq[i]);
     const int flip_index = math::dot(view_normal, normal) <= 0.0f;
     if (needs_center) {
-      accumulate_plane_center(
+      accumulate_plane_center_displacements(
           location, vert_positions[vert], distance, position_radius_inv, flip_index, sample_data);
     }
     if (needs_normal) {
@@ -2000,6 +1985,7 @@ static void sample_plane_normal_and_center_mesh(const Brush &brush,
 
 static void sample_plane_normal_and_center_multires(const Brush &brush,
                                                     const Object &object,
+                                                    const float3 &location,
                                                     const float normal_radius,
                                                     const float position_radius,
                                                     const bke::pbvh::MultiresNode &node,
@@ -2013,7 +1999,6 @@ static void sample_plane_normal_and_center_multires(const Brush &brush,
   const IndexRange node_range = node.range(grid_size);
   const Span<bool> hidden = multires.hidden_verts();
   const int offset = node.offset();
-  const float3 &location = ss.cache ? ss.cache->location_symm : ss.cursor_location;
   const float3 &view_normal = ss.cache ? ss.cache->view_normal_symm : ss.cursor_view_normal;
   const float position_radius_sq = position_radius * position_radius;
   const float position_radius_inv = math::safe_rcp(position_radius);
@@ -2047,7 +2032,7 @@ static void sample_plane_normal_and_center_multires(const Brush &brush,
         const float distance = std::sqrt(distances_sq[i]);
         const int flip_index = math::dot(view_normal, normal) <= 0.0f;
         if (needs_center) {
-          accumulate_plane_center(
+          accumulate_plane_center_displacements(
               location, orig_positions[i], distance, position_radius_inv, flip_index, sample_data);
         }
         if (needs_normal) {
@@ -2078,7 +2063,7 @@ static void sample_plane_normal_and_center_multires(const Brush &brush,
     const float distance = std::sqrt(distances_sq[i]);
     const int flip_index = math::dot(view_normal, normal) <= 0.0f;
     if (needs_center) {
-      accumulate_plane_center(
+      accumulate_plane_center_displacements(
           location, positions[i], distance, position_radius_inv, flip_index, sample_data);
     }
     if (needs_normal) {
@@ -2089,6 +2074,7 @@ static void sample_plane_normal_and_center_multires(const Brush &brush,
 
 static void sample_plane_normal_and_center_grids(const Brush &brush,
                                                  const Object &object,
+                                                 const float3 &location,
                                                  const float normal_radius,
                                                  const float position_radius,
                                                  const bke::pbvh::GridsNode &node,
@@ -2097,7 +2083,6 @@ static void sample_plane_normal_and_center_grids(const Brush &brush,
 {
   PRF_scope(ProfileCategory::Editor);
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const float3 &location = ss.cache ? ss.cache->location_symm : ss.cursor_location;
   const float3 &view_normal = ss.cache ? ss.cache->view_normal_symm : ss.cursor_view_normal;
   const float position_radius_sq = position_radius * position_radius;
   const float position_radius_inv = math::safe_rcp(position_radius);
@@ -2143,12 +2128,12 @@ static void sample_plane_normal_and_center_grids(const Brush &brush,
           const float distance = std::sqrt(distances_sq[node_vert]);
           const int flip_index = math::dot(view_normal, normal) <= 0.0f;
           if (needs_center) {
-            accumulate_plane_center(location,
-                                    orig_positions[node_vert],
-                                    distance,
-                                    position_radius_inv,
-                                    flip_index,
-                                    sample_data);
+            accumulate_plane_center_displacements(location,
+                                                  orig_positions[node_vert],
+                                                  distance,
+                                                  position_radius_inv,
+                                                  flip_index,
+                                                  sample_data);
           }
           if (needs_normal) {
             accumulate_plane_normal(normal, distance, normal_radius_inv, flip_index, sample_data);
@@ -2185,12 +2170,12 @@ static void sample_plane_normal_and_center_grids(const Brush &brush,
       const float distance = std::sqrt(distances_sq[node_vert]);
       const int flip_index = math::dot(view_normal, normal) <= 0.0f;
       if (needs_center) {
-        accumulate_plane_center(location,
-                                positions[node_vert],
-                                distance,
-                                position_radius_inv,
-                                flip_index,
-                                sample_data);
+        accumulate_plane_center_displacements(location,
+                                              positions[node_vert],
+                                              distance,
+                                              position_radius_inv,
+                                              flip_index,
+                                              sample_data);
       }
       if (needs_normal) {
         accumulate_plane_normal(normal, distance, normal_radius_inv, flip_index, sample_data);
@@ -2201,6 +2186,7 @@ static void sample_plane_normal_and_center_grids(const Brush &brush,
 
 static void sample_plane_normal_and_center_bmesh(const Brush &brush,
                                                  const Object &object,
+                                                 const float3 &location,
                                                  const float normal_radius,
                                                  const float position_radius,
                                                  const bool has_bm_orco,
@@ -2210,7 +2196,6 @@ static void sample_plane_normal_and_center_bmesh(const Brush &brush,
 {
   PRF_scope(ProfileCategory::Editor);
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const float3 &location = ss.cache ? ss.cache->location_symm : ss.cursor_location;
   const float3 &view_normal = ss.cache ? ss.cache->view_normal_symm : ss.cursor_view_normal;
   const float position_radius_sq = position_radius * position_radius;
   const float position_radius_inv = math::safe_rcp(position_radius);
@@ -2260,7 +2245,7 @@ static void sample_plane_normal_and_center_bmesh(const Brush &brush,
       const float distance = std::sqrt(distances_sq[i]);
       const int flip_index = math::dot(view_normal, normal) <= 0.0f;
       if (needs_center) {
-        accumulate_plane_center(
+        accumulate_plane_center_displacements(
             location, positions[i], distance, position_radius_inv, flip_index, sample_data);
       }
       if (needs_normal) {
@@ -2299,7 +2284,7 @@ static void sample_plane_normal_and_center_bmesh(const Brush &brush,
       const float distance = std::sqrt(distances_sq[i]);
       const int flip_index = math::dot(view_normal, normal) <= 0.0f;
       if (needs_center) {
-        accumulate_plane_center(
+        accumulate_plane_center_displacements(
             location, positions[i], distance, position_radius_inv, flip_index, sample_data);
       }
       if (needs_normal) {
@@ -2333,7 +2318,7 @@ static void sample_plane_normal_and_center_bmesh(const Brush &brush,
     const float distance = std::sqrt(distances_sq[i]);
     const int flip_index = math::dot(view_normal, normal) <= 0.0f;
     if (needs_center) {
-      accumulate_plane_center(
+      accumulate_plane_center_displacements(
           location, positions[i], distance, position_radius_inv, flip_index, sample_data);
     }
     if (needs_normal) {
@@ -2347,10 +2332,10 @@ static SamplePlaneData sample_reduce(const SamplePlaneData &a, const SamplePlane
 {
   SamplePlaneData joined{};
 
-  joined.plane_positions[0] = a.plane_positions[0] + b.plane_positions[0];
-  joined.plane_positions[1] = a.plane_positions[1] + b.plane_positions[1];
-  joined.position_count[0] = a.position_count[0] + b.position_count[0];
-  joined.position_count[1] = a.position_count[1] + b.position_count[1];
+  joined.plane_displacements[0] = a.plane_displacements[0] + b.plane_displacements[0];
+  joined.plane_displacements[1] = a.plane_displacements[1] + b.plane_displacements[1];
+  joined.displacement_count[0] = a.displacement_count[0] + b.displacement_count[0];
+  joined.displacement_count[1] = a.displacement_count[1] + b.displacement_count[1];
 
   joined.plane_normals[0] = a.plane_normals[0] + b.plane_normals[0];
   joined.plane_normals[1] = a.plane_normals[1] + b.plane_normals[1];
@@ -2372,6 +2357,7 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
   PRF_scope(ProfileCategory::Editor);
   const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
   const SculptSession &ss = *ob.runtime->sculpt_session;
+  const float3 &location = ss.cache ? ss.cache->location_symm : ss.cursor_location;
 
   SamplePlaneData sample_data;
   threading::EnumerableThreadSpecific<SampleLocalData> all_tls;
@@ -2395,6 +2381,7 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
                                                   vert_positions,
                                                   vert_normals,
                                                   hide_vert,
+                                                  location,
                                                   normal_radius,
                                                   position_radius,
                                                   nodes[i],
@@ -2414,7 +2401,7 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
           [&](const IndexRange range, SamplePlaneData sample_data) {
             node_mask.slice(range).foreach_index([&](const int i) {
               sample_plane_normal_and_center_multires(
-                  brush, ob, normal_radius, position_radius, nodes[i], sample_data);
+                  brush, ob, location, normal_radius, position_radius, nodes[i], sample_data);
             });
             return sample_data;
           },
@@ -2434,6 +2421,7 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
             node_mask.slice(range).foreach_index([&](const int i) {
               sample_plane_normal_and_center_bmesh(brush,
                                                    ob,
+                                                   location,
                                                    normal_radius,
                                                    position_radius,
                                                    has_bm_orco,
@@ -2456,7 +2444,7 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
             SampleLocalData &tls = all_tls.local();
             node_mask.slice(range).foreach_index([&](const int i) {
               sample_plane_normal_and_center_grids(
-                  brush, ob, normal_radius, position_radius, nodes[i], tls, sample_data);
+                  brush, ob, location, normal_radius, position_radius, nodes[i], tls, sample_data);
             });
             return sample_data;
           },
@@ -2465,13 +2453,16 @@ static void sample_plane_normal_and_center(const Depsgraph &depsgraph,
     }
   }
 
-  r_center = ss.cache ? ss.cache->location_symm : float3(0.0f);
+  float3 avg_displacement(0.0f);
+
   for (const int i : {0, 1}) {
-    if (sample_data.position_count[i] != 0) {
-      r_center = sample_data.plane_positions[i] * (1.0f / float(sample_data.position_count[i]));
+    if (sample_data.displacement_count[i] != 0) {
+      avg_displacement = sample_data.plane_displacements[i] /
+                         float(sample_data.displacement_count[i]);
       break;
     }
   }
+  r_center = location + avg_displacement;
 
   r_normal = std::nullopt;
   for (const int i : {0, 1}) {
@@ -2825,10 +2816,26 @@ void apply_brush_texture(const PaintMode paint_mode,
                          float *r_value,
                          float4 &r_rgba)
 {
-  const StrokeCache &cache = *ss.cache;
-  const MTex *mtex = BKE_brush_mask_texture_get(&brush, paint_mode);
+  apply_brush_texture(ss,
+                      brush,
+                      *BKE_brush_mask_texture_get(&brush, paint_mode),
+                      brush_point,
+                      thread_id,
+                      r_value,
+                      r_rgba);
+}
 
-  if (!mtex->tex) {
+void apply_brush_texture(const SculptSession &ss,
+                         const Brush &brush,
+                         const MTex &mtex,
+                         const float brush_point[3],
+                         const int thread_id,
+                         float *r_value,
+                         float4 &r_rgba)
+{
+  const StrokeCache &cache = *ss.cache;
+
+  if (!mtex.tex) {
     *r_value = 1.0f;
     copy_v4_fl(r_rgba, 1.0f);
     return;
@@ -2837,9 +2844,10 @@ void apply_brush_texture(const PaintMode paint_mode,
   float point[3];
   sub_v3_v3v3(point, brush_point, cache.plane_offset);
 
-  if (mtex->brush_map_mode == MTEX_MAP_MODE_3D) {
+  if (mtex.brush_map_mode == MTEX_MAP_MODE_3D) {
     /* Get strength by feeding the vertex location directly into a texture. */
-    *r_value = BKE_brush_sample_tex_3d(cache.paint, &brush, mtex, point, r_rgba, 0, ss.tex_pool);
+    *r_value = BKE_brush_sample_tex_3d(
+        cache.paint, &brush, &mtex, point, r_rgba, thread_id, ss.tex_pool);
   }
   else {
     /* If the active area is being applied for symmetry, flip it
@@ -2853,7 +2861,7 @@ void apply_brush_texture(const PaintMode paint_mode,
 
     /* Still no symmetry supported for other paint modes.
      * Sculpt does it DIY. */
-    if (mtex->brush_map_mode == MTEX_MAP_MODE_AREA) {
+    if (mtex.brush_map_mode == MTEX_MAP_MODE_AREA) {
       /* Similar to fixed mode, but projects from brush angle
        * rather than view direction. */
 
@@ -2862,13 +2870,13 @@ void apply_brush_texture(const PaintMode paint_mode,
       float x = symm_point[0];
       float y = symm_point[1];
 
-      x *= mtex->size[0];
-      y *= mtex->size[1];
+      x *= mtex.size[0];
+      y *= mtex.size[1];
 
-      x += mtex->ofs[0];
-      y += mtex->ofs[1];
+      x += mtex.ofs[0];
+      y += mtex.ofs[1];
 
-      paint_get_tex_pixel(mtex, x, y, ss.tex_pool, thread_id, r_value, r_rgba);
+      paint_get_tex_pixel(&mtex, x, y, ss.tex_pool, thread_id, r_value, r_rgba);
 
       add_v3_fl(r_rgba, brush.texture_sample_bias);  // v3 -> Ignore alpha
       *r_value -= brush.texture_sample_bias;
@@ -2878,7 +2886,7 @@ void apply_brush_texture(const PaintMode paint_mode,
           cache.vc->region, symm_point, cache.projection_mat);
       const float point_3d[3] = {point_2d[0], point_2d[1], 0.0f};
       *r_value = BKE_brush_sample_tex_3d(
-          cache.paint, &brush, mtex, point_3d, r_rgba, 0, ss.tex_pool);
+          cache.paint, &brush, &mtex, point_3d, r_rgba, thread_id, ss.tex_pool);
     }
   }
 }

@@ -70,8 +70,13 @@ void OneapiDeviceQueue::get_memory_info(size_t &total, size_t &free) const
   oneapi_device_->get_device_memory_info(total, free);
 }
 
-int OneapiDeviceQueue::num_sort_partitions(int max_num_paths, uint /*max_scene_shaders*/) const
+int OneapiDeviceQueue::num_sort_partitions(int max_num_paths, uint max_scene_shaders) const
 {
+  /* Sorting with partitions needs local memory for one counter per shader. */
+  if (size_t(max_scene_shaders) * sizeof(int) > oneapi_device_->get_local_mem_size()) {
+    return 1;
+  }
+
   int sort_partition_elements = (oneapi_device_->get_max_num_threads_per_multiprocessor() >= 128) ?
                                     32768 :
                                     8192;
@@ -85,12 +90,12 @@ void OneapiDeviceQueue::init_execution()
   oneapi_device_->load_image_info(nullptr);
 
   SyclQueue *device_queue = oneapi_device_->sycl_queue();
-  void *kg_dptr = oneapi_device_->kernel_globals_device_pointer();
+  void *kernel_params = oneapi_device_->kernel_params_device_pointer();
   assert(device_queue);
-  assert(kg_dptr);
+  assert(kernel_params);
   kernel_context_ = make_unique<KernelContext>();
   kernel_context_->queue = device_queue;
-  kernel_context_->kernel_globals = kg_dptr;
+  kernel_context_->kernel_params = kernel_params;
 
   debug_init_execution();
 }

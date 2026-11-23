@@ -7,6 +7,7 @@
 #include "draw_view.bsl.hh"
 #include "eevee_bxdf.bsl.hh"
 #include "eevee_gbuffer_read.bsl.hh"
+#include "eevee_ray_data_lib.bsl.hh"
 #include "eevee_sampling_lib.bsl.hh"
 #include "eevee_uniform.bsl.hh"
 #include "gpu_shader_codegen_lib.glsl"
@@ -15,7 +16,8 @@
 namespace eevee {
 
 /* Returns view-space ray. */
-BsdfSample ray_generate_direction(float2 noise, BsdfClosure cl, float3 V, Thickness thickness)
+BsdfSample ray_generate_direction(
+    const UtilityTexture &util_tx, float2 noise, BsdfClosure cl, float3 V, Thickness thickness)
 {
   float3 random_point_on_cylinder = sample_cylinder(noise);
   /* Bias the rays so we never get really high energy rays almost parallel to the surface. */
@@ -28,11 +30,11 @@ BsdfSample ray_generate_direction(float2 noise, BsdfClosure cl, float3 V, Thickn
 
   cl.context_amend(V, thickness);
 
-  float3x3 tangent_to_world = from_up_axis(cl.N);
+  float3x3 tangent_to_world = from_incident_vector(cl.N, V);
 
   float3 Vt = V * tangent_to_world;
   /* Sample in tangent space. */
-  BsdfSample samp = cl.sample(random_point_on_cylinder, Vt, thickness);
+  BsdfSample samp = cl.sample(util_tx, random_point_on_cylinder, Vt, thickness);
   /* Transform back to world space space. */
   samp.direction = tangent_to_world * float3(samp.direction);
   return samp;
@@ -46,7 +48,7 @@ struct RayGenerate {
   [[specialization_constant(0)]] int closure_index;
 
   [[storage(4, read)]] const uint (&tiles_coord_buf)[];
-  [[image(0, write, SFLOAT_16_16_16_16)]] image2D out_ray_data_img;
+  [[image(0, write, RAYTRACE_RAYDATA_FORMAT)]] uimage2D out_ray_data_img;
 };
 
 /**
@@ -74,7 +76,7 @@ void generate_rays([[resource_table]] RayGenerate &srt,
   BsdfClosure closure = reader.read_bin(texel_fullres, srt.closure_index);
 
   if (closure.type == CLOSURE_NONE_ID) {
-    imageStore(srt.out_ray_data_img, texel, float4(0.0f));
+    imageStore(srt.out_ray_data_img, texel, uint4(0u));
     return;
   }
 
@@ -88,13 +90,12 @@ void generate_rays([[resource_table]] RayGenerate &srt,
 
   Thickness thickness = reader.read_thickness(gbuf_header, texel_fullres);
 
-  BsdfSample samp = ray_generate_direction(noise.xy, closure, V, thickness);
+  BsdfSample samp = ray_generate_direction(util_tx, noise.xy, closure, V, thickness);
 
   /* Store inverse pdf to speedup denoising.
-   * Limit to the smallest non-0 value that the format can encode.
-   * Strangely it does not correspond to the IEEE spec. */
+   * Keep valid samples above 0 since 0 marks invalid rays. */
   float inv_pdf = (samp.pdf == 0.0f) ? 0.0f : max(6e-8f, 1.0f / samp.pdf);
-  imageStoreFast(srt.out_ray_data_img, texel, float4(samp.direction, inv_pdf));
+  imageStoreFast(srt.out_ray_data_img, texel, ray_data_pack(samp.direction, inv_pdf));
 }
 
 }  // namespace eevee::raytracing

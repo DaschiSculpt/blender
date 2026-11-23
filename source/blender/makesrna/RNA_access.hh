@@ -185,6 +185,23 @@ bool RNA_struct_system_idprops_check(StructRNA *srna);
  * there is no distinction for this between both kinds of storage.
  */
 bool RNA_struct_idprops_contains_datablock(const StructRNA *type);
+
+/**
+ * Checks whether the type allows dna-struct IDProperties (e.g. CurveMapping, ColorRamp, etc.).
+ */
+bool RNA_struct_idprops_struct_allowed(const StructRNA *type);
+
+/**
+ * Checks whether the type is a built-in dna-struct stored as IDProperty (e.g. CurveMapping,
+ * ColorRamp, etc.).
+ */
+bool RNA_struct_is_idprops_struct(const StructRNA *type);
+
+/**
+ * Checks whether the type contains any dna-struct IDProperties (e.g. CurveMapping, ColorRamp,
+ * etc.).
+ */
+bool RNA_struct_idprops_contains_struct(const StructRNA *type);
 /**
  * Remove an id-property.
  */
@@ -208,6 +225,12 @@ PropertyRNA *RNA_struct_find_property(PointerRNA *ptr, const char *identifier);
  * \warning Does not handle ["name"] style lookup.
  */
 PropertyRNA *RNA_struct_find_property(PointerRNA *ptr, UString identifier);
+
+/**
+ * Sometimes there are shadowed properties (e.g. PropertyGroup has a built-in readonly "name"
+ * property that can be overridden from Python with an editable one).
+ */
+bool RNA_property_is_shadowed(PointerRNA &ptr, PropertyRNA &prop);
 
 /**
  * Same as `RNA_struct_find_property` but returns `nullptr` if the property type is no same to
@@ -738,6 +761,11 @@ eRNAStatus RNA_property_collection_move(PointerRNA *ptr,
 
 /**
  * Copy the given property value from `fromtptr` to `ptr` data.
+ *
+ * \param bmain Main database containing the owner of the _destination_ `ptr` PointerRNA. May be
+ * null (e.g. in evaluated data case, no-main IDs, etc.), in which case some features may not work
+ * (e.g. default apply callback will skip calling the 'update' callback on the destination
+ * property).
  *
  * \return True if copy was successful, false otherwise.
  */

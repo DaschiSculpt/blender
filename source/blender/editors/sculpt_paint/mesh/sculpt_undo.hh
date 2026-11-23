@@ -444,6 +444,9 @@ Object *ensure_sculpt_mode_for_undo(bContext *C, Main *bmain, const std::string 
 void restore_from_bmesh_enter_geometry(const StepData &step_data, Object &object);
 bool has_bmesh_log_entry();
 
+/**
+ * \note Callers must remember to call #update_normals and #update_bounds as appropriate.
+ */
 void restore_position_from_undo_step(const Depsgraph &depsgraph, Object &object);
 
 namespace compression {

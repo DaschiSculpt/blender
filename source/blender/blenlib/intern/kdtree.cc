@@ -694,6 +694,7 @@ void KDTree<T>::build(const Span<T> points,
                       const int leaf_size,
                       LinearAllocator<> &allocator)
 {
+  PRF_scope(ProfileCategory::Core);
   const Span<VecT> vectors(reinterpret_cast<const VecT *>(points.data()), points.size());
   points_ = vectors.data();
   if (size == 0) {
@@ -844,6 +845,9 @@ static int calc_duplicates_impl(const KDTree<T> &tree,
                                 const ForeachFn foreach_index)
 {
   using value_type = typename KDTree<T>::value_type;
+  if (range < 0) {
+    return 0;
+  }
   const T *points = tree.points();
   int found = 0;
   foreach_index([&](const int index) {

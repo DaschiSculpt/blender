@@ -526,7 +526,7 @@ static void viewRedrawForce(const bContext *C, TransInfo *t)
   else if (t->spacetype == SPACE_VIEW3D) {
     if (t->options & CTX_PAINT_CURVE) {
       wmWindow *window = CTX_wm_window(C);
-      WM_paint_cursor_tag_redraw(window, t->region);
+      WM_cursor_overlay_tag_redraw(window, t->region);
     }
     else {
       /* Do we need more refined tags? */
@@ -572,7 +572,7 @@ static void viewRedrawForce(const bContext *C, TransInfo *t)
     }
     else if (t->options & CTX_PAINT_CURVE) {
       wmWindow *window = CTX_wm_window(C);
-      WM_paint_cursor_tag_redraw(window, t->region);
+      WM_cursor_overlay_tag_redraw(window, t->region);
     }
     else if (t->options & CTX_CURSOR) {
       ED_area_tag_redraw(t->area);
@@ -713,6 +713,20 @@ static bool transform_modal_item_poll(const wmOperator *op, int value)
       }
       break;
     }
+    case TFM_MODAL_PRECISION: {
+      if (t->mode_info == &TransMode_timetranslate) {
+        return false;
+      }
+      break;
+    }
+    case TFM_MODAL_SNAP_INV_ON:
+    case TFM_MODAL_SNAP_INV_OFF:
+    case TFM_MODAL_SNAP_TOGGLE: {
+      if (t->spacetype == SPACE_SEQ && t->mode_info == &TransMode_timetranslate) {
+        return false;
+      }
+      break;
+    }
     case TFM_MODAL_INSERTOFS_TOGGLE_DIR:
     case TFM_MODAL_NODE_ATTACH_ON:
     case TFM_MODAL_NODE_ATTACH_OFF:
@@ -817,6 +831,9 @@ static bool transform_modal_item_poll(const wmOperator *op, int value)
         return false;
       }
       if (t->data_type == &TransConvertType_SequencerRetiming) {
+        return false;
+      }
+      if (t->mode_info == &TransMode_timetranslate) {
         return false;
       }
       break;
@@ -2134,7 +2151,7 @@ bool initTransform(bContext *C, TransInfo *t, wmOperator *op, const wmEvent *eve
           t->region->runtime->type, drawTransformView, t, REGION_DRAW_POST_VIEW);
       t->draw_handle_pixel = ED_region_draw_cb_activate(
           t->region->runtime->type, drawTransformPixel, t, REGION_DRAW_POST_PIXEL);
-      t->draw_handle_cursor = WM_paint_cursor_activate(
+      t->draw_handle_cursor = WM_cursor_overlay_activate(
           SPACE_TYPE_ANY, RGN_TYPE_ANY, transform_draw_cursor_poll, transform_draw_cursor_draw, t);
     }
     else if (ELEM(t->spacetype,
@@ -2147,7 +2164,7 @@ bool initTransform(bContext *C, TransInfo *t, wmOperator *op, const wmEvent *eve
     {
       t->draw_handle_view = ED_region_draw_cb_activate(
           t->region->runtime->type, drawTransformView, t, REGION_DRAW_POST_VIEW);
-      t->draw_handle_cursor = WM_paint_cursor_activate(
+      t->draw_handle_cursor = WM_cursor_overlay_activate(
           SPACE_TYPE_ANY, RGN_TYPE_ANY, transform_draw_cursor_poll, transform_draw_cursor_draw, t);
     }
   }
@@ -2296,8 +2313,12 @@ bool initTransform(bContext *C, TransInfo *t, wmOperator *op, const wmEvent *eve
     if ((t->flag & T_EDIT) && t->obedit_type == OB_MESH) {
 
       FOREACH_TRANS_DATA_CONTAINER (t, tc) {
-        BMesh *bm = BKE_editmesh_bmesh_get_for_write(tc->obedit);
-        bool do_skip = false;
+        if (t->flag & T_MODAL) {
+          RNA_property_boolean_set(op->ptr, prop, false);
+          continue;
+        }
+
+        BMesh *bm = BKE_editmesh_bmesh_ensure(tc->obedit);
 
         /* Currently only used for two of three most frequent transform ops,
          * can include more ops.
@@ -2306,21 +2327,16 @@ bool initTransform(bContext *C, TransInfo *t, wmOperator *op, const wmEvent *eve
         if (ELEM(t->mode, TFM_TRANSLATION, TFM_ROTATION)) {
           if (bm->totvertsel == bm->totvert) {
             /* No need to invalidate if whole mesh is selected. */
-            do_skip = true;
+            continue;
           }
         }
 
-        if (t->flag & T_MODAL) {
-          RNA_property_boolean_set(op->ptr, prop, false);
+        const bool preserve_clnor = RNA_property_boolean_get(op->ptr, prop);
+        if (preserve_clnor) {
+          BKE_editmesh_lnorspace_update(bm);
+          t->flag |= T_CLNOR_REBUILD;
         }
-        else if (!do_skip) {
-          const bool preserve_clnor = RNA_property_boolean_get(op->ptr, prop);
-          if (preserve_clnor) {
-            BKE_editmesh_lnorspace_update(bm);
-            t->flag |= T_CLNOR_REBUILD;
-          }
-          BM_lnorspace_invalidate(bm, true);
-        }
+        BM_lnorspace_invalidate(bm, true);
       }
     }
   }
@@ -2377,7 +2393,7 @@ wmOperatorStatus transformEnd(bContext *C, TransInfo *t)
     else {
       if (t->flag & T_CLNOR_REBUILD) {
         FOREACH_TRANS_DATA_CONTAINER (t, tc) {
-          BMesh *bm = BKE_editmesh_bmesh_get_for_write(tc->obedit);
+          BMesh *bm = BKE_editmesh_bmesh_ensure(tc->obedit);
           BM_lnorspace_rebuild(bm, true);
         }
       }

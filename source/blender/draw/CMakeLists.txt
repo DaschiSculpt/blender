@@ -396,6 +396,7 @@ set(SHADER_SRC_EEVEE
   engines/eevee/shaders/eevee_bxdf_lut_gen.bsl.hh
   engines/eevee/shaders/eevee_bxdf_lut_lib.bsl.hh
   engines/eevee/shaders/eevee_bxdf_microfacet.bsl.hh
+  engines/eevee/shaders/eevee_bxdf_sheen.bsl.hh
   engines/eevee/shaders/eevee_bxdf_types.bsl.hh
   engines/eevee/shaders/eevee_camera_lib.bsl.hh
   engines/eevee/shaders/eevee_closure.bsl.hh
@@ -463,8 +464,8 @@ set(SHADER_SRC_EEVEE
   engines/eevee/shaders/eevee_nodetree_vert_lib.bsl.hh
   engines/eevee/shaders/eevee_occupancy_convert.bsl.hh
   engines/eevee/shaders/eevee_occupancy_lib.bsl.hh
-  engines/eevee/shaders/eevee_octahedron_lib.bsl.hh
   engines/eevee/shaders/eevee_pipeline.bsl.hh
+  engines/eevee/shaders/eevee_ray_data_lib.bsl.hh
   engines/eevee/shaders/eevee_ray_denoise.bsl.hh
   engines/eevee/shaders/eevee_ray_generate.bsl.hh
   engines/eevee/shaders/eevee_ray_tile.bsl.hh
@@ -568,13 +569,12 @@ set(SHADER_SRC_OVERLAY
   engines/overlay/shaders/overlay_edit_curve_point_vert.glsl
   engines/overlay/shaders/overlay_edit_curve_wire_vert.glsl
   engines/overlay/shaders/overlay_edit_curves_handle_vert.glsl
-  engines/overlay/shaders/overlay_edit_gpencil_canvas_vert.glsl
-  engines/overlay/shaders/overlay_edit_lattice_point_vert.glsl
-  engines/overlay/shaders/overlay_edit_lattice_wire_vert.glsl
+  engines/overlay/shaders/overlay_edit_gpencil_canvas.bsl.hh
+  engines/overlay/shaders/overlay_edit_lattice.bsl.hh
   engines/overlay/shaders/overlay_edit_mesh.bsl.hh
   engines/overlay/shaders/overlay_edit_mesh_analysis_frag.glsl
   engines/overlay/shaders/overlay_edit_mesh_analysis_vert.glsl
-  engines/overlay/shaders/overlay_edit_mesh_normal_vert.glsl
+  engines/overlay/shaders/overlay_edit_mesh_normal.bsl.hh
   engines/overlay/shaders/overlay_edit_mesh_skin_root_vert.glsl
   engines/overlay/shaders/overlay_edit_particle_point_vert.glsl
   engines/overlay/shaders/overlay_edit_particle_strand_vert.glsl
@@ -590,14 +590,11 @@ set(SHADER_SRC_OVERLAY
   engines/overlay/shaders/overlay_edit_uv_verts_frag.glsl
   engines/overlay/shaders/overlay_edit_uv_verts_vert.glsl
   engines/overlay/shaders/overlay_extra_frag.glsl
-  engines/overlay/shaders/overlay_extra_groundline_vert.glsl
   engines/overlay/shaders/overlay_extra_lightprobe_grid_vert.glsl
   engines/overlay/shaders/overlay_extra_loose_point_frag.glsl
   engines/overlay/shaders/overlay_extra_loose_point_vert.glsl
   engines/overlay/shaders/overlay_extra_point_vert.glsl
-  engines/overlay/shaders/overlay_extra_vert.glsl
-  engines/overlay/shaders/overlay_extra_wire_frag.glsl
-  engines/overlay/shaders/overlay_extra_wire_vert.glsl
+  engines/overlay/shaders/overlay_extra.bsl.hh
   engines/overlay/shaders/overlay_facing_frag.glsl
   engines/overlay/shaders/overlay_facing_vert.glsl
   engines/overlay/shaders/overlay_fullscreen_vert.glsl
@@ -620,11 +617,7 @@ set(SHADER_SRC_OVERLAY
   engines/overlay/shaders/overlay_paint_weight_frag.glsl
   engines/overlay/shaders/overlay_paint_weight_vert.glsl
   engines/overlay/shaders/overlay_paint_wire_vert.glsl
-  engines/overlay/shaders/overlay_particle_frag.glsl
-  engines/overlay/shaders/overlay_particle_vert.glsl
-  engines/overlay/shaders/overlay_particle_hair_vert.glsl
-  engines/overlay/shaders/overlay_particle_shape_vert.glsl
-  engines/overlay/shaders/overlay_particle_shape_frag.glsl
+  engines/overlay/shaders/overlay_particle.bsl.hh
   engines/overlay/shaders/overlay_point_varying_color_frag.glsl
   engines/overlay/shaders/overlay_point_varying_color_varying_outline_aa_frag.glsl
   engines/overlay/shaders/overlay_sculpt_curves_cage_vert.glsl
@@ -666,16 +659,12 @@ set(SHADER_SRC_GPENCIL
 
   engines/gpencil/shaders/gpencil_frag.glsl
   engines/gpencil/shaders/gpencil_vert.glsl
-  engines/gpencil/shaders/gpencil_antialiasing_accumulation_frag.glsl
+  engines/gpencil/shaders/gpencil_antialiasing.bsl.hh
   engines/gpencil/shaders/gpencil_antialiasing_frag.glsl
   engines/gpencil/shaders/gpencil_antialiasing_vert.glsl
-  engines/gpencil/shaders/gpencil_common_lib.glsl
-  engines/gpencil/shaders/gpencil_fullscreen_vert.glsl
-  engines/gpencil/shaders/gpencil_layer_blend_frag.glsl
-  engines/gpencil/shaders/gpencil_mask_invert_frag.glsl
-  engines/gpencil/shaders/gpencil_depth_merge_frag.glsl
-  engines/gpencil/shaders/gpencil_depth_merge_vert.glsl
-  engines/gpencil/shaders/gpencil_depth_pass_merge_frag.glsl
+  engines/gpencil/shaders/gpencil_blend_mode.bsl.hh
+  engines/gpencil/shaders/gpencil_layer_blend.bsl.hh
+  engines/gpencil/shaders/gpencil_depth_merge.bsl.hh
   engines/gpencil/shaders/gpencil_vfx.bsl.hh
 
   engines/gpencil/gpencil_defines.hh

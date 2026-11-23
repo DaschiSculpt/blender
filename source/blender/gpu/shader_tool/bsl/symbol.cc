@@ -833,9 +833,15 @@ struct SymbolParser : NodeErrorHandler {
       }
     }
 
+    const bool is_template = !suffix.empty();
+
     bool is_overload = false;
     SymbolScope &scope = ns ? *ns : def_scope;
-    if (auto [fdecl, fn_ptr] = scope.lookup_function_forward_decl(func); fdecl.is_valid()) {
+    if (auto [fdecl, fn_ptr] = scope.lookup_function_forward_decl(func);
+        /* Template instances are not the definition of a plain prototype with
+         * the same signature. Reusing it would link it twice in the overload list. */
+        !is_template && fdecl.is_valid())
+    {
       fn = fn_ptr;
       /* Modify symbol location if it is forward declared. */
       fn->loc = fdecl.front();
@@ -950,6 +956,18 @@ struct SymbolParser : NodeErrorHandler {
     /* Check if any overload has already the same signature w.r.t. the GLSL rules. */
     const SymbolFunction &base = scope.lookup_function_base(table, id);
     for (const SymbolFunction *overload = &base; overload; overload = overload->overload_next) {
+      /* Skip template declarations, whose arguments are not parsed. */
+      if (!overload->is_complete) {
+        continue;
+      }
+      /* Skip template instances emitted with a mangled name that differs from #fn, which cannot
+       * collide in the output. */
+      if (overload->is_specialization && overload->template_data &&
+          !overload->template_data->is_adl_possible() && overload->original != fn.original)
+      {
+        continue;
+      }
+
       if (overload != &fn) {
         if (overload->has_same_signature(fn)) {
           ast::Node decl = overload->fwd.is_valid() ? overload->fwd.identifier() :
@@ -1016,7 +1034,16 @@ struct SymbolParser : NodeErrorHandler {
        * instantiation. */
       SymbolFunction *fn = &table.fun_arena.alloc(scope, *table.err_cls, fn_decl);
       fn->is_complete = false;
-      fn = scope.functions.emplace(fn).first;
+
+      auto [existing, inserted] = scope.functions.emplace(fn);
+      if (!inserted && existing->is_method() && scope.as_class() != existing->parent_class()) {
+        /* Hide inherited base class method instead of attaching the template to it. */
+        scope.functions.insert_override(fn);
+      }
+      else {
+        fn = existing;
+      }
+
       if (fn->template_data) {
         error(fn_decl.identifier(), Diag::RedefinitionTemplate, fn_decl.identifier().str());
       }
@@ -1051,6 +1078,23 @@ struct SymbolParser : NodeErrorHandler {
     return temp_decl;
   }
 
+  /* Report a function template instance with the same arguments as a previous one. Linking it
+   * would create a cycle in the overload list. Return true if it is a duplicate. */
+  bool check_duplicate_function_instance(IdQualified id,
+                                         const SymbolFunction &fn,
+                                         const string &mangled)
+  {
+    auto it = fn.template_data->instances.find(mangled);
+    if (it == fn.template_data->instances.end()) {
+      return false;
+    }
+    const SymbolFunction &prev = *it->second;
+    ast::Node decl = prev.fwd.is_valid() ? prev.fwd.identifier() : prev.decl.identifier();
+    NOTE(decl, Diag::NotePreviousDefinition, id.str());
+    error(id, Diag::RedefinitionFunction, id.str());
+    return true;
+  }
+
   void parse_template_inst(SymbolScope &scope, TemplateInst temp, const std::string &prefix)
   {
     TemplateParamList tmp_params = temp.parameters();
@@ -1066,6 +1110,9 @@ struct SymbolParser : NodeErrorHandler {
       {
         auto mangled =
             table.mangle_identifier(temp_decl.arguments(), tmp_params, scope).unwrap(this);
+        if (check_duplicate_function_instance(id, fn, mangled.str)) {
+          return;
+        }
 
         SymbolScope *parent = &scope;
         if (fn.fn_type == SymbolFunction::MEMBER) {
@@ -1094,6 +1141,7 @@ struct SymbolParser : NodeErrorHandler {
         SymbolFunction *fn_inst = parse_func_decl(
             *parent, temp_decl.decl(), prefix, mangled.str, poi, temp.parameters());
         fn_inst->is_specialization = true;
+        fn_inst->fwd = decl;
         fn_inst->template_data = fn.template_data;
         /* For compatibility with previous version of BSL, do not mangle function names with
          * arguments if ADL is possible. */
@@ -1102,6 +1150,10 @@ struct SymbolParser : NodeErrorHandler {
               0, fn_inst->identifier.size() - mangled.str.size());
         }
         fn.template_data->instances.emplace(mangled.str, fn_inst);
+        /* Unmangled instances can collide with overloads declared before them. */
+        if (fn.template_data->is_adl_possible() && !fn_inst->is_entry_point()) {
+          check_overload_validity(id, *fn_inst, scope);
+        }
         fn.add_overload(fn_inst);
       }
     }
@@ -1150,10 +1202,15 @@ struct SymbolParser : NodeErrorHandler {
       {
         auto mangled =
             table.mangle_identifier(temp_decl.arguments(), temp_params, scope).unwrap(this);
+        if (check_duplicate_function_instance(id, fn, mangled.str)) {
+          return;
+        }
+
         string full_id = string(decl.identifier().str()) + "<" + mangled.str_debug.substr(2) + ">";
         NOTE(decl.identifier(), Diag::NoteInstantiationFuncTemplateRequested, full_id);
         SymbolFunction *spec = parse_func_decl(scope, decl, prefix, mangled.str, poi);
         spec->is_specialization = true;
+        spec->fwd = decl;
         spec->template_data = fn.template_data;
         /* For compatibility with previous version of BSL, do not mangle function names with
          * arguments if ADL is possible. */
@@ -1162,6 +1219,10 @@ struct SymbolParser : NodeErrorHandler {
                                                      spec->identifier.size() - mangled.str.size());
         }
         fn.template_data->instances.emplace(mangled.str, spec);
+        /* Unmangled instances can collide with overloads declared before them. */
+        if (fn.template_data->is_adl_possible() && !spec->is_entry_point()) {
+          check_overload_validity(id, *spec, scope);
+        }
         fn.add_overload(spec);
       }
     }

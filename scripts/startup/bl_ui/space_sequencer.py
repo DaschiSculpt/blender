@@ -1203,14 +1203,14 @@ class SEQUENCER_MT_strip(Menu):
                     layout.separator()
                     layout.operator("sequencer.rendersize")
                     layout.operator("sequencer.images_separate")
-                elif strip_type != 'SOUND':
-                    layout.separator()
-                    layout.operator("sequencer.rendersize")
                 elif strip_type == 'META':
                     layout.separator()
                     layout.operator("sequencer.meta_make")
                     layout.operator("sequencer.meta_separate")
                     layout.operator("sequencer.meta_toggle", text="Toggle Meta")
+                elif strip_type != 'SOUND':
+                    layout.separator()
+                    layout.operator("sequencer.rendersize")
                 if strip_type != 'META':
                     layout.separator()
                     layout.operator("sequencer.meta_make")
@@ -1386,14 +1386,14 @@ class SEQUENCER_MT_context_menu(Menu):
             }:
                 layout.separator()
                 layout.menu("SEQUENCER_MT_strip_effect")
-            elif strip_type != 'SOUND':
-                layout.separator()
-                layout.operator("sequencer.rendersize")
             elif strip_type == 'IMAGE':
                 layout.separator()
                 layout.operator("sequencer.rendersize")
                 if has_selection:
                     layout.operator("sequencer.images_separate")
+            elif strip_type != 'SOUND':
+                layout.separator()
+                layout.operator("sequencer.rendersize")
 
         if has_selection:
             layout.separator()
@@ -1961,11 +1961,9 @@ class SEQUENCER_PT_view_composition_guides(SequencerButtonsPanel_Output, Panel):
         is_preview = st.view_type in {'PREVIEW', 'SEQUENCER_PREVIEW'}
         return is_preview and (st.display_mode == 'IMAGE') and context.sequencer_scene
 
-    def draw_header(self, context):
-        pass
-
     def draw(self, context):
         overlay_settings = context.space_data.preview_overlay
+        self.layout.active = overlay_settings.show_composition_guides
         DATA_PT_camera_display_composition_guides.draw_panel(self.layout, overlay_settings)
 
 

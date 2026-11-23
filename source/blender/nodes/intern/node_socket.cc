@@ -66,6 +66,8 @@
 #include "SEQ_relations.hh"
 #include "SEQ_sequencer.hh"
 
+#include "UI_interface_c.hh"
+
 #include "WM_types.hh"
 
 #include "DEG_depsgraph.hh"
@@ -447,13 +449,14 @@ static void refresh_node_sockets_animation_inout(Main &bmain,
                                                  const Span<bNodeSocket *> old_sockets,
                                                  const Span<bNodeSocket *> new_sockets)
 {
-  std::optional<std::pair<animrig::Action *, animrig::Slot *>> action_and_slot =
-      animrig::get_action_slot_pair(ntree.id);
-  if (!action_and_slot) {
+  if (!ntree.adt) {
     return;
   }
-  animrig::Action &action = *action_and_slot->first;
-  animrig::Slot &slot = *action_and_slot->second;
+  const std::optional<std::pair<animrig::Action *, animrig::Slot *>> action_and_slot =
+      animrig::get_action_slot_pair(ntree.id);
+  if (!action_and_slot && ntree.adt->drivers.is_empty()) {
+    return;
+  }
 
   Map<UString, int> new_index_by_identifier;
   for (const int new_i : new_sockets.index_range()) {
@@ -521,11 +524,14 @@ static void refresh_node_sockets_animation_inout(Main &bmain,
     /* All index changes have to be applied in a single pass over the fcurves. Otherwise, when
      * sockets swap their position, the same fcurve may be modified twice and ends up with its
      * original rna path. */
-    animrig::foreach_fcurve_in_action_slot(action, slot.handle, [&](FCurve &fcurve) {
-      if (char *new_path = construct_new_rna_path(fcurve.rna_path())) {
-        fcurve.rna_path_set_move(new_path);
-      }
-    });
+    if (action_and_slot) {
+      animrig::foreach_fcurve_in_action_slot(
+          *action_and_slot->first, action_and_slot->second->handle, [&](FCurve &fcurve) {
+            if (char *new_path = construct_new_rna_path(fcurve.rna_path())) {
+              fcurve.rna_path_set_move(new_path);
+            }
+          });
+    }
     for (FCurve &driver_fcurve : ntree.adt->drivers) {
       if (char *new_path = construct_new_rna_path(driver_fcurve.rna_path())) {
         driver_fcurve.rna_path_set_move(new_path);
@@ -535,7 +541,9 @@ static void refresh_node_sockets_animation_inout(Main &bmain,
 
   if (animation_changed) {
     DEG_id_tag_update(&ntree.id, ID_RECALC_ANIMATION);
-    DEG_id_tag_update(&action.id, ID_RECALC_SYNC_TO_EVAL);
+    if (action_and_slot) {
+      DEG_id_tag_update(&action_and_slot->first->id, ID_RECALC_SYNC_TO_EVAL);
+    }
     DEG_relations_tag_update(&bmain);
   }
 }
@@ -745,7 +753,7 @@ void ED_init_standard_node_socket_type(bke::bNodeSocketType *);
 static bke::bNodeSocketType *make_standard_socket_type(
     const eNodeSocketDatatype type, int subtype, std::optional<int> dimensions = std::nullopt)
 {
-  const StringRefNull socket_idname = *bke::node_static_socket_type(type, subtype, dimensions);
+  const UString socket_idname = *bke::node_static_socket_type(type, subtype, dimensions);
   const StringRefNull interface_idname = *bke::node_static_socket_interface_type_new(
       type, subtype, dimensions);
   const StringRefNull socket_label = *bke::node_static_socket_label(type, subtype);
@@ -755,7 +763,7 @@ static bke::bNodeSocketType *make_standard_socket_type(
 
   stype = MEM_new<bke::bNodeSocketType>(__func__);
   stype->free_self = [](bke::bNodeSocketType *type) { MEM_delete(type); };
-  stype->idname = UString(socket_idname);
+  stype->idname = socket_idname;
   stype->label = socket_label;
   stype->subtype_label = socket_subtype_label;
 
@@ -1240,6 +1248,17 @@ static bke::bNodeSocketType *make_socket_type_closure()
   return socktype;
 }
 
+static void set_float_property_ui_range(PropertyRNA &prop, const bNodeSocketValueFloat &data)
+{
+  RNA_def_property_ui_range(
+      &prop,
+      data.min,
+      data.max,
+      std::clamp(data.step, UI_PRECISION_FLOAT_STEP_MIN, UI_PRECISION_FLOAT_STEP_MAX) /
+          UI_PRECISION_FLOAT_SCALE,
+      std::clamp(data.precision, 0, UI_PRECISION_FLOAT_MAX));
+}
+
 static bke::bNodeSocketType *make_socket_type_float(PropertySubType subtype)
 {
   bke::bNodeSocketType *socktype = make_standard_socket_type(SOCK_FLOAT, subtype);
@@ -1274,6 +1293,7 @@ static bke::bNodeSocketType *make_socket_type_float(PropertySubType subtype)
     RNA_def_property_update_runtime(prop, nodes::geometry_nodes_property_update);
     RNA_def_property_override_flag(prop, PROPOVERRIDE_OVERRIDABLE_LIBRARY);
     RNA_def_property_subtype(prop, PropertySubType(data->subtype));
+    set_float_property_ui_range(*prop, *data);
     make_common_value_and_attribute_props(srna, socket, r_generated);
   };
   socktype->make_compositor_nodes_input_srna = [](const bNodeTree & /*tree*/,
@@ -1292,6 +1312,7 @@ static bke::bNodeSocketType *make_socket_type_float(PropertySubType subtype)
                          data->min,
                          data->max);
     RNA_def_property_subtype(prop, PropertySubType(data->subtype));
+    set_float_property_ui_range(*prop, *data);
     set_common_sequencer_update_function(prop);
     make_common_type_prop(srna,
                           socket,
@@ -1315,6 +1336,7 @@ static bke::bNodeSocketType *make_socket_type_float(PropertySubType subtype)
                                               data->min,
                                               data->max);
         RNA_def_property_subtype(property, PropertySubType(data->subtype));
+        set_float_property_ui_range(*property, *data);
         set_scene_compositor_effect_property_common_properties(property);
       };
   return socktype;
@@ -2208,7 +2230,7 @@ static bke::bNodeSocketType *make_socket_type_sound()
                                                 nodes::GeneratedTreeSrnaData &r_generated) {
     PropertyRNA *prop = RNA_def_pointer_runtime(
         &srna, "value", RNA_Sound, socket.name().c_str(), socket.description().c_str());
-    const auto *default_value = reinterpret_cast<const bNodeSocketValueObject *>(
+    const auto *default_value = reinterpret_cast<const bNodeSocketValueSound *>(
         socket.socket_data);
     if (default_value->value) {
       RNA_def_property_pointer_default_runtime(prop, default_value->value->id.session_uid);
