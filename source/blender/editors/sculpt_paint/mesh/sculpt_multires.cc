@@ -141,11 +141,14 @@ static void propagate_to_top(const Mesh &base_mesh,
 {
   const bool use_tangent_space = std::is_same_v<T, float3> && name == "position" &&
                                  base_mesh.multires_use_tangent_space != 0;
+  const bool use_mask_propagation = std::is_same_v<T, float> && name == ".sculpt_mask";
+  const bool use_color_propagation = std::is_same_v<T, float4> && name == "Color";
+  const bool needs_curr_old = use_tangent_space || use_mask_propagation || use_color_propagation;
 
   Array<T> curr_old;
   Array<T> curr_delta;
   MutableSpan<T> downsample_dst;
-  if (use_tangent_space) {
+  if (needs_curr_old) {
     curr_old.reinitialize(curr_attr.size());
     downsample_dst = curr_old.as_mutable_span();
   }
@@ -163,7 +166,7 @@ static void propagate_to_top(const Mesh &base_mesh,
   }
 
   bool curr_dirty = false;
-  if (use_tangent_space) {
+  if (needs_curr_old) {
     curr_dirty = storage_undo::push_attribute_modified(
         storage_undo::StorageTarget::Curr, name, type, curr_old.as_span(), curr_attr, true);
   }
@@ -181,12 +184,12 @@ static void propagate_to_top(const Mesh &base_mesh,
     return;
   }
 
-  auto subdivide_attr = [&](const Span<T> src, const MutableSpan<T> dst) {
+  auto subdivide_attr = [&]<typename AttrT>(const Span<AttrT> src, const MutableSpan<AttrT> dst) {
     if (curr_lvl == 0) {
-      multires.subdivide_base_to<T>(base_mesh, top_lvl, top_offsets, src, dst, false);
+      multires.subdivide_base_to<AttrT>(base_mesh, top_lvl, top_offsets, src, dst, false);
     }
     else {
-      multires.subdivide_to<T>(
+      multires.subdivide_to<AttrT>(
           base_mesh, curr_lvl, curr_offsets, src, top_lvl, top_offsets, dst, false);
     }
   };
@@ -224,6 +227,91 @@ static void propagate_to_top(const Mesh &base_mesh,
                                                     new_smooth.as_span(),
                                                     top_attr.as_span(),
                                                     dst_top);
+
+      if (undo_active) {
+        storage_undo::push_attribute_modified(
+            storage_undo::StorageTarget::Top, name, type, top_attr.as_span(), dst_top.as_span());
+
+        bke::Attribute *attr = multires.top_attribute_storage.wrap().lookup(name);
+        BLI_assert(attr != nullptr);
+        attr->assign_data(std::move(*new_top_data));
+      }
+      return;
+    }
+  }
+
+  if constexpr (std::is_same_v<T, float>) {
+    if (use_mask_propagation) {
+      Array<float2> curr_packed(curr_attr.size());
+      bke::multiresolution::calc_mask_propagation(
+          curr_old.as_span(), curr_attr, curr_packed.as_mutable_span());
+      curr_old = {};
+
+      Array<float2> top_packed(top_attr.size());
+      subdivide_attr(curr_packed.as_span(), top_packed.as_mutable_span());
+      curr_packed = {};
+
+      const bool undo_active = storage_undo::is_active();
+      std::optional<bke::GList> new_top_data;
+      MutableSpan<float> dst_top = top_attr;
+      if (undo_active) {
+        const CPPType &float_type = CPPType::get<float>();
+        new_top_data.emplace(float_type,
+                             bke::GList::ArrayData::ForUninitialized(float_type, top_attr.size()),
+                             top_attr.size());
+        dst_top = std::get<GMutableSpan>(new_top_data->values_for_write()).typed<float>();
+      }
+
+      bke::multiresolution::apply_mask_propagation(
+          top_attr.as_span(), top_packed.as_span(), dst_top);
+
+      if (undo_active) {
+        storage_undo::push_attribute_modified(
+            storage_undo::StorageTarget::Top, name, type, top_attr.as_span(), dst_top.as_span());
+
+        bke::Attribute *attr = multires.top_attribute_storage.wrap().lookup(name);
+        BLI_assert(attr != nullptr);
+        attr->assign_data(std::move(*new_top_data));
+      }
+      return;
+    }
+  }
+
+  if constexpr (std::is_same_v<T, float4>) {
+    if (use_color_propagation) {
+      Array<float4> curr_rgb_packed(curr_attr.size());
+      const bool alpha_changed = bke::multiresolution::calc_color_propagation_rgb(
+          curr_old.as_span(), curr_attr, curr_rgb_packed.as_mutable_span());
+
+      Array<float4> top_rgb_packed(top_attr.size());
+      subdivide_attr(curr_rgb_packed.as_span(), top_rgb_packed.as_mutable_span());
+      curr_rgb_packed = {};
+
+      Array<float2> top_alpha_packed;
+      if (alpha_changed) {
+        Array<float2> curr_alpha_packed(curr_attr.size());
+        bke::multiresolution::calc_color_propagation_alpha(
+            curr_old.as_span(), curr_attr, curr_alpha_packed.as_mutable_span());
+        top_alpha_packed.reinitialize(top_attr.size());
+        subdivide_attr(curr_alpha_packed.as_span(), top_alpha_packed.as_mutable_span());
+      }
+      curr_old = {};
+
+      const bool undo_active = storage_undo::is_active();
+      std::optional<bke::GList> new_top_data;
+      MutableSpan<float4> dst_top = top_attr;
+      if (undo_active) {
+        const CPPType &color_type = CPPType::get<ColorGeometry4f>();
+        new_top_data.emplace(color_type,
+                             bke::GList::ArrayData::ForUninitialized(color_type, top_attr.size()),
+                             top_attr.size());
+        dst_top = std::get<GMutableSpan>(new_top_data->values_for_write())
+                      .typed<ColorGeometry4f>()
+                      .cast<float4>();
+      }
+
+      bke::multiresolution::apply_color_propagation(
+          top_attr.as_span(), top_rgb_packed.as_span(), top_alpha_packed.as_span(), dst_top);
 
       if (undo_active) {
         storage_undo::push_attribute_modified(

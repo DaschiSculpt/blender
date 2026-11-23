@@ -200,11 +200,6 @@ void calc_top_eval_positions(const Mesh &base_mesh,
                              const Span<float3> top_base_positions,
                              const MutableSpan<float3> r_eval_positions);
 
-/**
- * Propagates `old_positions` using Catmull-Clark limit tangent frames between
- * `old_smooth_positions` and `new_smooth_positions`. `r_new_positions` may alias `old_positions`
- * for in-place transformation.
- */
 void propagate_tangent_space(const BaseTopology &base_topo,
                              int delta_lvl,
                              const OffsetsSpan &offsets,
@@ -213,6 +208,27 @@ void propagate_tangent_space(const BaseTopology &base_topo,
                              Span<float3> new_smooth_positions,
                              Span<float3> old_positions,
                              MutableSpan<float3> r_new_positions);
+
+void calc_mask_propagation(Span<float> old_masks,
+                           Span<float> new_masks,
+                           MutableSpan<float2> r_packed);
+
+void apply_mask_propagation(Span<float> old_masks,
+                            Span<float2> packed,
+                            MutableSpan<float> r_new_masks);
+
+bool calc_color_propagation_rgb(Span<float4> old_colors,
+                                Span<float4> new_colors,
+                                MutableSpan<float4> r_rgb_packed);
+
+void calc_color_propagation_alpha(Span<float4> old_colors,
+                                  Span<float4> new_colors,
+                                  MutableSpan<float2> r_alpha_packed);
+
+void apply_color_propagation(Span<float4> old_colors,
+                             Span<float4> rgb_packed,
+                             Span<float2> alpha_packed,
+                             MutableSpan<float4> r_new_colors);
 
 }  // namespace multiresolution
 

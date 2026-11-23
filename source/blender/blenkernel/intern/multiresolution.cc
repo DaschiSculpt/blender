@@ -1523,6 +1523,114 @@ void calc_top_eval_positions(const Mesh &base_mesh,
   }
 }
 
+void calc_mask_propagation(const Span<float> old_masks,
+                           const Span<float> new_masks,
+                           const MutableSpan<float2> r_packed)
+{
+  BLI_assert(old_masks.size() == new_masks.size());
+  BLI_assert(old_masks.size() == r_packed.size());
+
+  constexpr float EPS = 1e-5f;
+  threading::parallel_for(old_masks.index_range(), 8192, [&](const IndexRange range) {
+    for (const int i : range) {
+      const float new_mask = new_masks[i];
+      const float diff = new_mask - old_masks[i];
+      r_packed[i] = math::abs(diff) > EPS ? float2(new_mask, 1.0f) : float2(diff, 0.0f);
+    }
+  });
+}
+
+void apply_mask_propagation(const Span<float> old_masks,
+                            const Span<float2> packed,
+                            const MutableSpan<float> r_new_masks)
+{
+  BLI_assert(old_masks.size() == packed.size());
+  BLI_assert(old_masks.size() == r_new_masks.size());
+
+  threading::parallel_for(old_masks.index_range(), 8192, [&](const IndexRange range) {
+    for (const int i : range) {
+      const float2 p = packed[i];
+      const float inv_alpha = 1.0f - math::clamp(p.y, 0.0f, 1.0f);
+      r_new_masks[i] = math::clamp(inv_alpha * old_masks[i] + p.x, 0.0f, 1.0f);
+    }
+  });
+}
+
+bool calc_color_propagation_rgb(const Span<float4> old_colors,
+                                const Span<float4> new_colors,
+                                const MutableSpan<float4> r_rgb_packed)
+{
+  BLI_assert(old_colors.size() == new_colors.size());
+  BLI_assert(old_colors.size() == r_rgb_packed.size());
+
+  constexpr float EPS = 1e-5f;
+  return threading::parallel_reduce(
+      old_colors.index_range(),
+      8192,
+      false,
+      [&](const IndexRange range, bool alpha_changed) {
+        for (const int i : range) {
+          const float4 old_color = old_colors[i];
+          const float4 new_color = new_colors[i];
+          if (old_color.w != new_color.w) {
+            alpha_changed = true;
+          }
+
+          const float3 new_rgb = new_color.xyz();
+          const float3 diff = new_rgb - old_color.xyz();
+          r_rgb_packed[i] = !math::is_zero(diff, EPS) ? float4(new_rgb, 1.0f) : float4(diff, 0.0f);
+        }
+        return alpha_changed;
+      },
+      [](const bool a, const bool b) { return a || b; });
+}
+
+void calc_color_propagation_alpha(const Span<float4> old_colors,
+                                  const Span<float4> new_colors,
+                                  const MutableSpan<float2> r_alpha_packed)
+{
+  BLI_assert(old_colors.size() == new_colors.size());
+  BLI_assert(old_colors.size() == r_alpha_packed.size());
+
+  constexpr float EPS = 1e-5f;
+  threading::parallel_for(old_colors.index_range(), 8192, [&](const IndexRange range) {
+    for (const int i : range) {
+      const float new_alpha = new_colors[i].w;
+      const float diff = new_alpha - old_colors[i].w;
+      r_alpha_packed[i] = math::abs(diff) > EPS ? float2(new_alpha, 1.0f) : float2(diff, 0.0f);
+    }
+  });
+}
+
+void apply_color_propagation(const Span<float4> old_colors,
+                             const Span<float4> rgb_packed,
+                             const Span<float2> alpha_packed,
+                             const MutableSpan<float4> r_new_colors)
+{
+  BLI_assert(old_colors.size() == rgb_packed.size());
+  BLI_assert(old_colors.size() == r_new_colors.size());
+  BLI_assert(alpha_packed.is_empty() || alpha_packed.size() == old_colors.size());
+
+  const bool has_alpha = !alpha_packed.is_empty();
+  threading::parallel_for(old_colors.index_range(), 8192, [&](const IndexRange range) {
+    for (const int i : range) {
+      const float4 old_color = old_colors[i];
+      const float4 rgb = rgb_packed[i];
+      const float inv_alpha_rgb = 1.0f - math::clamp(rgb.w, 0.0f, 1.0f);
+
+      float out_alpha = old_color.w;
+      if (has_alpha) {
+        const float2 a = alpha_packed[i];
+        const float inv_alpha_w = 1.0f - math::clamp(a.y, 0.0f, 1.0f);
+        out_alpha = math::clamp(inv_alpha_w * old_color.w + a.x, 0.0f, 1.0f);
+      }
+
+      const float3 out_rgb = math::clamp(inv_alpha_rgb * old_color.xyz() + rgb.xyz(), 0.0f, 1.0f);
+      r_new_colors[i] = float4(out_rgb, out_alpha);
+    }
+  });
+}
+
 }  // namespace bke::multiresolution
 
 int Multiresolution::verts_num() const
@@ -3152,6 +3260,15 @@ template void Multiresolution::subdivide_to<float>(const Mesh &,
                                                    const MutableSpan<float>,
                                                    const bool) const;
 
+template void Multiresolution::subdivide_to<float2>(const Mesh &,
+                                                    const int,
+                                                    const OffsetsSpan,
+                                                    const Span<float2>,
+                                                    const int,
+                                                    const OffsetsSpan,
+                                                    const MutableSpan<float2>,
+                                                    const bool) const;
+
 template void Multiresolution::subdivide_to<float3>(const Mesh &,
                                                     const int,
                                                     const OffsetsSpan,
@@ -3263,6 +3380,13 @@ template void Multiresolution::subdivide_base_to<float>(const Mesh &,
                                                         const Span<float>,
                                                         const MutableSpan<float>,
                                                         const bool) const;
+
+template void Multiresolution::subdivide_base_to<float2>(const Mesh &,
+                                                         const int,
+                                                         const OffsetsSpan,
+                                                         const Span<float2>,
+                                                         const MutableSpan<float2>,
+                                                         const bool) const;
 
 template void Multiresolution::subdivide_base_to<float3>(const Mesh &,
                                                          const int,
@@ -3631,6 +3755,10 @@ void Multiresolution::downsample_to_base(const Span<int> from_vert_offsets,
 template void Multiresolution::downsample_to_base<float>(const Span<int>,
                                                          const Span<float>,
                                                          const MutableSpan<float>);
+
+template void Multiresolution::downsample_to_base<float2>(const Span<int>,
+                                                          const Span<float2>,
+                                                          const MutableSpan<float2>);
 
 template void Multiresolution::downsample_to_base<float3>(const Span<int>,
                                                           const Span<float3>,
@@ -4685,33 +4813,113 @@ Mesh *Multiresolution::eval_to_mesh(const Mesh &mesh, const int target_lvl)
         mesh.vert_positions());
   }
 
-  eval_attr(
-      multires.top_masks(),
-      [&]() {
-        return bke::get_mutable_attribute<float>(eval_mesh.attribute_storage.wrap(),
-                                                 bke::AttrDomain::Point,
-                                                 ".sculpt_mask",
-                                                 eval_mesh.verts_num);
-      },
-      base_masks,
-      true,
-      true);
+  auto subdivide_to_out = [&]<typename T>(const Span<T> src, const MutableSpan<T> dst) {
+    if (target_lvl == multires.top_level) {
+      subdivide_base_to_direct<T>(mesh,
+                                  ctx.eff_base,
+                                  ctx.eff_lvl,
+                                  ctx.use_base1,
+                                  ctx.dir_vp,
+                                  ctx.dir_ep,
+                                  ctx.dir_fp,
+                                  src,
+                                  dst,
+                                  false);
+    }
+    else {
+      Array<T> top_scratch(multires.top_verts_num());
+      multires.subdivide_base_to<T>(
+          mesh, multires.top_level, top_offsets, src, top_scratch.as_mutable_span(), false);
+      eval_top_to_out(top_scratch.as_span(), dst);
+    }
+  };
+
+  if (!base_masks.is_empty()) {
+    const Span<float> top_masks = multires.top_masks();
+    auto get_out = [&]() {
+      return bke::get_mutable_attribute<float>(eval_mesh.attribute_storage.wrap(),
+                                               bke::AttrDomain::Point,
+                                               ".sculpt_mask",
+                                               eval_mesh.verts_num);
+    };
+
+    if (top_masks.is_empty()) {
+      eval_attr(top_masks, get_out, base_masks, false, true);
+    }
+    else {
+      MutableSpan<float> out = get_out();
+      eval_top_to_out(top_masks, out);
+
+      const Span<int> top_vert_offsets = top_offsets.verts;
+      if (base_attr_dirty<float>(base_masks, top_masks, top_vert_offsets)) {
+        Array<float> old_base(base_masks.size());
+        Multiresolution::downsample_to_base<float>(
+            top_vert_offsets, top_masks, old_base.as_mutable_span());
+
+        Array<float2> base_packed(base_masks.size());
+        bke::multiresolution::calc_mask_propagation(
+            old_base.as_span(), base_masks, base_packed.as_mutable_span());
+        old_base = {};
+
+        Array<float2> target_packed(out.size());
+        subdivide_to_out(base_packed.as_span(), target_packed.as_mutable_span());
+        base_packed = {};
+
+        bke::multiresolution::apply_mask_propagation(out.as_span(), target_packed.as_span(), out);
+      }
+    }
+  }
 
   if (!StringRef(mesh.active_color_attribute).is_empty()) {
-    const VArraySpan<ColorGeometry4f> base_colors = *base_attributes.lookup<ColorGeometry4f>(
+    const VArraySpan<ColorGeometry4f> base_colors_attr = *base_attributes.lookup<ColorGeometry4f>(
         mesh.active_color_attribute, bke::AttrDomain::Point);
-    eval_attr(
-        multires.top_colors(),
-        [&]() {
-          return bke::get_mutable_attribute<ColorGeometry4f>(eval_mesh.attribute_storage.wrap(),
-                                                             bke::AttrDomain::Point,
-                                                             mesh.active_color_attribute,
-                                                             eval_mesh.verts_num)
-              .cast<float4>();
-        },
-        base_colors.cast<float4>(),
-        true,
-        true);
+    const Span<float4> base_colors = base_colors_attr.cast<float4>();
+    if (!base_colors.is_empty()) {
+      const Span<float4> top_colors = multires.top_colors();
+      auto get_out = [&]() {
+        return bke::get_mutable_attribute<ColorGeometry4f>(eval_mesh.attribute_storage.wrap(),
+                                                           bke::AttrDomain::Point,
+                                                           mesh.active_color_attribute,
+                                                           eval_mesh.verts_num)
+            .cast<float4>();
+      };
+
+      if (top_colors.is_empty()) {
+        eval_attr(top_colors, get_out, base_colors, false, true);
+      }
+      else {
+        MutableSpan<float4> out = get_out();
+        eval_top_to_out(top_colors, out);
+
+        const Span<int> top_vert_offsets = top_offsets.verts;
+        if (base_attr_dirty<float4>(base_colors, top_colors, top_vert_offsets)) {
+          Array<float4> old_base(base_colors.size());
+          Multiresolution::downsample_to_base<float4>(
+              top_vert_offsets, top_colors, old_base.as_mutable_span());
+
+          Array<float4> base_rgb_packed(base_colors.size());
+          const bool alpha_changed = bke::multiresolution::calc_color_propagation_rgb(
+              old_base.as_span(), base_colors, base_rgb_packed.as_mutable_span());
+
+          Array<float4> target_rgb_packed(out.size());
+          subdivide_to_out(base_rgb_packed.as_span(), target_rgb_packed.as_mutable_span());
+          base_rgb_packed = {};
+
+          Array<float2> target_alpha_packed;
+          if (alpha_changed) {
+            Array<float2> base_alpha_packed(base_colors.size());
+            bke::multiresolution::calc_color_propagation_alpha(
+                old_base.as_span(), base_colors, base_alpha_packed.as_mutable_span());
+            target_alpha_packed.reinitialize(out.size());
+            subdivide_to_out(base_alpha_packed.as_span(), target_alpha_packed.as_mutable_span());
+          }
+          old_base = {};
+
+          bke::multiresolution::apply_color_propagation(
+              out.as_span(), target_rgb_packed.as_span(), target_alpha_packed.as_span(), out);
+        }
+      }
+    }
   }
 
   for (const SculptLayer &layer : mesh.sculpt_layers_as_span()) {
