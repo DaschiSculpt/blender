@@ -2147,6 +2147,21 @@ static void rna_MultiresolutionProperties_use_tangent_space_set(PointerRNA *ptr,
   mesh->multires_use_tangent_space = value ? 1 : 0;
 }
 
+static void rna_MultiresolutionProperties_use_tangent_space_update(bContext *C, PointerRNA *ptr)
+{
+  Mesh *mesh = rna_mesh(ptr);
+  if (mesh->id.us <= 0 || mesh->multires == nullptr || mesh->multires->view_level <= 0) {
+    return;
+  }
+  Object *ob = CTX_data_active_object(C);
+  const bool is_sculpting = ob != nullptr && ob->data == &mesh->id &&
+                            (ob->mode & OB_MODE_ALL_SCULPT) != 0;
+  if (!is_sculpting || mesh->id.us > 1) {
+    DEG_id_tag_update(&mesh->id, ID_RECALC_GEOMETRY);
+    WM_main_add_notifier(NC_GEOM | ND_DATA, &mesh->id);
+  }
+}
+
 static int rna_MultiresolutionProperties_curr_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
@@ -3292,13 +3307,15 @@ static void rna_def_multiresolution_properties(BlenderRNA *brna)
   RNA_def_property_boolean_funcs(prop,
                                  "rna_MultiresolutionProperties_use_linear_get",
                                  "rna_MultiresolutionProperties_use_linear_set");
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
   RNA_def_property_ui_text(prop, "Linear", "True if subdivision is linear");
 
   prop = RNA_def_property(srna, "use_tangent_space", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_funcs(prop,
                                  "rna_MultiresolutionProperties_use_tangent_space_get",
                                  "rna_MultiresolutionProperties_use_tangent_space_set");
-  RNA_def_property_update(prop, 0, "rna_Mesh_update_geom_and_params");
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_MultiresolutionProperties_use_tangent_space_update");
   RNA_def_property_ui_text(prop,
                            "Tangent-Space Propagation",
                            "Propagate multiresolution position details in tangent space");
@@ -3331,7 +3348,7 @@ static void rna_def_multiresolution_properties(BlenderRNA *brna)
                              "rna_MultiresolutionProperties_view_level_set",
                              "rna_MultiresolutionProperties_view_level_range");
   RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
-  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE | PROP_NO_DEG_UPDATE);
   RNA_def_property_update(prop, 0, "rna_MultiresolutionProperties_view_level_update");
   RNA_def_property_ui_text(prop, "View Level", "View multires level");
 
@@ -3341,6 +3358,7 @@ static void rna_def_multiresolution_properties(BlenderRNA *brna)
                              "rna_MultiresolutionProperties_render_level_set",
                              "rna_MultiresolutionProperties_render_level_range");
   RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_NO_DEG_UPDATE);
   RNA_def_property_update(prop, NC_GEOM | ND_DATA, nullptr);
   RNA_def_property_ui_text(prop, "Render Level", "Render multires level");
 }
