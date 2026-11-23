@@ -252,10 +252,11 @@ class DATA_PT_sculpt_layers(MeshButtonsPanel, Panel):
 def draw_multires(layout, mesh, ob=None):
     is_dyntopo = (ob and ob.use_dynamic_topology_sculpting) or getattr(mesh, "use_dynamic_topology_sculpting", False)
     in_sculpt = ob is not None and ob.mode == 'SCULPT'
-    curr_level = mesh.multires_curr_level
-    sculpt_level = mesh.multires_sculpt_level
-    top_level = mesh.multires_top_level
-    topology_ok = (not mesh.has_multires or mesh.multires_topology_matches) and not is_dyntopo
+    multires = mesh.multires
+    curr_level = multires.curr_level
+    sculpt_level = multires.sculpt_level
+    top_level = multires.top_level
+    topology_ok = (not mesh.has_multires or multires.topology_matches) and not is_dyntopo
     can_subdivide = not (in_sculpt and mesh.has_multires and curr_level != top_level)
 
     if mesh.has_multires and not topology_ok:
@@ -269,19 +270,19 @@ def draw_multires(layout, mesh, ob=None):
 
     col = layout.column(align=True)
     col.enabled = topology_ok
-    col.prop(mesh, "multires_sculpt_level", text="Sculpt Level")
-    col.prop(mesh, "multires_view_level", text="View Level")
-    col.prop(mesh, "multires_render_level", text="Render Level")
+    col.prop(multires, "sculpt_level", text="Sculpt Level")
+    col.prop(multires, "view_level", text="View Level")
+    col.prop(multires, "render_level", text="Render Level")
 
     col = layout.column()
     col.enabled = topology_ok
-    col.prop(mesh, "multires_use_tangent_space", text="Use Tangent Space")
+    col.prop(multires, "use_tangent_space", text="Use Tangent Space")
 
     layout.separator()
 
     col = layout.column(align=True)
     col.enabled = topology_ok and can_subdivide
-    col.prop(mesh, "multires_use_linear", text="Linear Subdivision")
+    col.prop(multires, "use_linear", text="Linear Subdivision")
     col.separator(factor=0.5)
     col.operator("sculpt.multires_subdiv", text="Subdivide")
 
@@ -299,8 +300,9 @@ def draw_multires(layout, mesh, ob=None):
 
 def draw_multires_bake(layout, sculpt, mesh, ob=None):
     is_dyntopo = (ob and ob.use_dynamic_topology_sculpting) or getattr(mesh, "use_dynamic_topology_sculpting", False)
-    top_level = mesh.multires_top_level
-    topology_ok = (not mesh.has_multires or mesh.multires_topology_matches) and not is_dyntopo
+    multires = mesh.multires
+    top_level = multires.top_level
+    topology_ok = (not mesh.has_multires or multires.topology_matches) and not is_dyntopo
 
     bake_settings = sculpt.multires_bake
 

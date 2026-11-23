@@ -2104,7 +2104,17 @@ static bool rna_Mesh_has_multires_get(PointerRNA *ptr)
   return mesh->multires != nullptr;
 }
 
-static bool rna_Mesh_multires_topology_matches_get(PointerRNA *ptr)
+static PointerRNA rna_Mesh_multires_get(PointerRNA *ptr)
+{
+  return RNA_pointer_create_with_parent(*ptr, RNA_MultiresolutionProperties, ptr->data);
+}
+
+static std::optional<std::string> rna_MultiresolutionProperties_path(const PointerRNA * /*ptr*/)
+{
+  return "multires";
+}
+
+static bool rna_MultiresolutionProperties_topology_matches_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr) {
@@ -2113,43 +2123,43 @@ static bool rna_Mesh_multires_topology_matches_get(PointerRNA *ptr)
   return bke::multiresolution::base_counts_match(*mesh);
 }
 
-static bool rna_Mesh_multires_use_linear_get(PointerRNA *ptr)
+static bool rna_MultiresolutionProperties_use_linear_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires_use_linear != 0;
 }
 
-static void rna_Mesh_multires_use_linear_set(PointerRNA *ptr, bool value)
+static void rna_MultiresolutionProperties_use_linear_set(PointerRNA *ptr, bool value)
 {
   Mesh *mesh = rna_mesh(ptr);
   mesh->multires_use_linear = value ? 1 : 0;
 }
 
-static bool rna_Mesh_multires_use_tangent_space_get(PointerRNA *ptr)
+static bool rna_MultiresolutionProperties_use_tangent_space_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires_use_tangent_space != 0;
 }
 
-static void rna_Mesh_multires_use_tangent_space_set(PointerRNA *ptr, bool value)
+static void rna_MultiresolutionProperties_use_tangent_space_set(PointerRNA *ptr, bool value)
 {
   Mesh *mesh = rna_mesh(ptr);
   mesh->multires_use_tangent_space = value ? 1 : 0;
 }
 
-static int rna_Mesh_multires_curr_level_get(PointerRNA *ptr)
+static int rna_MultiresolutionProperties_curr_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires ? mesh->multires->curr_level : 0;
 }
 
-static int rna_Mesh_multires_sculpt_level_get(PointerRNA *ptr)
+static int rna_MultiresolutionProperties_sculpt_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires ? mesh->multires->sculpt_level : 0;
 }
 
-static void rna_Mesh_multires_sculpt_level_range(
+static void rna_MultiresolutionProperties_sculpt_level_range(
     PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
 {
   Mesh *mesh = rna_mesh(ptr);
@@ -2157,7 +2167,7 @@ static void rna_Mesh_multires_sculpt_level_range(
   *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
 }
 
-static void rna_Mesh_multires_sculpt_level_set(PointerRNA *ptr, int value)
+static void rna_MultiresolutionProperties_sculpt_level_set(PointerRNA *ptr, int value)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
@@ -2166,7 +2176,7 @@ static void rna_Mesh_multires_sculpt_level_set(PointerRNA *ptr, int value)
   mesh->multires->sculpt_level = math::clamp(value, 0, mesh->multires->top_level);
 }
 
-static void rna_Mesh_multires_sculpt_level_update(bContext *C, PointerRNA *ptr)
+static void rna_MultiresolutionProperties_sculpt_level_update(bContext *C, PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr) {
@@ -2177,19 +2187,19 @@ static void rna_Mesh_multires_sculpt_level_update(bContext *C, PointerRNA *ptr)
   ed::sculpt_paint::multires::set_sculpt_level(C, ob, *mesh, target_lvl);
 }
 
-static int rna_Mesh_multires_top_level_get(PointerRNA *ptr)
+static int rna_MultiresolutionProperties_top_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires ? mesh->multires->top_level : 0;
 }
 
-static int rna_Mesh_multires_view_level_get(PointerRNA *ptr)
+static int rna_MultiresolutionProperties_view_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires ? mesh->multires->view_level : 0;
 }
 
-static void rna_Mesh_multires_view_level_range(
+static void rna_MultiresolutionProperties_view_level_range(
     PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
 {
   Mesh *mesh = rna_mesh(ptr);
@@ -2197,7 +2207,7 @@ static void rna_Mesh_multires_view_level_range(
   *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
 }
 
-static void rna_Mesh_multires_view_level_set(PointerRNA *ptr, int value)
+static void rna_MultiresolutionProperties_view_level_set(PointerRNA *ptr, int value)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
@@ -2206,7 +2216,7 @@ static void rna_Mesh_multires_view_level_set(PointerRNA *ptr, int value)
   mesh->multires->view_level = math::clamp(value, 0, mesh->multires->top_level);
 }
 
-static void rna_Mesh_multires_view_level_update(bContext *C, PointerRNA *ptr)
+static void rna_MultiresolutionProperties_view_level_update(bContext *C, PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr) {
@@ -2216,13 +2226,13 @@ static void rna_Mesh_multires_view_level_update(bContext *C, PointerRNA *ptr)
   ed::sculpt_paint::multires::view_level_changed(C, ob, *mesh);
 }
 
-static int rna_Mesh_multires_render_level_get(PointerRNA *ptr)
+static int rna_MultiresolutionProperties_render_level_get(PointerRNA *ptr)
 {
   Mesh *mesh = rna_mesh(ptr);
   return mesh->multires ? mesh->multires->render_level : 0;
 }
 
-static void rna_Mesh_multires_render_level_range(
+static void rna_MultiresolutionProperties_render_level_range(
     PointerRNA *ptr, int *min, int *max, int *softmin, int *softmax)
 {
   Mesh *mesh = rna_mesh(ptr);
@@ -2230,7 +2240,7 @@ static void rna_Mesh_multires_render_level_range(
   *max = *softmax = mesh->multires ? mesh->multires->top_level : 0;
 }
 
-static void rna_Mesh_multires_render_level_set(PointerRNA *ptr, int value)
+static void rna_MultiresolutionProperties_render_level_set(PointerRNA *ptr, int value)
 {
   Mesh *mesh = rna_mesh(ptr);
   if (mesh->multires == nullptr || !bke::multiresolution::base_counts_match(*mesh)) {
@@ -3262,6 +3272,79 @@ static void rna_def_sculpt_layer(BlenderRNA *brna)
   RNA_def_property_update(prop, 0, "rna_SculptLayer_update_minmax");
 }
 
+static void rna_def_multiresolution_properties(BlenderRNA *brna)
+{
+  StructRNA *srna = RNA_def_struct(brna, "MultiresolutionProperties", nullptr);
+  RNA_def_struct_ui_text(
+      srna, "Multiresolution Properties", "Multiresolution properties for a mesh");
+  RNA_def_struct_sdna(srna, "Mesh");
+  RNA_def_struct_nested(brna, srna, "Mesh");
+  RNA_def_struct_path_func(srna, "rna_MultiresolutionProperties_path");
+
+  PropertyRNA *prop = RNA_def_property(srna, "topology_matches", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(
+      prop, "rna_MultiresolutionProperties_topology_matches_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(
+      prop, "Multiresolution Topology Matches", "False if base mesh counts changed");
+
+  prop = RNA_def_property(srna, "use_linear", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop,
+                                 "rna_MultiresolutionProperties_use_linear_get",
+                                 "rna_MultiresolutionProperties_use_linear_set");
+  RNA_def_property_ui_text(prop, "Linear", "True if subdivision is linear");
+
+  prop = RNA_def_property(srna, "use_tangent_space", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop,
+                                 "rna_MultiresolutionProperties_use_tangent_space_get",
+                                 "rna_MultiresolutionProperties_use_tangent_space_set");
+  RNA_def_property_update(prop, 0, "rna_Mesh_update_geom_and_params");
+  RNA_def_property_ui_text(prop,
+                           "Tangent-Space Propagation",
+                           "Propagate multiresolution position details in tangent space");
+
+  prop = RNA_def_property(srna, "curr_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(
+      prop, "rna_MultiresolutionProperties_curr_level_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Current Level", "Current multires level");
+
+  prop = RNA_def_property(srna, "sculpt_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_MultiresolutionProperties_sculpt_level_get",
+                             "rna_MultiresolutionProperties_sculpt_level_set",
+                             "rna_MultiresolutionProperties_sculpt_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_MultiresolutionProperties_sculpt_level_update");
+  RNA_def_property_ui_text(prop, "Sculpt Level", "Sculpt multires level");
+
+  prop = RNA_def_property(srna, "top_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(
+      prop, "rna_MultiresolutionProperties_top_level_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Top Level", "Highest multires subdivision level");
+
+  prop = RNA_def_property(srna, "view_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_MultiresolutionProperties_view_level_get",
+                             "rna_MultiresolutionProperties_view_level_set",
+                             "rna_MultiresolutionProperties_view_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
+  RNA_def_property_update(prop, 0, "rna_MultiresolutionProperties_view_level_update");
+  RNA_def_property_ui_text(prop, "View Level", "View multires level");
+
+  prop = RNA_def_property(srna, "render_level", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop,
+                             "rna_MultiresolutionProperties_render_level_get",
+                             "rna_MultiresolutionProperties_render_level_set",
+                             "rna_MultiresolutionProperties_render_level_range");
+  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
+  RNA_def_property_update(prop, NC_GEOM | ND_DATA, nullptr);
+  RNA_def_property_ui_text(prop, "Render Level", "Render multires level");
+}
+
 static void rna_def_mesh(BlenderRNA *brna)
 {
   StructRNA *srna;
@@ -3689,64 +3772,11 @@ static void rna_def_mesh(BlenderRNA *brna)
   RNA_def_property_clear_flag(prop, PROP_EDITABLE);
   RNA_def_property_ui_text(prop, "Has Multires", "True if this mesh has multiresolution data");
 
-  prop = RNA_def_property(srna, "multires_topology_matches", PROP_BOOLEAN, PROP_NONE);
-  RNA_def_property_boolean_funcs(prop, "rna_Mesh_multires_topology_matches_get", nullptr);
-  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
-  RNA_def_property_ui_text(
-      prop, "Multiresolution Topology Matches", "False if base mesh counts changed");
-
-  prop = RNA_def_property(srna, "multires_use_linear", PROP_BOOLEAN, PROP_NONE);
-  RNA_def_property_boolean_funcs(
-      prop, "rna_Mesh_multires_use_linear_get", "rna_Mesh_multires_use_linear_set");
-  RNA_def_property_ui_text(prop, "Linear", "True if subdivision is linear");
-
-  prop = RNA_def_property(srna, "multires_use_tangent_space", PROP_BOOLEAN, PROP_NONE);
-  RNA_def_property_boolean_funcs(
-      prop, "rna_Mesh_multires_use_tangent_space_get", "rna_Mesh_multires_use_tangent_space_set");
-  RNA_def_property_update(prop, 0, "rna_Mesh_update_geom_and_params");
-  RNA_def_property_ui_text(prop,
-                           "Tangent-Space Propagation",
-                           "Propagate multiresolution position details in tangent space");
-
-  prop = RNA_def_property(srna, "multires_curr_level", PROP_INT, PROP_UNSIGNED);
-  RNA_def_property_int_funcs(prop, "rna_Mesh_multires_curr_level_get", nullptr, nullptr);
-  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
-  RNA_def_property_ui_text(
-      prop, "Current Level", "Resident multires level (0 outside sculpt mode)");
-
-  prop = RNA_def_property(srna, "multires_sculpt_level", PROP_INT, PROP_UNSIGNED);
-  RNA_def_property_int_funcs(prop,
-                             "rna_Mesh_multires_sculpt_level_get",
-                             "rna_Mesh_multires_sculpt_level_set",
-                             "rna_Mesh_multires_sculpt_level_range");
-  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
-  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
-  RNA_def_property_update(prop, 0, "rna_Mesh_multires_sculpt_level_update");
-  RNA_def_property_ui_text(prop, "Sculpt Level", "Multires level used for sculpting");
-
-  prop = RNA_def_property(srna, "multires_top_level", PROP_INT, PROP_UNSIGNED);
-  RNA_def_property_int_funcs(prop, "rna_Mesh_multires_top_level_get", nullptr, nullptr);
-  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
-  RNA_def_property_ui_text(prop, "Top Level", "Highest multires subdivision level");
-
-  prop = RNA_def_property(srna, "multires_view_level", PROP_INT, PROP_UNSIGNED);
-  RNA_def_property_int_funcs(prop,
-                             "rna_Mesh_multires_view_level_get",
-                             "rna_Mesh_multires_view_level_set",
-                             "rna_Mesh_multires_view_level_range");
-  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
-  RNA_def_property_flag(prop, PROP_CONTEXT_UPDATE);
-  RNA_def_property_update(prop, 0, "rna_Mesh_multires_view_level_update");
-  RNA_def_property_ui_text(prop, "View Level", "Multires level used for object-mode display");
-
-  prop = RNA_def_property(srna, "multires_render_level", PROP_INT, PROP_UNSIGNED);
-  RNA_def_property_int_funcs(prop,
-                             "rna_Mesh_multires_render_level_get",
-                             "rna_Mesh_multires_render_level_set",
-                             "rna_Mesh_multires_render_level_range");
-  RNA_def_property_clear_flag(prop, PROP_ANIMATABLE);
-  RNA_def_property_update(prop, NC_GEOM | ND_DATA, nullptr);
-  RNA_def_property_ui_text(prop, "Render Level", "Multires level used for rendering");
+  prop = RNA_def_property(srna, "multires", PROP_POINTER, PROP_NONE);
+  RNA_def_property_flag(prop, PROP_NEVER_NULL);
+  RNA_def_property_struct_type(prop, "MultiresolutionProperties");
+  RNA_def_property_pointer_funcs(prop, "rna_Mesh_multires_get", nullptr, nullptr, nullptr);
+  RNA_def_property_ui_text(prop, "Multiresolution", "Multiresolution properties for this mesh");
 
   /* texture space */
   prop = RNA_def_property(srna, "use_auto_texspace", PROP_BOOLEAN, PROP_NONE);
@@ -3838,6 +3868,7 @@ void RNA_def_mesh(BlenderRNA *brna)
   rna_def_mloopuv(brna);
   rna_def_mloopcol(brna);
   rna_def_sculpt_layer(brna);
+  rna_def_multiresolution_properties(brna);
 }
 
 }  // namespace blender
