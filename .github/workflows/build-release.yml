@@ -100,9 +100,9 @@ jobs:
           fi
 
           if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-            git fetch --filter=blob:none --unshallow origin
+            git fetch --no-tags --no-recurse-submodules --filter=blob:none --unshallow origin
           fi
-          git fetch --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags --no-recurse-submodules --filter=blob:none origin +refs/heads/main:refs/remotes/origin/main
 
           MERGE_BASE=$(git merge-base HEAD refs/remotes/origin/main || true)
           if [ -z "$MERGE_BASE" ]; then
