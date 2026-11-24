@@ -991,7 +991,6 @@ void calc_multires_factors(const Depsgraph &depsgraph,
 {
   PRF_scope(ProfileCategory::Editor);
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const int grid_size = multires.grid_size();
   const IndexRange node_range = node.range(grid_size);
   const Span<float3> positions = multires.positions().slice(node_range);
@@ -1051,8 +1050,6 @@ void calc_multires_factors(const Depsgraph &depsgraph,
                                                BRUSH_AUTOMASKING_BOUNDARY_EDGES |
                                                BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS);
   if (has_coord_flags) {
-    multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
-
     const Span<int> face_sets = multires.face_sets();
 
     if (flag_is_set(automasking.settings.flags, BRUSH_AUTOMASKING_FACE_SETS)) {
@@ -1134,7 +1131,6 @@ void calc_face_factors(const Depsgraph &depsgraph,
 {
   PRF_scope(ProfileCategory::Editor);
   const SculptSession &ss = *object.runtime->sculpt_session;
-  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(object);
   const int grid_size = multires.grid_size();
   const Span<int> corner_verts = multires.corner_verts();
   const Span<float3> positions = multires.positions();
@@ -1144,9 +1140,6 @@ void calc_face_factors(const Depsgraph &depsgraph,
                                            BRUSH_AUTOMASKING_FACE_SETS |
                                                BRUSH_AUTOMASKING_BOUNDARY_EDGES |
                                                BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS);
-  if (has_coord_flags) {
-    multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
-  }
   const Span<int> face_sets = multires.face_sets();
 
   for (const int i : face_indices.index_range()) {
@@ -1798,8 +1791,7 @@ static void init_boundary_masking_multires(Object &object,
   const Span<float3> positions = multires.positions();
   const Span<bool> hidden = multires.hidden_verts();
 
-  const bke::AttributeAccessor attributes = mesh.attributes();
-  const VArraySpan face_sets = *attributes.lookup<int>(".sculpt_face_set", bke::AttrDomain::Face);
+  const Span<int> face_sets = multires.face_sets();
 
   Array<int> edge_distance(positions.size(), EDGE_DISTANCE_INF);
   for (const int i : positions.index_range()) {
@@ -2072,6 +2064,17 @@ std::unique_ptr<Cache> cache_init(const Depsgraph &depsgraph,
   eAutomasking_flag mode = calc_effective_bits(paint, brush);
 
   vert_random_access_ensure(ob);
+  const bke::pbvh::Tree &pbvh = *bke::object::pbvh_get(ob);
+  if (pbvh.type() == bke::pbvh::Type::Multires &&
+      flag_is_set(mode,
+                  BRUSH_AUTOMASKING_FACE_SETS | BRUSH_AUTOMASKING_BOUNDARY_EDGES |
+                      BRUSH_AUTOMASKING_BOUNDARY_FACE_SETS | BRUSH_AUTOMASKING_CAVITY_ALL))
+  {
+    const Mesh &mesh = *id_cast<const Mesh *>(ob.data);
+    const Multiresolution &multires = *mesh.multires;
+    const bke::multiresolution::BaseTopology base_topo = multires.get_base_topology(mesh);
+    multires.coord_from_index_map_ensure(base_topo, pbvh.offsets);
+  }
   if (flag_is_set(mode, BRUSH_AUTOMASKING_TOPOLOGY) && ss.active_vert_index() != -1) {
     islands::ensure_cache(ob);
 

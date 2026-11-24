@@ -959,6 +959,7 @@ void MultiresolutionRuntime::rebuild(const Mesh &base_mesh, const OffsetsSpan of
                     corner_verts_);
 
   normals_.reinitialize(verts_num);
+  coord_from_index_map.clear_and_shrink();
 }
 
 const Mesh &MultiresolutionRuntime::ensure_base_mesh(const Mesh &real_base_mesh,
@@ -1208,6 +1209,7 @@ Span<bke::multiresolution::MultiresCoord> Multiresolution::coord_from_index_map_
 bke::multiresolution::MultiresCoord Multiresolution::coord_from_index(const int idx) const
 {
   BLI_assert(idx >= 0 && idx < this->verts_num());
+  BLI_assert(this->runtime->coord_from_index_map.size() == this->verts_num());
   return this->runtime->coord_from_index_map[idx];
 }
 

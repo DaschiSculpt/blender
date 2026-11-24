@@ -397,7 +397,7 @@ static void foreach_subface_of_coord(const bke::multiresolution::MultiresCoord c
           else if (local_corner == 2) {
             subface += faces_per_side * faces_per_side - 1;
           }
-          else {
+          else if (local_corner == 3) {
             subface += (faces_per_side - 1) * faces_per_side;
           }
           if (!func(subface)) {
