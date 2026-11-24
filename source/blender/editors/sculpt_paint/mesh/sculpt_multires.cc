@@ -850,6 +850,20 @@ void flush(Object &object)
   switch_face_attribute<bool>(base_mesh, multires, src_lvl, 0, ".hide_poly", bke::AttrType::Bool);
 }
 
+void exit_sculpt_mode(Object &object)
+{
+  Mesh *mesh = BKE_mesh_from_object(&object);
+  if (mesh == nullptr || mesh->multires == nullptr || mesh->multires->curr_level == 0) {
+    return;
+  }
+  mesh->multires->sculpt_level = mesh->multires->curr_level;
+  flush(object);
+  mesh->multires->curr_level = 0;
+  mesh->multires->clear_sculpt_data();
+  mesh->tag_positions_changed();
+  DEG_id_tag_update(&mesh->id, ID_RECALC_GEOMETRY);
+}
+
 void ensure_curr_storage(Object &object)
 {
   Mesh &base_mesh = *id_cast<Mesh *>(object.data);

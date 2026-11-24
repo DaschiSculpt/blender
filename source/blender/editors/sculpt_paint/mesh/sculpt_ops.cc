@@ -271,10 +271,17 @@ void object_sculpt_mode_enter(Main &bmain,
   }
 
   if (mesh->multires) {
-    mesh->multires->curr_level = math::clamp(
-        mesh->multires->sculpt_level, 0, mesh->multires->top_level);
+    if (mesh->multires->curr_level == 0) {
+      mesh->multires->curr_level = math::clamp(
+          mesh->multires->sculpt_level, 0, mesh->multires->top_level);
+      multires::ensure_curr_storage(ob);
+    }
+    else {
+      mesh->multires->curr_level = math::clamp(
+          mesh->multires->curr_level, 0, mesh->multires->top_level);
+      mesh->multires->sculpt_level = mesh->multires->curr_level;
+    }
   }
-  multires::ensure_curr_storage(ob);
   ed::sculpt_paint::mode_enter_generic(bmain, depsgraph, scene, ob, OB_MODE_SCULPT);
 
   if (mesh->attributes().contains(".sculpt_face_set")) {

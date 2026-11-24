@@ -121,6 +121,7 @@ void ED_editors_init(bContext *C)
    * e.g. linked objects we have to ensure that they are actually the
    * active object in this scene. */
   Object *obact = CTX_data_active_object(C);
+  bool has_forced_sculpt_exit = false;
   for (Object &ob : bmain->objects) {
     eObjectMode mode = ob.mode;
     if (mode == OB_MODE_OBJECT) {
@@ -140,6 +141,7 @@ void ED_editors_init(bContext *C)
     /* Object mode is enforced if there is no active object, or if the active object's type is
      * different. */
     if (obact == nullptr || ob.type != obact->type) {
+      has_forced_sculpt_exit |= (mode == OB_MODE_SCULPT && ob.type == OB_MESH);
       continue;
     }
     /* Object mode is enforced for non-editable data (or their obdata). */
@@ -162,6 +164,7 @@ void ED_editors_init(bContext *C)
     if (!BKE_collection_has_object_recursive(scene->master_collection, &ob) ||
         !BKE_scene_has_object(*bmain, scene, &ob) || (ob.visibility_flag & OB_HIDE_VIEWPORT) != 0)
     {
+      has_forced_sculpt_exit |= (mode == OB_MODE_SCULPT && ob.type == OB_MESH);
       continue;
     }
 
@@ -200,6 +203,26 @@ void ED_editors_init(bContext *C)
       /* TODO(@ideasman42): avoid operator calls. */
       if (obact == &ob) {
         object::mode_set_ex(C, mode, true, reports);
+      }
+    }
+  }
+
+  if (has_forced_sculpt_exit) {
+    for (Object &ob : bmain->objects) {
+      if (ob.type != OB_MESH || ob.mode != OB_MODE_OBJECT || ob.data == nullptr ||
+          !BKE_id_is_editable(bmain, ob.data))
+      {
+        continue;
+      }
+      bool mesh_in_sculpt = false;
+      for (const Object &other : bmain->objects) {
+        if (other.data == ob.data && (other.mode & OB_MODE_SCULPT) != 0) {
+          mesh_in_sculpt = true;
+          break;
+        }
+      }
+      if (!mesh_in_sculpt) {
+        ed::sculpt_paint::multires::exit_sculpt_mode(ob);
       }
     }
   }

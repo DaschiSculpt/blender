@@ -110,6 +110,8 @@ bool set_sculpt_level(bContext *C,
 
 void view_level_changed(bContext *C, Object *ob, Mesh &mesh);
 
+void exit_sculpt_mode(Object &object);
+
 }  // namespace multires
 
 namespace face_set {
